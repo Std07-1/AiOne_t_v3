@@ -1,0 +1,15 @@
+aiohttp==3.11.13
+fastapi==0.115.12
+lz4==4.4.4
+numpy==1.24.0
+optuna==4.2.1
+orjson==3.10.18
+pandas==2.2.3
+pydantic==2.11.5
+pydantic_settings==2.9.1
+python-dotenv==1.1.0
+redis==4.5.5
+rich==14.0.0
+scipy==1.15.3
+tenacity==9.1.2
+websockets==15.0

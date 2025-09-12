@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+*.dll
+*.lib
+*.exe
+
+# Virtual environments
+venv/
+venv_aione_t/
+AiOne_t/venv_aione_t/
+
+# Editor / system files
+*.log
+*.txt
+!requirements.txt
+!runtime.txt
+!Procfile
+*.yml
+.env
+keys
+maps.md
+
+# Project-specific folders to ignore
+etc/
+logs/
+symbols/
+analytics/
+indicators/
+!monitor/indicators/
+
+# Cache and intermediate data
+*.csv
+*.json
+
+# Docker-related
+docker-compose
+Dockerfile
+*.dockerignore
+
+# Python project structure — internal
+datafetcher/__init__.py
+datafetcher/__pycache__/
+datafetcher/cache_handler.py
+datafetcher/websocket.py
+datafetcher/raw_data.py
+
+# Temporary scripts / testing
+tr4.py

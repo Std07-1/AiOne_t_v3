@@ -113,35 +113,49 @@ async def fetch_cached_data(
     :param process_fn: функція обробки даних
     :return: оброблені дані
     """
-    logger.debug(f"[STEP] _fetch_cached_data: key={key}, url={url}")
-    cached = await cache_handler.fetch_from_cache(
-        symbol=key, interval="global", prefix="meta"
-    )
-    logger.debug(f"[EVENT] Кеш отримано: {type(cached)}")
+    logger.debug(f"[STEP] _fetch_cached_data (JSON-first): key={key}, url={url}")
+    # НОВИЙ ПІДХІД: пробуємо структурований JSON ключ замість blob
+    json_cached = None
+    try:
+        json_cached = await cache_handler.redis.jget(
+            "selectors", "meta", key, default=None
+        )
+    except Exception as e:  # pragma: no cover
+        logger.debug(f"[EVENT] jget не вдалось для {key}: {e}")
 
-    if cached is not None:
-        if isinstance(cached, pd.DataFrame):
-            # logger.warning("Кешовані дані у форматі DataFrame, але очікується JSON")
-            cached = ensure_timestamp_column(cached)
-            if cached.empty:
-                logger.debug("Кеш порожній, запит до API")
-                cached = None
-            else:
-                data = cached.to_dict(orient="records")
-                logger.debug(
-                    f"[EVENT] Повертаємо кешовані дані DataFrame: {len(data)} записів"
-                )
-                return data
-        elif isinstance(cached, (bytes, str)) and cached:
+    if json_cached is not None:
+        logger.debug(f"[EVENT] JSON кеш знайдено: {type(json_cached)}")
+        return json_cached
+
+    # FALLBACK (тимчасово): спроба старого blob кеша якщо існує
+    try:
+        legacy_blob = await cache_handler.fetch_from_cache(
+            symbol=key, interval="global", prefix="meta"
+        )
+    except Exception:
+        legacy_blob = None
+    if isinstance(legacy_blob, (bytes, str)) and legacy_blob:
+        try:
+            parsed = json.loads(legacy_blob)
+            logger.debug("[EVENT] Використано legacy blob кеш (parsed JSON)")
+            # Міг бути збережений старим шляхом — перепишемо у новий JSON ключ
             try:
-                data = json.loads(cached)
-                logger.debug(f"[EVENT] Повертаємо кешовані дані JSON: {type(data)}")
-                return data
-            except (json.JSONDecodeError, TypeError) as e:
-                logger.warning("Помилка десеріалізації кешу %s: %s", key, e)
-                await cache_handler.delete_from_cache(key, "global", "meta")
+                await cache_handler.redis.jset(
+                    "selectors", "meta", key, value=parsed, ttl=REDIS_CACHE_TTL
+                )
+            except Exception:
+                pass
+            return parsed
+        except Exception:
+            # видаляємо старий blob, щоб уникати повторів
+            try:
+                await cache_handler.delete_from_cache(
+                    symbol=key, interval="global", prefix="meta"
+                )
+            except Exception:
+                pass
 
-    logger.debug("[STEP] Кеш не валідний, запит до API")
+    logger.debug("[STEP] Кеш відсутній, виконуємо HTTP запит")
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
         logger.debug(f"[EVENT] Відповідь API отримано, статус: {resp.status}")
         resp.raise_for_status()
@@ -151,14 +165,13 @@ async def fetch_cached_data(
         processed = process_fn(data) if process_fn else data
         logger.debug(f"[EVENT] Дані оброблено: {type(processed)}")
 
-        await cache_handler.store_in_cache(
-            symbol=key,
-            interval="global",
-            data=json.dumps(processed),
-            ttl=REDIS_CACHE_TTL,
-            prefix="meta",
-        )
-        logger.debug(f"[EVENT] Дані збережено у кеш: {key}")
+        try:
+            await cache_handler.redis.jset(
+                "selectors", "meta", key, value=processed, ttl=REDIS_CACHE_TTL
+            )
+            logger.debug(f"[EVENT] Дані збережено (jset JSON): {key}")
+        except Exception as e:  # pragma: no cover
+            logger.warning("Не вдалося зберегти JSON кеш %s: %s", key, e)
         return processed
 
 

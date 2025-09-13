@@ -8,7 +8,7 @@ from rich.logging import RichHandler
 
 from UI.ui_consumer import UI_Consumer
 
-# --- Налаштування логування ---
+# ── Налаштування логування ─────────────────────────────────────────────────
 logger = logging.getLogger("ui_consumer_entry")
 logger.setLevel(logging.INFO)
 logger.handlers.clear()

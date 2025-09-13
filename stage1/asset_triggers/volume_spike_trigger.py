@@ -1,3 +1,8 @@
+"""Volume Spike Trigger.
+
+Виявляє аномальний стрибок обсягу на основі Z-score та співвідношення Volume/ATR.
+"""
+
 import numpy as np
 import pandas as pd
 import logging
@@ -5,19 +10,18 @@ import logging
 from rich.console import Console
 from rich.logging import RichHandler
 
-# --- Налаштування логування ---
+# ── Логування ───────────────────────────────────────────────────────────────
 logger = logging.getLogger("asset_triggers.volume_spike")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-logger.propagate = False
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
 def volume_spike_trigger(
     df: pd.DataFrame, z_thresh: float = 2.0, atr_window: int = 14, symbol: str = ""
 ) -> bool:
-    """Визначає сплеск обсягу торгів на основі Z-score та відношення обсягу до ATR.
-    Повертає True, якщо обсяг останнього бару аномально великий."""
+    """Повертає True якщо останній бар має аномально великий обсяг."""
     if len(df) < atr_window:
         logger.debug(
             f"[{symbol}] [VolumeSpike] Недостатньо даних ({len(df)}) для ATR={atr_window}"

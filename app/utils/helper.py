@@ -17,20 +17,7 @@ import logging
 from rich.console import Console
 from rich.logging import RichHandler
 import pandas as pd
-from typing import Optional, Dict, Any
-from utils.utils import safe_float, normalize_result_types  # re-export use only
-
-try:
-    # якщо в тебе є мапа та формалізовані brackets у конфігу — використовуємо їх
-    from config.config import (
-        TICK_SIZE_MAP,
-        TICK_SIZE_BRACKETS,
-        TICK_SIZE_DEFAULT,
-    )  # optional
-except Exception:
-    TICK_SIZE_MAP = {}
-    TICK_SIZE_BRACKETS = []  # type: ignore
-    TICK_SIZE_DEFAULT = 1e-3  # fallback
+from typing import Any
 
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.utils.helper")
@@ -123,12 +110,6 @@ def estimate_atr_pct(df_1m: pd.DataFrame) -> float:
         return float(max(0.05, min(5.0, pct)))
     except Exception:
         return 0.5
-
-
-## get_tick_size перенесено у utils.utils (single source)
-
-
-## Видалено локальний duplicate normalize_result_types — використовуй імпортований із utils.utils
 
 
 def make_serializable_safe(data) -> Any:

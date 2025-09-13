@@ -11,8 +11,6 @@
 - `print_stages`: виводить етапи фільтрації
 """
 
-import time
-import logging
 
 from utils.utils import format_open_interest, format_volume_usd
 
@@ -24,14 +22,7 @@ from typing import List
 from config.config import FilterParams, MetricResults
 
 from rich.console import Console
-from rich.logging import RichHandler
 
-# --- Налаштування логування ---
-logger = logging.getLogger("binance_future_asset_filter")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-logger.propagate = False
 
 # Глобальний консоль для зручності
 console = Console()

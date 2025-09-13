@@ -67,14 +67,14 @@ console = Console()
 
 # CORE LOGIC
 class BinanceFutureAssetFilter:
-    def __init__(self, session: aiohttp.ClientSession, cache_handler):
+    def __init__(self, session: aiohttp.ClientSession, store):
         """
         Ініціалізація фільтра активів Binance Futures.
         :param session: aiohttp.ClientSession для HTTP-запитів
-        :param cache_handler: обробник кешу (наприклад, Redis)
+        :param store: UnifiedDataStore (раніше називали cache_handler)
         """
         self.session = session
-        self.cache_handler = cache_handler
+        self.store = store  # історичне cache_handler → тепер чіткіше
         self.metrics = {}
         self.progress = None
         self.metrics_progress = None  # Додатковий атрибут для прогресу метрик
@@ -105,7 +105,7 @@ class BinanceFutureAssetFilter:
 
         data = await fetch_cached_data(
             self.session,
-            self.cache_handler,
+            self.store,
             "binance_futures_exchange_info",
             "https://fapi.binance.com/fapi/v1/exchangeInfo",
             process_data,

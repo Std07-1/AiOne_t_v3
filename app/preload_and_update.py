@@ -31,7 +31,7 @@ if not logger.handlers:
     logger.propagate = False
 
 
-# --- Фоновий таск: періодичне оновлення fast_symbols через prefilter ---
+# ── Фоновий таск: періодичне оновлення fast_symbols через prefilter ─────────
 async def periodic_prefilter_and_update(
     cache,
     session: aiohttp.ClientSession,
@@ -73,7 +73,7 @@ async def periodic_prefilter_and_update(
                     fast_symbols[:5],
                 )
 
-                # --- preload для нових активів ---
+                # ── preload для нових активів ──────────────────────────────
                 if buffer is not None:
                     # Знаходимо ТІЛЬКИ нові символи
                     new_symbols = current_symbols - prev_symbols
@@ -109,7 +109,7 @@ async def periodic_prefilter_and_update(
         await asyncio.sleep(interval)  # 600 сек
 
 
-# --- Preload історії для Stage1 ---
+# ── Preload історії для Stage1 ─────────────────────────────────────────────
 async def _fetch_klines(
     symbol: str, interval: str, limit: int, session: aiohttp.ClientSession
 ):
@@ -233,7 +233,7 @@ async def preload_1m_history(
     return stats
 
 
-# --- Preload денних барів для глобальних рівнів ---
+# ── Preload денних барів для глобальних рівнів ─────────────────────────────
 async def preload_daily_levels(
     fast_symbols,
     days: int = PRELOAD_DAILY_DAYS,

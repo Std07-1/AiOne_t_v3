@@ -11,7 +11,6 @@
 from __future__ import annotations
 import json
 import logging
-import numpy as np
 import pandas as pd
 from datetime import timedelta
 from typing import Any, Dict, Optional, Union
@@ -20,7 +19,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 from stage1.indicators.atr_indicator import ATRManager  # залишено для сумісності типів
-from config.config import CACHE_TTL_DAYS, OPTUNA_SQLITE_URI
+from config.config import CACHE_TTL_DAYS
 
 # ───────────────────────────── Логування ─────────────────────────────
 log = logging.getLogger("app.thresholds")
@@ -28,8 +27,6 @@ if not log.handlers:
     log.setLevel(logging.INFO)
     log.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
     log.propagate = False
-
-# Константи перенесено до config.config (CACHE_TTL_DAYS, OPTUNA_SQLITE_URI)
 
 
 class Thresholds:

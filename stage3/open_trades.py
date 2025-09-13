@@ -1,17 +1,31 @@
+"""Stage3 helper: відкриття угод на базі Stage2 сигналів.
+
+Сортує сигнали за впевненістю, застосовує поріг і делегує відкриття
+`TradeLifecycleManager`. Стиль уніфіковано (короткі секції, guard logger).
+"""
+
+from __future__ import annotations
+
+# ── Imports ──────────────────────────────────────────────────────────────────
 import logging
 import json
 from typing import Any, Dict, List
+
 from rich.console import Console
 from rich.logging import RichHandler
+
 from stage3.trade_manager import TradeLifecycleManager
 from utils.utils import safe_float
 
-# --- Налаштування логування ---
-logger = logging.getLogger("app.screening_producer")
-logger.setLevel(logging.INFO)  # Змінено на INFO для зменшення шуму
-logger.handlers.clear()
-logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-logger.propagate = False
+# ── Logger ───────────────────────────────────────────────────────────────────
+logger = logging.getLogger("stage3.open_trades")
+if not logger.handlers:  # guard від повторної ініціалізації
+    logger.setLevel(logging.INFO)
+    try:  # optional rich
+        logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    except Exception:  # broad except: rich необов'язковий
+        logger.addHandler(logging.StreamHandler())
+    logger.propagate = False
 
 MIN_CONFIDENCE_TRADE = 0.6  # Мінімальна впевненість для відкриття угоди
 
@@ -37,6 +51,7 @@ async def open_trades(
         reverse=True,
     )[:max_parallel]
 
+    # ── Iterate sorted signals ───────────────────────────────────────────────
     for signal in sorted_signals:
         symbol = signal["symbol"]
         confidence = safe_float(signal.get("confidence", 0))
@@ -95,5 +110,8 @@ async def open_trades(
             logger.info(
                 f"✅ Відкрито угоду для {symbol} (впевненість: {confidence:.2f})"
             )
-        except Exception as e:
+        except Exception as e:  # broad except: відкриття угоди не критичне
             logger.error(f"Помилка відкриття угоди для {symbol}: {str(e)}")
+
+
+__all__ = ["open_trades"]

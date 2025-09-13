@@ -11,7 +11,6 @@
 
 # ───────────── Стандартна бібліотека ─────────────
 import asyncio
-import json  # TODO: видалити якщо не використовується
 import logging
 import time
 from datetime import datetime

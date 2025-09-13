@@ -33,17 +33,14 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
     from app.asset_state_manager import AssetStateManager
+from rich.console import Console
+from rich.logging import RichHandler
 
+# ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("ui.publish_full_state")
 if not logger.handlers:  # guard від повторної ініціалізації
-    logger.setLevel(logging.INFO)
-    try:  # optional rich
-        from rich.console import Console
-        from rich.logging import RichHandler
-
-        logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-    except Exception:  # pragma: no cover
-        logger.addHandler(logging.StreamHandler())
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.addHandler(logging.StreamHandler())
     logger.propagate = False
 
 
@@ -99,10 +96,10 @@ async def publish_full_state(
                                 if asset["stats"][stat_key] not in [None, "", "NaN"]
                                 else 0.0
                             )
-                        except (TypeError, ValueError):
+                        except (TypeError, ValueError):  # narrow: очікувана валідація
                             asset["stats"][stat_key] = 0.0
 
-            # ---- UI FLATTENING LAYER ----
+            # ── UI flattening layer ────────────────────────────────────────
             stats = asset.get("stats") or {}
             # Уніфіковані кореневі ключі, щоб UI не мав додаткових мапперів
             if "price" not in asset:
@@ -116,7 +113,7 @@ async def publish_full_state(
                         asset["price_str"] = fmt_price_stage1(
                             float(asset["price"]), str(asset.get("symbol", "")).lower()
                         )
-                except Exception:
+                except Exception:  # broad except: форматування ціни не критичне
                     pass
             # Raw volume_mean (кількість контрактів/штук) → зберігаємо як raw_volume
             if "raw_volume" not in asset:
@@ -135,7 +132,7 @@ async def publish_full_state(
             ):
                 try:
                     asset["volume_str"] = format_volume_usd(float(asset["volume"]))
-                except Exception:
+                except Exception:  # broad except: форматування volume_str не критичне
                     pass
             # ATR% (для швидкого відтворення у UI без ділення щоразу)
             if "atr_pct" not in asset:
@@ -208,7 +205,7 @@ async def publish_full_state(
             if isinstance(a, dict) and "symbol" in a:
                 try:
                     a["symbol"] = str(a["symbol"]).upper()
-                except Exception:
+                except Exception:  # broad except: upper-case sanitation
                     pass
 
         payload = {
@@ -237,11 +234,11 @@ async def publish_full_state(
         # Зберігаємо снапшот останнього повного стану (для швидкого старту UI)
         try:
             await redis_conn.set(REDIS_SNAPSHOT_KEY, payload_json)
-        except Exception:
+        except Exception:  # broad except: snapshot optional
             logger.debug("Не вдалося записати asset_state_snapshot", exc_info=True)
         logger.info(f"✅ Опубліковано стан {len(serialized_assets)} активів")
 
-    except Exception as e:
+    except Exception as e:  # broad except: публікація best-effort
         logger.error(f"Помилка публікації стану: {str(e)}")
 
 

@@ -25,3 +25,35 @@
 * Перевір, чи TP/SL адекватно встановлені — зазвичай вони вже були згенеровані.
 * Зазвичай не варто відкривати позицію без підтвердження достатньої впевненості (`composite_confidence > 0.65`).
 
+## Dependencies
+
+### Core
+aiohttp / websockets (потокові та REST дані)  
+numpy / pandas / scipy (числові обчислення та індикатори)  
+orjson + lz4 (швидка компактна серіалізація payload для WS/UI)  
+redis (спільний стан та крос‑процес кеш)  
+rich (форматоване логування)  
+tenacity (retry логіка)  
+PyYAML + python-dotenv (конфіг та середовище)  
+psutil (метрики процесу)  
+
+### Metrics (optional)
+prometheus_client — експозиція метрик (Counters/Gauges + HTTP endpoint).  
+Увімкнення: якщо `prometheus_client` встановлено, `app/main.py` запускає `start_http_server(port=8001)` (перевір порт у коді). Збирання: `curl localhost:8001/metrics`.
+
+### Experimental / Calibration (вилучено зараз)
+optuna, SQLAlchemy, alembic, greenlet, Mako, MarkupSafe — історичний стек для калібрування та збереження результатів (поки неактивні).  
+
+### Removed legacy / Not in use
+propcache, typing-inspection, Pygments, markdown-it-py, mdurl, tqdm, colorlog, packaging (не використовуємо прямо), pyarrow (placeholder для parquet) — очищено для мінімізації залежностей.
+
+### Примітки
+Якщо буде потрібний Parquet або історичне калібрування — поверни `pyarrow` та відповідні бібліотеки (Optuna + SQLAlchemy).  
+`orjson + lz4` вибрані замість стандартного `json` через менший latency та розмір повідомлень при великій кількості барів.
+
+### Як додати опційні залежності назад
+1. Додай пакет у `requirements.txt` у відповідний блок.  
+2. Перевір імпорт у відповідних модулях (уніфікуй логування та секції).  
+3. Запусти тести та вручну провалідируй відсутність побічних ефектів.
+
+

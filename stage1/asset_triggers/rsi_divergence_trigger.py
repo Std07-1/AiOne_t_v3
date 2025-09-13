@@ -1,3 +1,14 @@
+"""RSI Divergence Trigger.
+
+Призначення:
+    • Розрахунок RSI (EMA варіант) та виявлення бичачої / ведмежої дивергенції
+    • Повертає словник із прапорцями дивергенцій та поточним RSI
+
+Стиль:
+    • Українська мова, секційні розділювачі, захищена ініціалізація логера
+    • Без побічних ефектів поза логуванням
+"""
+
 from scipy.signal import find_peaks
 import pandas as pd
 import logging
@@ -5,19 +16,21 @@ import logging
 from rich.console import Console
 from rich.logging import RichHandler
 
-# --- Налаштування логування ---
+# ── Логування ───────────────────────────────────────────────────────────────
 logger = logging.getLogger("asset_triggers.rsi_divergence")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-logger.propagate = False
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
 def rsi_divergence_trigger(
     df: pd.DataFrame, rsi_period: int = 14, symbol: str = ""
 ) -> dict:
-    """Розраховує RSI та перевіряє наявність ведмежої/бичачої дивергенції.
-    Повертає словник: {'rsi': значення RSI, 'bearish_divergence': bool, 'bullish_divergence': bool}.
+    """Обчислює RSI та виявляє бичачу/ведмежу дивергенцію.
+
+    Returns:
+        dict: { 'rsi': float|None, 'bearish_divergence': bool, 'bullish_divergence': bool }
     """
     close = df["close"]
     if len(close) < rsi_period + 3:

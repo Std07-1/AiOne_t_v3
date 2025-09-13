@@ -1,20 +1,29 @@
-# qde_core.py
-# -*- coding: utf-8 -*-
-"""
-QDE Core (single-file) — самодостатній рушій прийняття рішень без сторонніх модулів.
-Мінімальні залежності: numpy, pandas, logging, dataclasses, typing.
+"""QDE Core — рушій прийняття рішень (Stage2 ядро).
 
-Вхід: stage1_signal = {
-    "symbol": "BTCUSDT",
-    "stats": {
-        "current_price": float, "vwap": float, "atr": float, "daily_high": float, "daily_low": float,
-        "rsi": float, "volume": float, "volume_z": float, "bid_ask_spread": float,
-        # опційно: "adx", "correlation", "sentiment_index", "tick_size"
-    },
-    "trigger_reasons": ["volume_spike", "breakout_up", ...]
-}
+Призначення:
+    • Перетворити Stage1 сигнал (stats + triggers) у вичерпний контекст ринку
+    • Обчислити сценарії, confidence, рекомендацію, narrative та risk-параметри
 
-Вихід: dict з context, confidence, recommendation, narrative, risk.
+Вхід (stage1_signal):
+    {
+        "symbol": str,
+        "stats": {
+            "current_price": float,
+            "vwap": float,
+            "atr": float,
+            "daily_high": float,
+            "daily_low": float,
+            "rsi": float,
+            "volume": float,
+            "volume_z": float,
+            "bid_ask_spread": float,
+            # опційно: adx / correlation / sentiment_index / tick_size / closes
+        },
+        "trigger_reasons": [str, ...]
+    }
+
+Вихід: dict з ключами: market_context, confidence_metrics, anomaly_detection,
+recommendation, narrative, risk_parameters.
 """
 
 from __future__ import annotations
@@ -25,17 +34,18 @@ import logging
 import numpy as np
 import pandas as pd
 
-# ────────────────────────── ЛОГУВАННЯ ──────────────────────────
-logger = logging.getLogger("qde.core")
-if not logger.handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-logger.setLevel(logging.INFO)
+from rich.console import Console
+from rich.logging import RichHandler
+
+# ── Logger ──
+logger = logging.getLogger("app.stage2.qde_core")
+if not logger.handlers:  # guard від повторної ініціалізації
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
-# ────────────────────────── ПЕРЕЛІКИ ──────────────────────────
+# ── Переліки ──
 class Scenario:
     BULLISH_BREAKOUT = "BULLISH_BREAKOUT"
     BEARISH_REVERSAL = "BEARISH_REVERSAL"
@@ -47,7 +57,7 @@ class Scenario:
     UNCERTAIN = "UNCERTAIN"
 
 
-# ────────────────────────── КОНФІГ ──────────────────────────
+# ── Конфіг ──
 @dataclass
 class QDEConfig:
     # пороги/дефолти
@@ -63,14 +73,14 @@ class QDEConfig:
     sl_step: float = 0.8  # у ATR
 
 
-# ────────────────────────── УТИЛІТИ ──────────────────────────
+# ── Утиліти ──
 def _safe(x: Any, default: float = 0.0) -> float:
     try:
         v = float(x)
         if math.isnan(v) or math.isinf(v):
             return default
         return v
-    except Exception:
+    except Exception:  # broad except: універсальна санітизація вхідних значень stats
         return default
 
 
@@ -84,7 +94,7 @@ def _normalize(x: float, lo: float, hi: float) -> float:
     return _clamp01((x - lo) / (hi - lo))
 
 
-# ────────────────────────── ВАЛІДАЦІЯ ──────────────────────────
+# ── Валідація ──
 def validate_stats(stats: Dict[str, Any]) -> Dict[str, Any]:
     required = ["current_price", "vwap", "atr", "daily_high", "daily_low"]
     for k in required:
@@ -98,7 +108,7 @@ def validate_stats(stats: Dict[str, Any]) -> Dict[str, Any]:
     return stats
 
 
-# ────────────────────────── АНОМАЛІЇ ──────────────────────────
+# ── Аномалії ──
 def detect_anomalies(
     stats: Dict[str, Any], triggers: List[str], cfg: QDEConfig
 ) -> Dict[str, bool]:
@@ -117,7 +127,7 @@ def detect_anomalies(
     return anomalies
 
 
-# ────────────────────────── КОРИДОР РІВНІВ (лайт) ──────────────────────────
+# ── Коридор рівнів (лайт) ──
 def build_corridor(stats: Dict[str, Any]) -> Dict[str, Optional[float]]:
     """
     Спрощений коридор: використовує daily_low/high як межі; якщо ціна поза — зсуває на ATR.
@@ -151,7 +161,7 @@ def build_corridor(stats: Dict[str, Any]) -> Dict[str, Optional[float]]:
     }
 
 
-# ────────────────────────── АНАЛІЗ (мікро/мезо/макро) ──────────────────────────
+# ── Аналіз (мікро/мезо/макро) ──
 def analyze_micro(
     stats: Dict[str, Any], cfg: QDEConfig, triggers: List[str]
 ) -> Dict[str, float]:
@@ -242,7 +252,7 @@ def analyze_macro(stats: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
-# ────────────────────────── СКОРИНГ СЦЕНАРІЇВ ──────────────────────────
+# ── Скоринг сценаріїв ──
 def decision_matrix(
     micro: Dict[str, float], meso: Dict[str, float], macro: Dict[str, float]
 ) -> Dict[str, float]:
@@ -321,7 +331,7 @@ def select_scenario(dm: Dict[str, float], min_abs: float) -> Tuple[str, float]:
     return Scenario.UNCERTAIN, float(max(0.0, min(1.0, top * 0.6)))
 
 
-# ────────────────────────── CONFIDENCE ──────────────────────────
+# ── Confidence ──
 def compute_confidence(ctx: Dict[str, Any]) -> Dict[str, float]:
     bp = ctx.get("breakout_probability")
     pp = ctx.get("pullback_probability")
@@ -353,7 +363,7 @@ def compute_confidence(ctx: Dict[str, Any]) -> Dict[str, float]:
     }
 
 
-# ────────────────────────── РЕКОМЕНДАЦІЯ ──────────────────────────
+# ── Рекомендація ──
 def make_recommendation(ctx: Dict[str, Any], conf: Dict[str, float]) -> str:
     composite = conf.get("composite_confidence", 0.0)
     scn = ctx.get("scenario", Scenario.UNCERTAIN)
@@ -399,7 +409,7 @@ def make_recommendation(ctx: Dict[str, Any], conf: Dict[str, float]) -> str:
     return "AVOID"
 
 
-# ────────────────────────── НАРАТИВ ──────────────────────────
+# ── Наратив ──
 def make_narrative(
     ctx: Dict[str, Any], anomalies: Dict[str, bool], lang: str = "UA"
 ) -> str:
@@ -476,7 +486,7 @@ def make_narrative(
     return " ".join(parts)
 
 
-# ────────────────────────── РИЗИК ──────────────────────────
+# ── Ризик ──
 def make_risk(
     stats: Dict[str, Any], ctx: Dict[str, Any], cfg: QDEConfig
 ) -> Dict[str, Any]:
@@ -497,7 +507,7 @@ def make_risk(
     return {"sl_level": sl, "tp_targets": tps, "risk_reward_ratio": rr}
 
 
-# ────────────────────────── ЯДРО: QDEngine ──────────────────────────
+# ── Ядро: QDEngine ──
 class QDEngine:
     """Один клас, один виклик — повний цикл аналізу."""
 
@@ -574,7 +584,7 @@ class QDEngine:
         }
 
 
-# ────────────────────────── ПРИКЛАД ──────────────────────────
+# ── Приклад ──
 if __name__ == "__main__":
     engine = QDEngine()
     sample = {
@@ -595,3 +605,20 @@ if __name__ == "__main__":
     out = engine.process(sample)
     print(pd.Series(out["confidence_metrics"]))
     print(out["recommendation"], "-", out["narrative"])
+
+__all__ = [
+    "QDEConfig",
+    "QDEngine",
+    "Scenario",
+    "detect_anomalies",
+    "build_corridor",
+    "analyze_micro",
+    "analyze_meso",
+    "analyze_macro",
+    "decision_matrix",
+    "select_scenario",
+    "compute_confidence",
+    "make_recommendation",
+    "make_narrative",
+    "make_risk",
+]

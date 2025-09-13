@@ -1,9 +1,11 @@
-# stage3/trade_manager.py
-# -*- coding: utf-8 -*-
+"""Stage3 TradeLifecycleManager.
+
+Управління життєвим циклом угод: відкриття, оновлення за правилами,
+trail, дострокові виходи, контекстні адаптації. Уніфікований стиль:
+короткі секційні хедери, guard для логера, коментарі до broad except.
 """
-Stage3: TradeLifecycleManager — управління життєвим циклом угоди.
-Містить модель угоди (Trade), правила оновлення (TradeRule) і асинхронний менеджер.
-"""
+
+from __future__ import annotations
 
 import asyncio
 import logging
@@ -13,9 +15,18 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional
 from utils.utils import safe_float
 
-# --- Логування ---
-logger = logging.getLogger("trade_manager")
-logger.setLevel(logging.DEBUG)
+# ── Logger ───────────────────────────────────────────────────────────────────
+logger = logging.getLogger("stage3.trade_manager")
+if not logger.handlers:  # guard від дублювання
+    logger.setLevel(logging.DEBUG)
+    try:
+        from rich.console import Console  # type: ignore
+        from rich.logging import RichHandler  # type: ignore
+
+        logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    except Exception:  # broad except: rich опціональний
+        logger.addHandler(logging.StreamHandler())
+    logger.propagate = False
 
 # ───── Статуси угод ─────
 TRADE_STATUS: Dict[str, str] = {
@@ -588,8 +599,7 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
                     # Оновлення ринковими даними
                     market_data = self.get_market_data(trade.symbol)
                     await self.update_trade(trade_id, market_data)
-
-                except Exception as e:
+                except Exception as e:  # broad except: ізоляція однієї угоди
                     logger.error(f"Error managing trade {trade_id}: {e}")
 
             await asyncio.sleep(60)
@@ -732,7 +742,7 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
             df = self.context_engine.load_data(symbol)
             if df is not None and not df.empty:
                 return float(df.iloc[-1]["close"])
-        except Exception as e:
+        except Exception as e:  # broad except: тільки лог діагностики
             logger.error(f"get_current_price error for {symbol}: {e}")
         return 0.0
 
@@ -742,7 +752,7 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
             df = self.context_engine.load_data(symbol)
             if df is not None and not df.empty:
                 return float(df.iloc[-1]["volume"])
-        except Exception as e:
+        except Exception as e:  # broad except: тільки лог діагностики
             logger.error(f"get_current_volume error for {symbol}: {e}")
         return 0.0
 
@@ -752,7 +762,7 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
             df = self.context_engine.load_data(symbol)
             if df is not None and not df.empty and "rsi" in df.columns:
                 return float(df.iloc[-1]["rsi"])
-        except Exception as e:
+        except Exception as e:  # broad except: тільки лог діагностики
             logger.error(f"get_current_rsi error for {symbol}: {e}")
         return 0.0
 
@@ -769,6 +779,6 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
                 bid = float(df.iloc[-1]["bid"])
                 ask = float(df.iloc[-1]["ask"])
                 return abs(ask - bid)
-        except Exception as e:
+        except Exception as e:  # broad except: тільки лог діагностики
             logger.error(f"get_bid_ask_spread error for {symbol}: {e}")
         return 0.0

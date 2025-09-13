@@ -1,4 +1,8 @@
-# asset_triggers/__init__.py
+"""Stage1 Asset Triggers package.
+
+Експортує набір детекторів подій для початкового аналізу активів.
+"""
+
 from .volume_spike_trigger import volume_spike_trigger
 from .breakout_level_trigger import breakout_level_trigger
 from .volatility_spike_trigger import volatility_spike_trigger

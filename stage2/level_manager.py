@@ -1,19 +1,13 @@
-# stage2/level_manager.py
-# -*- coding: utf-8 -*-
-"""
-LevelSystem v2 — менеджер рівнів із багатоджерельним формуванням, вагами та злиттям.
+"""LevelSystem v2 — менеджер рівнів (агрегація + нормалізація).
 
-Основні можливості:
-- Збір рівнів із кількох джерел: daily/intraday, pivots (свінги), Volume Profile (HVN),
-  Anchored VWAP ± σ.
-- Ваги/якість рівнів, просте злиття близьких рівнів за ε (відносна відстань).
-- Пошук support/resistance з урахуванням ваг (ефективна відстань = |Δ|/(1+score)).
-- М’який seed денними рівнями, якщо даних ще немає.
-- Допоміжний метод get_corridor(): повертає support/resistance/mid/band/confidence.
+Можливості:
+    • Збір рівнів з різних джерел: daily / intraday / pivots / volume profile / Anchored VWAP
+    • Вага + band_pct + злиття близьких рівнів за відносним ε
+    • Пошук найближчих support / resistance (score-aware)
+    • Seed денними рівнями при відсутності історії
+    • Corridor / evidence API для Stage2
 
-Стиль:
-- PEP8, Google-style docstrings, type hints.
-- Логування не конфігурується тут (припускаємо глобальну конфігурацію з RichHandler).
+Призначення: централізоване управління та збагачення рівнів для QDE / Stage2.
 """
 
 from __future__ import annotations
@@ -26,9 +20,15 @@ import numpy as np
 import pandas as pd
 
 from stage1.indicators.levels import calculate_global_levels  # type: ignore
+from rich.console import Console
+from rich.logging import RichHandler
 
-logger = logging.getLogger("stage2.level_manager")
-logger.propagate = False
+# ───────────────────────────── Логування ─────────────────────────────
+logger = logging.getLogger("app.stage2.level_manager")
+if not logger.handlers:  # захист від повторної ініціалізації
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
 @dataclass
@@ -269,7 +269,9 @@ class LevelManager:
                             band_pct=float(band),
                         )
                     )
-                except Exception:
+                except (
+                    Exception
+                ):  # broad except: пропускаємо одиничні некоректні рівні без зриву оновлення
                     continue
 
         # 1) Pivots/екстремуми

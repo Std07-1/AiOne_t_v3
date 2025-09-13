@@ -187,7 +187,7 @@ class UI_Consumer:
                                         "♻️ Fallback snapshot reload: %d активів",
                                         len(assets_snap),
                                     )
-                        except Exception:
+                        except Exception:  # broad except: fallback reload best-effort
                             pass
                     message = await pubsub.get_message(
                         ignore_subscribe_messages=True, timeout=1.0

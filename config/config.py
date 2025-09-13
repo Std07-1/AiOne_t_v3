@@ -22,10 +22,10 @@ from __future__ import annotations
 # ──────────────────────────────────────────────────────────────────────────────
 import asyncio
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
-from pydantic import BaseModel, confloat, conint, validator
+from pydantic import BaseModel, validator
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ REDIS_SNAPSHOT_KEY: str = "asset_state_snapshot"
 # ──────────────────────────────────────────────────────────────────────────────
 # UI / ЛОКАЛІЗАЦІЯ
 # ──────────────────────────────────────────────────────────────────────────────
-#: Основна локаль UI (використовуй у форматуванні дат/чисел за потреби)
+#: Основна локаль UI (використовуємо у форматуванні дат/чисел за потреби)
 UI_LOCALE: str = "uk-UA"
 
 #: Підпис колонки для обігу в доларах США

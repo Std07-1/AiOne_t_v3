@@ -1,3 +1,10 @@
+"""Breakout / Near-Level Trigger.
+
+Виявляє:
+    • Пробій локальних максимумів/мінімумів
+    • Близькість до локальних та денних рівнів (support/resistance)
+"""
+
 import pandas as pd
 import logging
 from typing import Dict, Any
@@ -5,12 +12,12 @@ from typing import Dict, Any
 from rich.console import Console
 from rich.logging import RichHandler
 
-# --- Налаштування логування ---
+# ── Логування ───────────────────────────────────────────────────────────────
 logger = logging.getLogger("asset_triggers.breakout_level")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-logger.propagate = False
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
 def breakout_level_trigger(
@@ -21,21 +28,10 @@ def breakout_level_trigger(
     near_daily_threshold: float = 0.5,
     symbol: str = "",
 ) -> Dict[str, bool]:
-    """
-    Виявляє пробій локальних екстремумів і близькість до них,
-    а також до глобальних денних рівнів.
+    """Виявляє пробій локальних екстремумів і близькість до них та денних рівнів.
 
-    Параметри:
-    - df: останні бари, мінімум window+1
-    - stats: словник з update_statistics, повинен містити 'daily_levels': List[float]
-    - window: число барів для локальних екстремумів
-    - near_threshold: поріг близькості до локальних рівнів (в частках, напр. 0.005=0.5%)
-    - near_daily_threshold: поріг близькості до денних рівнів (в %)
-    - symbol: символ для логування
-
-    Повертає словник із ключами:
-    - breakout_up, breakout_down, near_high, near_low,
-    - near_daily_support, near_daily_resistance
+    Returns:
+        Dict[str, bool]: breakouts / near-level flags
     """
     triggers: Dict[str, bool] = {
         "breakout_up": False,

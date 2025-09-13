@@ -62,7 +62,7 @@ from data.unified_store import (
     UnifiedDataStore,
 )  # unified store (single source of truth)
 
-# --- Налаштування/константи ---
+# ── Налаштування / константи ───────────────────────────────────────────────
 PARTIAL_CHANNEL = "klines.1m.partial"
 FINAL_CHANNEL = "klines.1h.update"
 # Default TTLs for legacy blob snapshot (NOT the canonical ds.cfg.intervals_ttl)

@@ -352,7 +352,7 @@ async def run_pipeline() -> None:
             },
         )
 
-        # --- Виконуємо фон-воркери ---
+        # ── Виконуємо фон-воркери ──────────────────────────────────────────
         # WSWorker still legacy; will be refactored to use store (task 5)
         # WSWorker v2 (selectors_key configurable, intervals_ttl for legacy blob TTL overrides)
         ws_worker = WSWorker(

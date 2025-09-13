@@ -1,10 +1,17 @@
-# stage2/processor.py
-# -*- coding: utf-8 -*-
+"""Stage2 (lite) — мінімальний процесор.
 
-"""Stage2 (lite) — мінімальний процесор:
+Потік:
+    Stage1 stats → QDE Core → corridor (LevelManager) → evidence → результат.
 
-Потік: Stage1 stats -> QDE Core -> corridor (LevelManager) -> evidence -> результат.
-Без калібрування, без легасі fallback. Лише необхідні поля для UI та продюсера.
+Призначення:
+    • Формування компактного результату (recommendation / confidence / risk / narrative)
+    • Інʼєкція коридору рівнів (LevelManager v2) у context
+    • Повністю без калібрування та легасі модулів
+
+Особливості:
+    • Валідація мінімально необхідних полів
+    • Обережне оновлення LevelSystem (throttling)
+    • Логування короткого REC-підсумку
 """
 
 from __future__ import annotations
@@ -20,20 +27,17 @@ from rich.logging import RichHandler
 
 from config.config import STAGE2_CONFIG
 
-# підключаємо незалежний QDE Core
+# Підключаємо незалежний QDE Core
 from .qde_core import QDEngine, QDEConfig
 from .level_manager import LevelManager
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ЛОГУВАННЯ
-# ──────────────────────────────────────────────────────────────────────────────
-logger = logging.getLogger("stage2.processor")
-logger.setLevel(logging.INFO)
-handler = RichHandler(console=Console(stderr=True), show_path=False)
-logger.handlers.clear()
-logger.addHandler(handler)
-logger.propagate = False
+# ── Логування ──
+logger = logging.getLogger("app.stage2.processor")
+if not logger.handlers:  # захист від повторної ініціалізації
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
 def _safe(val: Any, default: float = 0.0) -> float:
@@ -43,16 +47,22 @@ def _safe(val: Any, default: float = 0.0) -> float:
         if math.isnan(f) or math.isinf(f):
             return default
         return f
-    except Exception:
+    except (
+        Exception
+    ):  # broad except: захист від будь-яких типів/об'єктів, що не кастяться у float
         return default
 
 
 class Stage2Processor:
-    """
-    Легкий Stage2-процесор:
-    - QDE Core як єдине ядро аналізу (context + confidence + reco + narrative + risk).
-    - LevelManager v2 для оновлення рівнів і corridor/evidence.
-    - Без легасі-модулів калібрування, аномалій, ризику, наративу тощо.
+    """Легкий Stage2-процесор.
+
+    Фокусується лише на необхідному пайплайні:
+        QDE Core (context/confidence/reco/narrative/risk) + LevelManager corridor.
+
+    Відсутнє:
+        • Калібрування
+        • Легасі anomaly/risk overlays
+        • Будь-які кеш-адаптери
     """
 
     def __init__(
@@ -95,9 +105,7 @@ class Stage2Processor:
 
         logger.debug("Stage2Processor (lite) ініціалізовано, TF=%s", timeframe)
 
-    # ────────────────────────────────────────────────────────────────────
-    # Внутрішні допоміжні
-    # ────────────────────────────────────────────────────────────────────
+    # ── Внутрішні допоміжні ──
     def _maybe_fetch_bars(self, symbol: str) -> Tuple[Any, Any, Any]:
         """Повертає (df_1m, df_5m, df_1d), якщо доступні; інакше (None, None, None)."""
         df_1m = (
@@ -140,12 +148,12 @@ class Stage2Processor:
             )
 
             self._levels_last_update[symbol] = now_ts
-        except Exception as e:
+        except (
+            Exception
+        ) as e:  # broad except: оновлення рівнів не критичне, пропускаємо
             logger.debug("Level update skipped for %s: %s", symbol, e)
 
-    # ────────────────────────────────────────────────────────────────────
-    # Основний пайплайн
-    # ────────────────────────────────────────────────────────────────────
+    # ── Основний пайплайн ──
     async def process(self, stage1_signal: Dict[str, Any]) -> Dict[str, Any]:
         """
         Мінімалістичний потік:
@@ -230,7 +238,7 @@ class Stage2Processor:
                     else {}
                 )
                 ctx["level_evidence"] = {"support": s_ev, "resistance": r_ev}
-            except Exception:
+            except Exception:  # broad except: evidence необов'язкова, тихо фолбек
                 ctx["level_evidence"] = {"support": {}, "resistance": {}}
 
             # 4) Лог короткого підсумку (сумісний)
@@ -272,7 +280,9 @@ class Stage2Processor:
             )
             return result
 
-        except Exception as e:
+        except (
+            Exception
+        ) as e:  # broad except: фінальний бар'єр Stage2, гарантуємо повернення без падіння пайплайну
             logger.exception("Stage2Processor failure: %s", e)
             return {
                 "error": "SYSTEM_FAILURE",

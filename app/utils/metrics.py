@@ -12,7 +12,7 @@ import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 
 # ──────────────────── Класи для метрик ────────────────────────

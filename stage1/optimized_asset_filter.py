@@ -28,7 +28,7 @@ import logging
 from rich.console import Console
 from rich.logging import RichHandler
 
-# --- Налаштування логування ---
+# ── Налаштування логування ─────────────────────────────────────────────────
 logger = logging.getLogger("optimized_asset_filter")
 logger.setLevel(logging.INFO)
 logger.handlers.clear()

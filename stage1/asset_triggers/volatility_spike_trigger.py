@@ -1,25 +1,26 @@
+"""Volatility Spike Trigger.
+
+Виявляє різкий стрибок волатильності через порівняння поточного True Range з історичним ATR.
+"""
+
 import pandas as pd
 import logging
-
-logger = logging
 
 from rich.console import Console
 from rich.logging import RichHandler
 
-# --- Налаштування логування ---
+# ── Логування ───────────────────────────────────────────────────────────────
 logger = logging.getLogger("asset_triggers.volatility_spike")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-logger.propagate = False
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
 def volatility_spike_trigger(
     df: pd.DataFrame, window: int = 14, threshold: float = 2.0, symbol: str = ""
 ) -> bool:
-    """Виявляє різкий стрибок волатильності.
-    Повертає True, якщо діапазон останнього бару більше, ніж threshold * середній діапазон попередніх window барів.
-    """
+    """Повертає True якщо TR останнього бару > threshold * середній TR попередніх window."""
     if len(df) < window + 1:
         logger.debug(
             f"[{symbol}] [VolatilitySpike] Недостатньо даних ({len(df)}) для window={window}"

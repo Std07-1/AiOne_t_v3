@@ -373,6 +373,13 @@ async def screening_producer(
         logger.info("📢 Публікація стану активів...")
         await publish_full_state(state_manager, store, redis_conn)
         processing_time = time.time() - start_time
+        # Метрика часу циклу (Prometheus якщо увімкнено)
+        try:
+            store.metrics.put_latency.labels(layer="screening_cycle").observe(
+                processing_time
+            )
+        except Exception:
+            pass
         logger.info(f"⏳ Час обробки циклу: {processing_time:.2f} сек")
         if processing_time < 1:
             logger.warning(

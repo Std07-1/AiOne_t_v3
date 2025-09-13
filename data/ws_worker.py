@@ -248,6 +248,11 @@ class WSWorker:
             await self.store.put_bars(sym, tf, df_row)
         except Exception as e:
             logger.warning("Failed to put bars into UnifiedDataStore: %s", e)
+        # Лічильник отриманих повідомлень WS
+        try:
+            self.store.metrics.errors.inc(stage="ws_msg")  # reuse counter namespace
+        except Exception:
+            pass
 
         # Запис у Redis (як fallback і для stage2+)
         df_1m = await self._store_minute(sym, ts, k)

@@ -44,6 +44,12 @@ from stage1.indicators import (
 from rich.console import Console
 from rich.logging import RichHandler
 
+try:  # optional Prometheus
+    from prometheus_client import Gauge, Counter  # type: ignore
+except Exception:  # pragma: no cover
+    Gauge = None  # type: ignore
+    Counter = None  # type: ignore
+
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.stage1.asset_monitoring")
 if not logger.handlers:  # guard від подвійного підключення
@@ -94,6 +100,44 @@ class AssetMonitorStage1:
         # Статистики для anti-spam/визначення частоти тригерів можна додати тут, якщо потрібно
         self.feature_switches = feature_switches or {}
         self._sw_triggers = self.feature_switches.get("triggers") or {}
+        # ── Prometheus метрики Stage1 (опціонально) ──
+        self._m_feed_lag = None  # Gauge (max feed lag seconds across symbols)
+        self._m_missing_bars = None  # Counter (detected gaps)
+        self._last_processed_last_ts: Dict[str, float] = {}
+        self._last_symbol_lag: Dict[str, float] = {}
+        if Gauge and Counter:
+            try:
+                from prometheus_client import REGISTRY  # type: ignore
+
+                def _gauge(name: str, desc: str):
+                    try:
+                        return Gauge(name, desc)  # type: ignore
+                    except Exception:
+                        # спробуємо знайти існуючий
+                        for m in REGISTRY.collect():  # pragma: no cover
+                            if m.name == name:
+                                return m
+                        return None
+
+                def _counter(name: str, desc: str):
+                    try:
+                        return Counter(name, desc)  # type: ignore
+                    except Exception:
+                        for m in REGISTRY.collect():  # pragma: no cover
+                            if m.name == name:
+                                return m
+                        return None
+
+                self._m_feed_lag = _gauge(
+                    "stage1_feed_lag_seconds",
+                    "Max feed lag (seconds) across tracked symbols (now - last bar timestamp)",
+                )
+                self._m_missing_bars = _counter(
+                    "stage1_missing_bars_total",
+                    "Accumulated count of inferred missing bars (gaps in timestamps)",
+                )
+            except Exception:  # pragma: no cover
+                pass
 
     def update_params(
         self,
@@ -159,6 +203,74 @@ class AssetMonitorStage1:
         df = ensure_timestamp_column(df)
         if df.empty:
             raise ValueError(f"[{symbol}] Передано порожній DataFrame для статистики!")
+
+        # ── Feed lag & missing bars instrumentation ──
+        try:
+            ts_series = df["timestamp"]
+            # Нормалізуємо до секунд (якщо ms)
+            last_raw = ts_series.iloc[-1]
+            prev_raw = ts_series.iloc[-2] if len(ts_series) > 1 else ts_series.iloc[-1]
+
+            # Конвертація у float seconds
+            def _to_sec(v: Any) -> float:
+                try:
+                    fv = float(v)
+                    # heuristics: ms if >1e12
+                    if fv > 1_000_000_000_000:
+                        return fv / 1000.0
+                    # ns (pandas) if >1e18
+                    if fv > 1_000_000_000_000_000_000:
+                        return fv / 1_000_000_000.0
+                    return fv
+                except Exception:
+                    try:
+                        # try parse via pandas
+                        return pd.to_datetime([v]).view("int64")[0] / 1e9  # type: ignore
+                    except Exception:
+                        return float("nan")
+
+            last_ts = _to_sec(last_raw)
+            prev_ts = _to_sec(prev_raw)
+            now_sec = datetime.now(timezone.utc).timestamp()
+            if self._m_feed_lag is not None and not np.isnan(last_ts):
+                lag = max(0.0, now_sec - last_ts)
+                self._last_symbol_lag[symbol] = lag
+                try:
+                    # оновлюємо gauge максимальним lag по всіх символах
+                    self._m_feed_lag.set(max(self._last_symbol_lag.values()))  # type: ignore
+                except Exception:
+                    pass
+
+            # Missing bars: рахуємо тільки якщо новий last_ts (щоб не подвоювати)
+            if (
+                self._m_missing_bars is not None
+                and not np.isnan(last_ts)
+                and symbol in self._last_processed_last_ts
+                and self._last_processed_last_ts[symbol] != last_ts
+            ):
+                # очікуваний інтервал (median останніх diff або fallback 60s)
+                if len(ts_series) >= 3:
+                    diffs = []
+                    for a, b in zip(ts_series.values[-10:-1], ts_series.values[-9:]):
+                        da = _to_sec(a)
+                        db = _to_sec(b)
+                        if not np.isnan(da) and not np.isnan(db):
+                            diffs.append(db - da)
+                    expected = float(np.median(diffs)) if diffs else 60.0
+                else:
+                    expected = 60.0
+                gap = last_ts - prev_ts
+                if expected > 0 and gap > expected * 1.5:
+                    missing = int(gap / expected) - 1
+                    if missing > 0:
+                        try:
+                            self._m_missing_bars.inc(missing)  # type: ignore
+                        except Exception:
+                            pass
+            # оновлюємо маркер останнього опрацьованого last_ts
+            self._last_processed_last_ts[symbol] = last_ts
+        except Exception:  # instrumentation не повинен ламати основний потік
+            pass
 
         # 2. Основні ціни/зміни
         price = df["close"].iloc[-1]

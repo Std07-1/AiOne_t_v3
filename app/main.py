@@ -175,7 +175,15 @@ def start_prometheus_if_enabled(cfg: DataStoreCfg) -> bool:
 async def health_pinger(metrics, cfg) -> None:
     """Проста періодична інкрементація лічильника для моніторингу життєздатності."""
     while True:
-        metrics.errors.inc(stage="health_ping")
+        try:
+            # ds_errors_total має label 'stage' -> треба викликати через labels
+            metrics.errors.labels(stage="health_ping").inc()  # type: ignore
+        except Exception:
+            # fallback на raw inc без labels якщо Noop або інша реалізація
+            try:
+                metrics.errors.inc()  # type: ignore
+            except Exception:
+                pass
         await asyncio.sleep(cfg.admin.health_ping_sec)
 
 

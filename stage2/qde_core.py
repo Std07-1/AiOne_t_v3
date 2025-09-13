@@ -478,7 +478,7 @@ def make_narrative(
         elif band > 1.5:
             parts.append(
                 {
-                    "UA": "Широкий діапазон — ризикні рухи.",
+                    "UA": "Широкий діапазон — ризиковані рухи.",
                     "EN": "Wide range — risky moves.",
                 }[lang]
             )

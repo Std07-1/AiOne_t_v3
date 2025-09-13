@@ -51,6 +51,8 @@ class UI_Consumer:
         self._display_results: List[Dict[str, Any]] = (
             []
         )  # кеш останнього непорожнього списку
+        self._blink_state = False  # для миготіння pressure
+        self._pressure_alert_active = False
 
     def _format_price(self, price: float) -> str:
         if price >= 1000:
@@ -122,7 +124,7 @@ class UI_Consumer:
         )
         pubsub = redis_client.pubsub()
 
-        # Спроба початкового снапшоту перед підпискою
+        # Спроба початкового снапшоту перед підпискою + нові core-статистики
         try:
             snapshot_raw = await redis_client.get("asset_state_snapshot")
             if snapshot_raw:
@@ -144,7 +146,56 @@ class UI_Consumer:
                         "📥 Завантажено початковий снапшот: %d активів",
                         len(self._last_results),
                     )
-        except Exception:
+            # Нові агреговані трейд-метрики (stats:core)
+            try:
+                core_raw = await redis_client.get("ai_one:stats:core")
+                if core_raw:
+                    core = json.loads(core_raw)
+                    trades_part = (
+                        core.get("trades", {}) if isinstance(core, dict) else {}
+                    )
+                    # кешуємо як counters.* для заголовку
+                    if trades_part:
+                        self._last_counters.update(
+                            {
+                                "active_trades": trades_part.get("active"),
+                                "closed_trades": trades_part.get("closed"),
+                                "skipped": core.get("skipped"),
+                                "skipped_ewma": core.get("skipped_ewma"),
+                                "drift_ratio": core.get("drift_ratio"),
+                                "dynamic_interval": core.get("dynamic_interval"),
+                                "pressure": core.get("pressure"),
+                                "pressure_norm": core.get("pressure_norm"),
+                                "alpha": core.get("alpha"),
+                            }
+                        )
+                        thresholds = core.get("thresholds") or {}
+                        consecutive = core.get("consecutive") or {}
+                        self._last_counters["th_drift_high"] = thresholds.get(
+                            "drift_high"
+                        )
+                        self._last_counters["th_drift_low"] = thresholds.get(
+                            "drift_low"
+                        )
+                        self._last_counters["th_pressure"] = thresholds.get("pressure")
+                        self._last_counters["consec_drift_high"] = consecutive.get(
+                            "drift_high"
+                        )
+                        self._last_counters["consec_pressure_high"] = consecutive.get(
+                            "pressure_high"
+                        )
+                        if "skip_reasons" in core and isinstance(
+                            core.get("skip_reasons"), dict
+                        ):
+                            self._last_counters["skip_reasons"] = core.get(
+                                "skip_reasons"
+                            )
+                        # last_update_ts можна відобразити як heartbeat
+                        if core.get("last_update_ts"):
+                            self.last_update_time = float(core["last_update_ts"])
+            except Exception:
+                pass
+        except Exception:  # broad-except: початковий снапшот не критичний
             ui_logger.debug("Не вдалося завантажити початковий снапшот", exc_info=True)
 
         await asyncio.sleep(loading_delay)
@@ -338,11 +389,152 @@ class UI_Consumer:
 
         last_update = datetime.fromtimestamp(self.last_update_time).strftime("%H:%M:%S")
 
+        # Нові трейд-метрики з core (якщо були підвантажені)
+        active_trades = self._last_counters.get("active_trades")
+        closed_trades = self._last_counters.get("closed_trades")
+        skipped = self._last_counters.get("skipped")
+        skipped_ewma = self._last_counters.get("skipped_ewma")
+        drift_ratio = self._last_counters.get("drift_ratio")
+        dynamic_interval = self._last_counters.get("dynamic_interval")
+        pressure = self._last_counters.get("pressure")
+        pressure_norm = self._last_counters.get("pressure_norm")
+        th_drift_high = self._last_counters.get("th_drift_high")
+        th_drift_low = self._last_counters.get("th_drift_low")
+        th_pressure = self._last_counters.get("th_pressure")
+        consec_drift = self._last_counters.get("consec_drift_high")
+        consec_pressure = self._last_counters.get("consec_pressure_high")
+        alpha_val = self._last_counters.get("alpha")
+        skip_reasons = self._last_counters.get("skip_reasons")
+
+        # Форматуємо drift (якщо буде передаватися через stats:core у майбутньому)
+        if drift_ratio is not None:
+            try:
+                drift_val = float(drift_ratio)
+                # Якщо thresholds доступні – використовуємо їх
+                if th_drift_high is not None and th_drift_low is not None:
+                    if drift_val < float(th_drift_low):
+                        drift_color = (
+                            "yellow"  # занадто повільно / мало часу? (нижній поріг)
+                        )
+                    elif drift_val > float(th_drift_high):
+                        drift_color = "red"
+                    else:
+                        drift_color = "green"
+                else:
+                    if drift_val < 0.9:
+                        drift_color = "green"
+                    elif drift_val <= 1.2:
+                        drift_color = "yellow"
+                    else:
+                        drift_color = "red"
+                drift_fragment = f" | Drift: [{drift_color}]{drift_val:.2f}[/]"
+            except Exception:
+                drift_fragment = ""
+        else:
+            drift_fragment = ""
+
+        trades_fragment = ""
+        if active_trades is not None or closed_trades is not None:
+            trades_fragment = (
+                f" | Trades: 🟢{active_trades or 0}/🔴{closed_trades or 0}"
+            )
+        # Форматування skipped / ewma
+        if skipped is not None:
+            skipped_fragment = f" | Skipped: {skipped}"
+            if skipped_ewma is not None:
+                try:
+                    skipped_ewma_val = float(skipped_ewma)
+                    color = (
+                        "green"
+                        if skipped_ewma_val < 1
+                        else ("yellow" if skipped_ewma_val < 3 else "red")
+                    )
+                    skipped_fragment += f" (EWMA: [{color}]{skipped_ewma_val:.2f}[/])"
+                except Exception:
+                    pass
+        else:
+            skipped_fragment = ""
+
+        if dynamic_interval is not None:
+            try:
+                dyn_val = float(dynamic_interval)
+                dyn_color = (
+                    "green"
+                    if dyn_val
+                    <= 1.1 * (self._last_counters.get("cycle_interval") or dyn_val)
+                    else (
+                        "yellow"
+                        if dyn_val
+                        <= 2.0 * (self._last_counters.get("cycle_interval") or dyn_val)
+                        else "red"
+                    )
+                )
+                dynamic_fragment = f" | ΔInterval: [{dyn_color}]{dyn_val:.1f}s[/]"
+            except Exception:
+                dynamic_fragment = f" | ΔInterval: {dynamic_interval}"
+        else:
+            dynamic_fragment = ""
+
+        blink_fragment = ""
+        if pressure is not None:
+            try:
+                p_val = float(pressure)
+                if th_pressure is not None:
+                    th_pressure_f = float(th_pressure)
+                    if p_val > th_pressure_f:
+                        p_color = "red"
+                        self._pressure_alert_active = True
+                    elif p_val > th_pressure_f * 0.7:
+                        p_color = "yellow"
+                        self._pressure_alert_active = False
+                    else:
+                        p_color = "green"
+                        self._pressure_alert_active = False
+                else:
+                    p_color = (
+                        "green" if p_val < 0.5 else ("yellow" if p_val < 1.5 else "red")
+                    )
+                    self._pressure_alert_active = p_color == "red"
+                pressure_fragment = f" | Pressure: [{p_color}]{p_val:.2f}[/]"
+                if pressure_norm is not None:
+                    try:
+                        pn = float(pressure_norm)
+                        pressure_fragment += f"(n={pn:.2f})"
+                    except Exception:
+                        pass
+                # Миготіння
+                if self._pressure_alert_active:
+                    self._blink_state = not self._blink_state
+                    if self._blink_state:
+                        blink_fragment = " [blink][red]⚠[/][/blink]"
+            except Exception:
+                pressure_fragment = f" | Pressure: {pressure}"
+        else:
+            pressure_fragment = ""
+
+        consec_fragment = ""
+        if (consec_drift or consec_pressure) and (consec_drift or 0) + (
+            consec_pressure or 0
+        ) > 0:
+            consec_fragment = (
+                f" | Seq(drift/press): {consec_drift or 0}/{consec_pressure or 0}"
+            )
+        alpha_fragment = (
+            f" | α={alpha_val:.2f}" if isinstance(alpha_val, (int, float)) else ""
+        )
+        skip_reasons_fragment = ""
+        if isinstance(skip_reasons, dict) and skip_reasons:
+            # take first 3 reasons for compact display
+            top_pairs = list(skip_reasons.items())[:3]
+            compact = ",".join(f"{k}:{v}" for k, v in top_pairs)
+            skip_reasons_fragment = f" | SkipReasons[{compact}]"
+
         title = (
             f"[bold]Система моніторингу AiOne_t[/bold] | "
             f"Активи: [green]{total_assets}[/green] | "
             f"ALERT: [red]{alert_count}[/red] | "
             f"Оновлено: [cyan]{last_update}[/cyan]"
+            f"{trades_fragment}{skipped_fragment}{drift_fragment}{dynamic_fragment}{pressure_fragment}{consec_fragment}{alpha_fragment}{skip_reasons_fragment}{blink_fragment}"
         )
 
         table = Table(

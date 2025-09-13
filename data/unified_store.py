@@ -874,7 +874,13 @@ class UnifiedDataStore:
         missing = MIN_COLUMNS - cols
         if missing:
             logger.error(f"[validate:{stage}] Відсутні стовпці: {missing}")
-            self.metrics.errors.inc(stage=f"validate_{stage}")
+            try:
+                self.metrics.errors.labels(stage=f"validate_{stage}").inc()  # type: ignore
+            except Exception:
+                try:
+                    self.metrics.errors.inc()  # type: ignore
+                except Exception:
+                    pass
         # простий детектор гепів (по open_time)
         if "open_time" in cols:
             s = pd.to_datetime(df["open_time"], unit="ms", errors="coerce")

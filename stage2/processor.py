@@ -25,6 +25,13 @@ from typing import Any, Dict, Optional, Tuple, Callable, List
 from rich.console import Console
 from rich.logging import RichHandler
 
+try:  # optional Prometheus
+    from prometheus_client import Counter, Histogram, Gauge  # type: ignore
+except Exception:  # pragma: no cover
+    Counter = None  # type: ignore
+    Histogram = None  # type: ignore
+    Gauge = None  # type: ignore
+
 from config.config import STAGE2_CONFIG
 
 # Підключаємо незалежний QDE Core
@@ -105,6 +112,140 @@ class Stage2Processor:
 
         logger.debug("Stage2Processor (lite) ініціалізовано, TF=%s", timeframe)
 
+        # ── Prometheus метрики (опціонально) ──
+        self._m_processed_total = None
+        self._m_errors_total = None
+        self._m_latency = None
+        self._m_reco_total = None  # Counter з label recommendation
+        self._m_level_updates_total = None
+        self._m_level_update_skips_total = None
+        self._m_core_latency = None  # Histogram
+        self._m_levels_latency = None  # Histogram
+        self._m_last_success_ts = None  # Gauge
+        self._m_gap_latency = None  # Histogram (між викликами process)
+        self._last_process_wall: float | None = None
+        if Counter and Histogram:
+            try:
+                # Локальний кеш щоб уникати дублюючих реєстрацій під час гарячого перезапуску
+                from prometheus_client import REGISTRY  # type: ignore
+
+                def counter(name: str, desc: str, labelnames: tuple | None = None):
+                    try:
+                        if labelnames:
+                            return Counter(name, desc, labelnames=labelnames)  # type: ignore
+                        return Counter(name, desc)  # type: ignore
+                    except Exception:  # dup registration
+                        # Пошук існуючого (грубим способом)
+                        for metric in REGISTRY.collect():  # pragma: no cover
+                            if metric.name == name:
+                                return metric
+                        return None
+
+                def histogram(name: str, desc: str, buckets: tuple[float, ...]):
+                    try:
+                        return Histogram(name, desc, buckets=buckets)  # type: ignore
+                    except Exception:
+                        for metric in REGISTRY.collect():  # pragma: no cover
+                            if metric.name == name:
+                                return metric
+                        return None
+
+                def gauge(name: str, desc: str):
+                    try:
+                        return Gauge(name, desc)  # type: ignore
+                    except Exception:
+                        for metric in REGISTRY.collect():  # pragma: no cover
+                            if metric.name == name:
+                                return metric
+                        return None
+
+                latency_buckets = (
+                    0.001,
+                    0.003,
+                    0.005,
+                    0.01,
+                    0.02,
+                    0.05,
+                    0.1,
+                    0.25,
+                    0.5,
+                    1.0,
+                    2.0,
+                )
+                self._m_processed_total = counter(
+                    "stage2_process_total", "Кількість оброблених Stage2 сигналів"
+                )
+                self._m_errors_total = counter(
+                    "stage2_errors_total", "Кількість помилок Stage2"
+                )
+                self._m_latency = histogram(
+                    "stage2_process_latency_seconds",
+                    "Latency обробки Stage2 сигналу (perf counter)",
+                    latency_buckets,
+                )
+                self._m_reco_total = counter(
+                    "stage2_recommendation_total",
+                    "Лічильник рекомендацій за типом",
+                    ("recommendation",),
+                )
+                self._m_level_updates_total = counter(
+                    "stage2_level_updates_total",
+                    "Скільки разів відбулося оновлення LevelManager",
+                )
+                self._m_level_update_skips_total = counter(
+                    "stage2_level_update_skips_total",
+                    "Скільки разів оновлення рівнів пропущене через тротлінг",
+                )
+                # Core & levels latency (деталізація)
+                fine_latency_buckets = (
+                    0.0005,
+                    0.001,
+                    0.002,
+                    0.003,
+                    0.005,
+                    0.008,
+                    0.012,
+                    0.02,
+                    0.03,
+                    0.05,
+                    0.08,
+                    0.12,
+                    0.2,
+                )
+                self._m_core_latency = histogram(
+                    "stage2_qde_core_latency_seconds",
+                    "Latency QDE core processing inside Stage2",
+                    fine_latency_buckets,
+                )
+                self._m_levels_latency = histogram(
+                    "stage2_level_manager_latency_seconds",
+                    "Latency corridor + evidence (LevelManager) Stage2",
+                    fine_latency_buckets,
+                )
+                self._m_last_success_ts = gauge(
+                    "stage2_last_success_ts",
+                    "Unix timestamp of last successful Stage2 process()",
+                )
+                self._m_gap_latency = histogram(
+                    "stage2_gap_seconds",
+                    "Gap (wall time) between successive Stage2 process() calls",
+                    (
+                        0.05,
+                        0.1,
+                        0.25,
+                        0.5,
+                        1.0,
+                        2.0,
+                        5.0,
+                        10.0,
+                        30.0,
+                        60.0,
+                        120.0,
+                    ),
+                )
+            except Exception:  # pragma: no cover
+                pass
+
     # ── Внутрішні допоміжні ──
     def _maybe_fetch_bars(self, symbol: str) -> Tuple[Any, Any, Any]:
         """Повертає (df_1m, df_5m, df_1d), якщо доступні; інакше (None, None, None)."""
@@ -130,6 +271,12 @@ class Stage2Processor:
         now_ts = int(time.time())
         last = self._levels_last_update.get(symbol, 0)
         if (now_ts - last) < self.levels_update_every:
+            # instrumentation skip
+            if self._m_level_update_skips_total is not None:
+                try:
+                    self._m_level_update_skips_total.inc()  # type: ignore
+                except Exception:
+                    pass
             return
 
         try:
@@ -148,6 +295,11 @@ class Stage2Processor:
             )
 
             self._levels_last_update[symbol] = now_ts
+            if self._m_level_updates_total is not None:
+                try:
+                    self._m_level_updates_total.inc()  # type: ignore
+                except Exception:
+                    pass
         except (
             Exception
         ) as e:  # broad except: оновлення рівнів не критичне, пропускаємо
@@ -159,6 +311,7 @@ class Stage2Processor:
         Мінімалістичний потік:
         Stage1 stats --> QDE Core --> corridor v2 injection (LevelManager) --> evidence --> результат
         """
+        start_perf = time.perf_counter()
         try:
             stats = dict(stage1_signal.get("stats") or {})
             # self._update_levels_if_needed(symbol, stats)
@@ -186,6 +339,7 @@ class Stage2Processor:
                 stats["daily_high"] = cp * 1.01
 
             # 1) QDE Core — єдине джерело context/confidence/reco/narrative/risk
+            core_start = time.perf_counter()
             result = self.engine.process(
                 {
                     "symbol": symbol,
@@ -193,8 +347,14 @@ class Stage2Processor:
                     "trigger_reasons": triggers,
                 }
             )
+            if self._m_core_latency is not None:
+                try:
+                    self._m_core_latency.observe(max(0.0, time.perf_counter() - core_start))  # type: ignore
+                except Exception:
+                    pass
 
             # 2) Corridor v2 із LevelManager (override key_levels у context)
+            levels_start = time.perf_counter()
             corr = (
                 self.level_manager.get_corridor(
                     symbol=symbol,
@@ -240,6 +400,11 @@ class Stage2Processor:
                 ctx["level_evidence"] = {"support": s_ev, "resistance": r_ev}
             except Exception:  # broad except: evidence необов'язкова, тихо фолбек
                 ctx["level_evidence"] = {"support": {}, "resistance": {}}
+            if self._m_levels_latency is not None:
+                try:
+                    self._m_levels_latency.observe(max(0.0, time.perf_counter() - levels_start))  # type: ignore
+                except Exception:
+                    pass
 
             # 4) Лог короткого підсумку (сумісний)
             conf = result.get("confidence_metrics", {}) or {}
@@ -278,12 +443,52 @@ class Stage2Processor:
                     "processing_time": datetime.utcnow().isoformat(),
                 }
             )
+            # instrumentation success
+            if self._m_processed_total is not None:
+                try:
+                    self._m_processed_total.inc()  # type: ignore
+                except Exception:
+                    pass
+            if self._m_reco_total is not None:
+                try:
+                    reco = str(result.get("recommendation"))
+                    self._m_reco_total.labels(recommendation=reco).inc()  # type: ignore
+                except Exception:
+                    pass
+            if self._m_latency is not None:
+                try:
+                    self._m_latency.observe(max(0.0, time.perf_counter() - start_perf))  # type: ignore
+                except Exception:
+                    pass
+            # Gap & last success timestamp
+            wall_now = time.time()
+            if self._last_process_wall is not None and self._m_gap_latency is not None:
+                try:
+                    self._m_gap_latency.observe(max(0.0, wall_now - self._last_process_wall))  # type: ignore
+                except Exception:
+                    pass
+            self._last_process_wall = wall_now
+            if self._m_last_success_ts is not None:
+                try:
+                    self._m_last_success_ts.set(wall_now)  # type: ignore
+                except Exception:
+                    pass
             return result
 
         except (
             Exception
         ) as e:  # broad except: фінальний бар'єр Stage2, гарантуємо повернення без падіння пайплайну
             logger.exception("Stage2Processor failure: %s", e)
+            if self._m_errors_total is not None:
+                try:
+                    self._m_errors_total.inc()  # type: ignore
+                except Exception:
+                    pass
+            if self._m_latency is not None:
+                try:
+                    self._m_latency.observe(max(0.0, time.perf_counter() - start_perf))  # type: ignore
+                except Exception:
+                    pass
             return {
                 "error": "SYSTEM_FAILURE",
                 "symbol": stage1_signal.get("symbol", "UNKNOWN"),

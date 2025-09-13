@@ -18,7 +18,7 @@ from typing import Any, Dict, Optional, Tuple, Callable, List
 from rich.console import Console
 from rich.logging import RichHandler
 
-from stage2.config import STAGE2_CONFIG
+from config.config import STAGE2_CONFIG
 
 # підключаємо незалежний QDE Core
 from .qde_core import QDEngine, QDEConfig

@@ -1,34 +1,40 @@
-"""
-Основний модуль запуску системи AiOne_t
-app/main.py
+"""AiOne_t — точка входу системи.
+
+Завдання модуля:
+    • Bootstrap UnifiedDataStore та пов'язані сервіси (metrics, admin, health)
+    • Підготовка списку активів (ручний або автоматичний префільтр)
+    • Preload історії / денні рівні / ініціалізація LevelManager
+    • Запуск WebSocket стрімера (WSWorker) та Stage1 моніторингу
+    • Запуск Screening Producer + публікація початкового snapshot у Redis
+    • Запуск менеджера угод (TradeLifecycleManager) та оновлювача
+
+Архітектурні акценти:
+    • Єдине джерело даних: UnifiedDataStore (Redis + RAM)
+    • Мінімум побічних ефектів у глобальному просторі — все через bootstrap()
+    • Логування уніфіковане (RichHandler, українська локалізація повідомлень)
 """
 
-import time
-import time
 import asyncio
 import logging
 import os
 import sys
 from pathlib import Path
-from dataclasses import asdict
 
 from redis.asyncio import Redis
 import subprocess
 import aiohttp
-import pandas as pd
 from dotenv import load_dotenv
 
-# FastAPI було використано раніше для експорту metrics, зараз видаляємо залежність
-
 # ─────────────────────────── Імпорти бізнес-логіки ───────────────────────────
-from data.cache_handler import SimpleCacheHandler
-from data.raw_data import OptimizedDataFetcher
-from data.file_manager import FileManager
 from data.ws_worker import WSWorker
-from data.ram_buffer import RAMBuffer
+
+# UnifiedDataStore now the single source of truth
+from data.unified_store import UnifiedDataStore, StoreConfig, StoreProfile
+from app.settings import load_datastore_cfg, DataStoreCfg
 
 from stage1.asset_monitoring import AssetMonitorStage1
-from app.screening_producer import screening_producer, publish_full_state
+from app.screening_producer import screening_producer
+from UI.publish_full_state import publish_full_state
 from .preload_and_update import (
     preload_1m_history,
     preload_daily_levels,
@@ -42,44 +48,139 @@ from app.settings import settings
 from rich.console import Console
 from rich.logging import RichHandler
 from app.screening_producer import AssetStateManager
-from stage2.config import STAGE2_CONFIG  # (залишаємо якщо ще потрібні switch'і Stage2)
+from config.config import (
+    STAGE2_CONFIG,  # (залишаємо якщо ще потрібні switch'і Stage2)
+    STAGE1_PREFILTER_THRESHOLDS,
+    MANUAL_FAST_SYMBOLS_SEED,
+    USER_SETTINGS_DEFAULT,
+    PRELOAD_1M_LOOKBACK_INIT,
+    PRELOAD_DAILY_DAYS,
+    SCREENING_LOOKBACK,
+    FAST_SYMBOLS_TTL_MANUAL,
+    FAST_SYMBOLS_TTL_AUTO,
+    PREFILTER_INTERVAL_SEC,
+    STAGE1_MONITOR_PARAMS,
+    PREFILTER_BASE_PARAMS,
+)
 from stage2.level_manager import LevelManager
 from stage1.indicators import calculate_global_levels
 from app.utils.helper import (
-    buffer_to_dataframe,
     resample_5m,
     estimate_atr_pct,
-    get_tick_size,
+    store_to_dataframe,
 )
+from utils.utils import get_tick_size
+from .admin import DataStoreAdmin, admin_command_loop
 
 # Завантажуємо налаштування з .env
 load_dotenv()
 
-# --- Логування ---
-main_logger = logging.getLogger("main")
-main_logger.setLevel(logging.INFO)
-main_logger.handlers.clear()
-main_logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-main_logger.propagate = False  # ← Критично важливо!
+# ───────────────────────────── Логування ─────────────────────────────
+logger = logging.getLogger("app.main")
+if not logger.handlers:  # захист від повторної ініціалізації
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
 # (FastAPI вилучено) — якщо потрібен REST інтерфейс у майбутньому, повернемо створення app/router
 
-# Глобальний Redis-кеш, ініціалізується при старті
-cache_handler: SimpleCacheHandler
+# ───────────────────────────── Глобальні змінні модуля ─────────────────────────────
+# Єдиний інстанс UnifiedDataStore (створюється в bootstrap)
+store: UnifiedDataStore | None = None
 
-# (calib_queue видалено — калібрація відключена)
+# Повністю видалено калібрацію та RAMBuffer — єдиний шар даних UnifiedDataStore
 
-# Шлях до кореня проекту
+# ───────────────────────────── Шлях / каталоги ─────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
 # Каталог зі статичними файлами (фронтенд WebApp)
 STATIC_DIR = BASE_DIR / "static"
 
 
-def launch_ui_consumer():
+async def bootstrap() -> UnifiedDataStore:
+    """Ініціалізація інфраструктурних компонентів.
+
+    Кроки:
+      1. Завантаження datastore конфігурації
+      2. Підключення до Redis
+      3. Ініціалізація UnifiedDataStore + maintenance loop
+      4. (Опційно) запуск Prometheus metrics server
+      5. Запуск командного адміністративного циклу та health-pinger
     """
-    Запуск UI/ui_consumer_entry.py у новому терміналі (Windows).
+    global store
+    cfg = load_datastore_cfg()
+    logger.info(
+        "[Launch] datastore.yaml loaded: namespace=%s base_dir=%s",
+        cfg.namespace,
+        cfg.base_dir,
+    )
+    redis = Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", "6379")),
+    )
+    logger.info(
+        "[Launch] Redis client created host=%s port=%s",
+        os.getenv("REDIS_HOST", "localhost"),
+        os.getenv("REDIS_PORT", "6379"),
+    )
+    # Pydantic v2: use model_dump(); fallback to dict() for backward compat
+    try:
+        profile_data = cfg.profile.model_dump()  # type: ignore[attr-defined]
+    except Exception:
+        profile_data = cfg.profile.dict()
+    store_cfg = StoreConfig(
+        namespace=cfg.namespace,
+        base_dir=cfg.base_dir,
+        profile=StoreProfile(**profile_data),
+        intervals_ttl=cfg.intervals_ttl,
+        write_behind=cfg.write_behind,
+        validate_on_read=cfg.validate_on_read,
+        validate_on_write=cfg.validate_on_write,
+        io_retry_attempts=cfg.io_retry_attempts,
+        io_retry_backoff=cfg.io_retry_backoff,
+    )
+    store = UnifiedDataStore(redis=redis, cfg=store_cfg)
+    await store.start_maintenance()
+    logger.info("[Launch] UnifiedDataStore maintenance loop started")
+    # adapters removed – use store directly
+
+    prom_started = start_prometheus_if_enabled(cfg)
+    if prom_started:
+        logger.info("[Launch] Prometheus metrics server on :%s", cfg.prometheus.port)
+    admin = DataStoreAdmin(store, store.redis, cfg)
+    asyncio.create_task(admin_command_loop(admin))
+    asyncio.create_task(health_pinger(store.metrics, cfg))
+    logger.info("[Launch] Admin command loop + health pinger started")
+    return store
+
+
+def start_prometheus_if_enabled(cfg: DataStoreCfg) -> bool:
+    """Запускає HTTP endpoint метрик, якщо активовано у конфізі.
+
+    Returns:
+        bool: True якщо сервер стартував, False якщо вимкнено або залежність відсутня.
     """
+    if not cfg.prometheus.enabled:
+        return False
+    try:
+        from prometheus_client import start_http_server  # type: ignore
+
+        start_http_server(cfg.prometheus.port)
+        return True
+    except Exception:  # broad except: зовнішня залежність може бути не встановлена
+        logger.warning("Prometheus client не встановлено – метрики HTTP не активні")
+        return False
+
+
+async def health_pinger(metrics, cfg) -> None:
+    """Проста періодична інкрементація лічильника для моніторингу життєздатності."""
+    while True:
+        metrics.errors.inc(stage="health_ping")
+        await asyncio.sleep(cfg.admin.health_ping_sec)
+
+
+def launch_ui_consumer() -> None:
+    """Запускає `UI.ui_consumer_entry` у новому терміналі (Windows / *nix)."""
     proj_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     if sys.platform.startswith("win"):
         subprocess.Popen(
@@ -95,12 +196,8 @@ def launch_ui_consumer():
 
 
 def validate_settings() -> None:
-    """
-    Перевіряємо необхідні змінні оточення:
-      - REDIS_URL або (REDIS_HOST + REDIS_PORT)
-      - BINANCE_API_KEY, BINANCE_SECRET_KEY
-    """
-    missing = []
+    """Перевіряє необхідні змінні середовища (Redis + Binance ключі)."""
+    missing: list[str] = []
     if not os.getenv("REDIS_URL"):
         if not settings.redis_host:
             missing.append("REDIS_HOST")
@@ -115,102 +212,29 @@ def validate_settings() -> None:
     if missing:
         raise ValueError(f"Відсутні налаштування: {', '.join(missing)}")
 
-    main_logger.info("Налаштування перевірено — OK.")
+    logger.info("Налаштування перевірено — OK.")
 
 
-async def init_system() -> SimpleCacheHandler:
-    """
-    Ініціалізація зовнішніх систем:
-      - Валідація налаштувань
-      - Підключення до Redis
-    Повертає: інстанс SimpleCacheHandler
-    """
-    validate_settings()
-
-    redis_url = os.getenv("REDIS_URL")
-    if redis_url:
-        handler = SimpleCacheHandler.from_url(redis_url)
-        # logger.debug("Redis через URL: %s", redis_url)
-    else:
-        handler = SimpleCacheHandler(
-            host=settings.redis_host,
-            port=settings.redis_port,
-        )
-        # logger.debug(
-        #    "Redis через host/port: %s:%s",
-        #    settings.redis_host,
-        #    settings.redis_port,
-        # )
-    return handler
+# Legacy init_system removed (UnifiedDataStore handles Redis connection)
 
 
-# --- Дебаг-функція для RAMBuffer ---
-def debug_ram_buffer(buffer, symbols, tf="1m"):
-    """
-    Дебажить свіжість барів у RAMBuffer для заданих символів.
-    """
-    now = int(time.time() * 1000)
-    for sym in symbols:
-        bars = buffer.get(sym, tf, 3)
-        if bars:
-            last_ts = bars[-1]["timestamp"]
-            print(f"[{sym}] Last bar: {last_ts} | Age: {(now - last_ts) // 1000}s")
-        else:
-            print(f"[{sym}] No bars in RAMBuffer")
-
-
-# --- HealthCheck для RAMBuffer ---
-async def ram_buffer_healthcheck(
-    buffer, symbols, max_age=90, interval=30, ws_worker=None, tf="1m"
-):
-    """
-    Моніторинг живучості даних у RAMBuffer.
-    Якщо дані по символу не оновлювались >max_age сек — лог WARN і опційно перезапуск WSWorker.
-    """
+async def noop_healthcheck():
+    """Легкий healthcheck-плейсхолдер (RAMBuffer видалено)."""
     while True:
-        now = int(time.time() * 1000)
-        dead = []
-        for sym in symbols:
-            bars = buffer.get(sym, tf, 1)
-            if not bars or (now - bars[-1]["timestamp"]) > max_age * 1000:
-                dead.append(sym)
-        if dead:
-            main_logger.warning("[HealthCheck] Symbols stalled: %s", dead)
-            if ws_worker is not None:
-                main_logger.warning(
-                    "[HealthCheck] Restarting WSWorker через застій символів."
-                )
-                await ws_worker.stop()
-                asyncio.create_task(ws_worker.consume())
-        else:
-            main_logger.debug(
-                "[HealthCheck] Всі символи активні (перевірено %d).", len(symbols)
-            )
-        await asyncio.sleep(interval)
+        await asyncio.sleep(120)
 
 
 async def run_pipeline() -> None:
-    """
-    Основний pipeline:
-    1. Ініціалізація системи та кешу
-    2. Pre-filter активів
-    3. Запуск ws_worker + RAMBuffer для 1m даних + healthcheck
-    4. Запуск скринінгу (screening_producer) для stage1
-    5. (Опційно) запуск UI/live-stats/fastapi
-    """
+    """Основний асинхронний цикл застосунку (оркестрація компонентів)."""
 
     # 1. Ініціалізація
-    cache = await init_system()  # Ініціалізуємо кеш
-    file_manager = FileManager()  # Файловий менеджер для зберігання даних
-    buffer = RAMBuffer(max_bars=120)  # RAMBuffer для зберігання історії
-    # Калібрація відключена: прибираємо CalibrationConfig / CalibrationEngine / Queue
-    stage2_config = STAGE2_CONFIG  # Залишаємо лише конфіг Stage2 для switches тощо
+    # Initialize unified store
+    ds = await bootstrap()
+    # Калібрація та окремий RAMBuffer видалені — залишаємо лише Stage2 switches
+    stage2_config = STAGE2_CONFIG
     level_manager = LevelManager()  # Менеджер рівнів підтримки/опору
     # Отримуємо налаштування користувача (з конфігураційного файлу)
-    user_settings = {
-        "lang": "UA",  # Мова за замовчуванням (може бути "UA" або "EN")
-        "style": "pro",  # Стиль за замовчуванням (може бути "pro", "explain", "short" )
-    }
+    user_settings = USER_SETTINGS_DEFAULT.copy()
 
     # ATRManager не використовується без калібрації
 
@@ -224,19 +248,12 @@ async def run_pipeline() -> None:
 
     launch_ui_consumer()  # Запускаємо UI-споживача у новому терміналі
     trade_manager = TradeLifecycleManager(log_file="trade_log.jsonl")  # Менеджер угод
-    file_manager = FileManager()  # Файловий менеджер
-    buffer = RAMBuffer(max_bars=500)  # RAMBuffer для зберігання історії
-    thresholds = {
-        "MIN_QUOTE_VOLUME": 1_000_000.0,  # Мінімальний об'єм торгівлі
-        "MIN_PRICE_CHANGE": 3.0,  # Мінімальна зміна ціни
-        "MIN_OPEN_INTEREST": 500_000.0,  # Мінімальний відкритий інтерес
-        "MAX_SYMBOLS": 350,  # Максимальна кількість символів
-    }
+    thresholds = STAGE1_PREFILTER_THRESHOLDS.copy()
 
     # 2. Створюємо довгоживу ClientSession
     session = aiohttp.ClientSession()
     try:
-        fetcher = OptimizedDataFetcher(cache_handler=cache, session=session)
+        # Preload функції тепер працюють без окремого fetcher — прямі HTTP виклики через session
 
         # ===== НОВА ЛОГІКА ВИБОРУ РЕЖИМУ =====
         use_manual_list = (
@@ -245,64 +262,59 @@ async def run_pipeline() -> None:
 
         if use_manual_list:
             # Ручний режим: використовуємо фіксований список
-            fast_symbols = [
-                "btcusdt",
-                "OMNIUSDT",
-                "tonusdt",
-                "PUMPUSDT",
-            ]
-            await cache.set_fast_symbols(fast_symbols, ttl=3600)  # TTL 1 година
-            main_logger.info(
-                f"[Main] Використовуємо ручний список символів: {fast_symbols}"
-            )
+            fast_symbols = MANUAL_FAST_SYMBOLS_SEED.copy()
+            await ds.set_fast_symbols(fast_symbols, ttl=FAST_SYMBOLS_TTL_MANUAL)
+            logger.info(f"[Main] Використовуємо ручний список символів: {fast_symbols}")
         else:
             # Автоматичний режим: виконуємо первинний префільтр
-            main_logger.info("[Main] Запускаємо первинний префільтр...")
+            logger.info("[Main] Запускаємо первинний префільтр...")
 
             # Використовуємо новий механізм відбору активів
             fast_symbols = await get_filtered_assets(
                 session=session,
-                cache_handler=cache,
-                min_quote_vol=1_000_000.0,
-                min_price_change=3.0,
-                min_oi=500_000.0,
-                min_depth=50_000.0,
-                min_atr=0.5,
-                max_symbols=350,
-                dynamic=False,  # Фіксований список для первинного префільтру
+                cache_handler=ds,
+                min_quote_vol=thresholds["MIN_QUOTE_VOLUME"],
+                min_price_change=thresholds["MIN_PRICE_CHANGE"],
+                min_oi=thresholds["MIN_OPEN_INTEREST"],
+                min_depth=PREFILTER_BASE_PARAMS["min_depth"],
+                min_atr=PREFILTER_BASE_PARAMS["min_atr"],
+                max_symbols=thresholds["MAX_SYMBOLS"],
+                dynamic=PREFILTER_BASE_PARAMS["dynamic"],
             )
 
             fast_symbols = [s.lower() for s in fast_symbols]
-            await cache.set_fast_symbols(fast_symbols, ttl=600)  # TTL 10 хвилин
+            await ds.set_fast_symbols(fast_symbols, ttl=FAST_SYMBOLS_TTL_AUTO)
             # Логуємо кількість символів
-            main_logger.info(
-                f"[Main] Первинний префільтр: {len(fast_symbols)} символів"
-            )
+            logger.info(f"[Main] Первинний префільтр: {len(fast_symbols)} символів")
 
         # Отримуємо актуальний список символів
-        fast_symbols = await cache.get_fast_symbols()
+        fast_symbols = await ds.get_fast_symbols()
         if not fast_symbols:
-            main_logger.error("[Main] Не вдалося отримати список символів. Завершення.")
+            logger.error("[Main] Не вдалося отримати список символів. Завершення.")
             return
 
-        main_logger.info(
+        logger.info(
             f"[Main] Початковий список символів: {fast_symbols} (кількість: {len(fast_symbols)})"
         )
 
         # Preload історії
+        # TODO: refactor preload to use store directly (task 4)
         await preload_1m_history(
-            fetcher, fast_symbols, buffer, lookback=500
-        )  # 500 барів (~8.3 години)
+            fast_symbols, ds, lookback=PRELOAD_1M_LOOKBACK_INIT, session=session
+        )
 
         # Preload денних рівнів
-        daily_data = await preload_daily_levels(fetcher, fast_symbols, days=30)
+        daily_data = await preload_daily_levels(
+            fast_symbols, days=PRELOAD_DAILY_DAYS, session=session
+        )
         for sym, df in daily_data.items():
             levels = calculate_global_levels(df, window=20)
             level_manager.set_daily_levels(sym, levels)
 
-        # === LevelSystem v2: первинне наповнення з RAMBuffer (після preload) ===
+        # === Первинне наповнення рівнів із UnifiedDataStore (RAMBuffer видалено) ===
         for sym in fast_symbols:
-            df_1m = buffer_to_dataframe(buffer, sym, limit=500)
+            # buffer_to_dataframe will be replaced with store-based helper later
+            df_1m = await store_to_dataframe(ds, sym, limit=500)  # unified store
             df_5m = resample_5m(df_1m)
             df_1d = daily_data.get(sym)  # у тебе вже є daily_data (30 днів)
             atr_pct = estimate_atr_pct(df_1m)
@@ -321,61 +333,90 @@ async def run_pipeline() -> None:
         state_manager = AssetStateManager(assets_current)
 
         # Ініціалізація AssetMonitorStage1
-        main_logger.info("[Main] Ініціалізуємо AssetMonitorStage1...")
+        logger.info("[Main] Ініціалізуємо AssetMonitorStage1...")
         monitor = AssetMonitorStage1(
-            cache_handler=cache,
-            state_manager=state_manager,  # Додаємо state_manager для інтеграції
-            vol_z_threshold=2.5,
-            rsi_overbought=70,
-            rsi_oversold=30,
-            min_reasons_for_alert=2,
+            cache_handler=ds,
+            state_manager=state_manager,
             feature_switches=stage2_config.get("switches"),
+            **{
+                k: v
+                for k, v in STAGE1_MONITOR_PARAMS.items()
+                if k
+                in {
+                    "vol_z_threshold",
+                    "rsi_overbought",
+                    "rsi_oversold",
+                    "min_reasons_for_alert",
+                    "dynamic_rsi_multiplier",
+                }
+            },
         )
 
         # --- Виконуємо фон-воркери ---
-        ws_task = asyncio.create_task(WSWorker(fast_symbols, buffer, cache).consume())
-        health_task = asyncio.create_task(
-            ram_buffer_healthcheck(buffer, fast_symbols, ws_worker=None)
+        # WSWorker still legacy; will be refactored to use store (task 5)
+        # WSWorker v2 (selectors_key configurable, intervals_ttl for legacy blob TTL overrides)
+        ws_worker = WSWorker(
+            fast_symbols,
+            store=ds,
+            selectors_key="selectors:fast_symbols",  # use store helper path
+            intervals_ttl={"1m": 90, "1h": 65 * 60},
         )
+        ws_task = asyncio.create_task(ws_worker.consume())
+        health_task = asyncio.create_task(noop_healthcheck())
+
+        # UI metrics publisher (Redis pub/sub) — lightweight snapshot every 5s
+        async def ui_metrics_publisher():
+            channel = "ui.metrics"
+            while True:
+                snap = ds.metrics_snapshot()
+                # add hot symbols count (unique symbols in RAM layer)
+                try:
+                    hot_symbols = list({s for (s, _i) in ds.ram._lru.keys()})  # type: ignore[attr-defined]
+                    snap["hot_symbols"] = len(hot_symbols)
+                except Exception:
+                    snap["hot_symbols"] = None
+                try:
+                    await ds.redis.r.publish(channel, json.dumps(snap))  # type: ignore[attr-defined]
+                except Exception as e:
+                    logger.debug("ui_metrics publish failed: %s", e)
+                await asyncio.sleep(5)
+
+        metrics_task = asyncio.create_task(ui_metrics_publisher())
 
         # Ініціалізуємо UI-споживача
-        main_logger.info("[Main] Ініціалізуємо UI-споживача...")
+        logger.info("[Main] Ініціалізуємо UI-споживача...")
         ui = UI_Consumer()
 
         # Запускаємо Screening Producer
-        main_logger.info("[Main] Запускаємо Screening Producer...")
+        logger.info("[Main] Запускаємо Screening Producer...")
         prod = asyncio.create_task(
             screening_producer(
-                monitor,
-                buffer,
-                cache,
-                fast_symbols,
-                redis_conn,
-                fetcher,
+                monitor=monitor,
+                store=ds,
+                store_fast_symbols=ds,
+                assets=fast_symbols,
+                redis_conn=redis_conn,
                 trade_manager=trade_manager,
                 timeframe="1m",
-                lookback=50,
+                lookback=SCREENING_LOOKBACK,
                 interval_sec=30,
-                # calib_engine / calib_queue видалені
-                # Додаємо state_manager для повної інтеграції (опціонально)
                 state_manager=state_manager,
-                level_manager=level_manager,  # Менеджер рівнів підтримки/опору
-                # Передаємо налаштування користувачаuser_lang=user_settings["lang"],
+                level_manager=level_manager,
                 user_lang=user_settings["lang"],
                 user_style=user_settings["style"],
             )
         )
 
         # Публікуємо початковий стан в Redis
-        main_logger.info("[Main] Публікуємо початковий стан в Redis...")
-        await publish_full_state(state_manager, cache, redis_conn)
+        logger.info("[Main] Публікуємо початковий стан в Redis...")
+        await publish_full_state(state_manager, ds, redis_conn)
 
         # Запускаємо TradeLifecycleManager для управління угодами
-        main_logger.info("[Main] Запускаємо TradeLifecycleManager...")
+        logger.info("[Main] Запускаємо TradeLifecycleManager...")
         trade_update_task = asyncio.create_task(
             trade_manager_updater(
                 trade_manager,
-                buffer,
+                ds,
                 monitor,
             )
         )
@@ -385,22 +426,16 @@ async def run_pipeline() -> None:
         if not use_manual_list:
             prefilter_task = asyncio.create_task(
                 periodic_prefilter_and_update(
-                    cache,
+                    ds,
                     session,
                     thresholds,
-                    interval=600,
-                    buffer=buffer,
-                    fetcher=fetcher,
+                    interval=PREFILTER_INTERVAL_SEC,
+                    buffer=ds,
                 )
             )
 
         # Завдання для збору
-        tasks_to_run = [
-            ws_task,
-            health_task,
-            prod,
-            trade_update_task,
-        ]
+        tasks_to_run = [ws_task, health_task, prod, trade_update_task, metrics_task]
 
         if prefilter_task:
             tasks_to_run.append(prefilter_task)
@@ -417,5 +452,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(run_pipeline())
     except Exception as e:
-        main_logger.error("Помилка виконання: %s", e, exc_info=True)
+        logger.error("Помилка виконання: %s", e, exc_info=True)
         sys.exit(1)

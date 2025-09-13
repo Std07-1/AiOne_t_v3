@@ -1,8 +1,16 @@
-# monitor/asset_monitoring.py
-# -*- coding: utf-8 -*-
-"""
-Модуль Stage1 для AiOne_t — швидкий реальний моніторинг 1m/5m WS-барів,
-визначення аномалій і формування сирих сигналів для Stage2.
+"""Stage1 моніторинг потокових барів (1m/5m) та генерація сирих сигналів.
+
+Шлях: ``stage1/asset_monitoring.py``
+
+Призначення:
+    • підтримка інкрементальної статистики (RSI, VWAP, ATR, VolumeZ);
+    • агрегація тригерів (volume / breakout / volatility / RSI / VWAP deviation);
+    • нормалізація причин (`normalize_trigger_reasons`) і формування сигналу ALERT/NORMAL.
+
+Особливості:
+    • lazy ініціалізація порогів (Redis / дефолти);
+    • динамічні RSI пороги (over/under) із історії;
+    • можливість каліброваних параметрів через state_manager.
 """
 
 import logging
@@ -11,7 +19,7 @@ from typing import Any, Dict, Optional, List
 import pandas as pd
 import numpy as np
 
-from utils.utils_1_2 import ensure_timestamp_column
+from utils.utils import ensure_timestamp_column, normalize_trigger_reasons
 
 from app.thresholds import load_thresholds, Thresholds
 
@@ -32,17 +40,16 @@ from stage1.indicators import (
     VolumeZManager,
 )
 
-from stage1.utils import normalize_trigger_reasons
 
 from rich.console import Console
 from rich.logging import RichHandler
 
-# --- Логування ---
-logger = logging.getLogger("stage1_monitor")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-logger.propagate = False
+# ───────────────────────────── Логування ─────────────────────────────
+logger = logging.getLogger("app.stage1.asset_monitoring")
+if not logger.handlers:  # guard від подвійного підключення
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
 class AssetMonitorStage1:
@@ -271,26 +278,7 @@ class AssetMonitorStage1:
             f"[{symbol}] Пороги: low={thr.low_gate*100:.2f}%, high={thr.high_gate*100:.2f}%"
         )
 
-        # Отримання каліброваних параметрів
-        calibrated_params = None
-        if self.state_manager and symbol in self.state_manager.state:
-            asset_state = self.state_manager.state[symbol]
-            calibrated_params = asset_state.get("calibrated_params")
-            logger.debug(
-                f"[{symbol}] Отримано калібровані параметри: {calibrated_params}"
-            )
-
-        # Оновлення порогів
-        if calibrated_params:
-            thr.low_gate = calibrated_params.get("low_gate", thr.low_gate)
-            thr.high_gate = calibrated_params.get("high_gate", thr.high_gate)
-            thr.vol_z_threshold = calibrated_params.get(
-                "volume_z_threshold", thr.vol_z_threshold
-            )
-            thr.rsi_oversold = calibrated_params.get("rsi_oversold", thr.rsi_oversold)
-            thr.rsi_overbought = calibrated_params.get(
-                "rsi_overbought", thr.rsi_overbought
-            )
+        # Калібровані параметри видалені — використовуються лише завантажені/дефолтні thresholds
 
         logger.debug(
             f"[check_anomalies] {symbol} | Параметри застосовані: "

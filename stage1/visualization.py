@@ -14,14 +14,14 @@
 import time
 import logging
 
-from stage1.utils import format_open_interest, format_volume_usd
+from utils.utils import format_open_interest, format_volume_usd
 
 from rich.table import Table
 from rich.box import SIMPLE
 
 from typing import List
 
-from stage1.config import FilterParams, MetricResults
+from config.config import FilterParams, MetricResults
 
 from rich.console import Console
 from rich.logging import RichHandler

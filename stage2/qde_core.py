@@ -556,7 +556,7 @@ class QDEngine:
         # 8) risk
         risk = make_risk(stats, context, self.cfg)
         # лог
-        logger.info(
+        logger.debug(
             "[QDE] %s scen=%s comp=%.3f reco=%s",
             symbol,
             scenario,

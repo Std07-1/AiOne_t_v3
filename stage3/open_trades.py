@@ -3,8 +3,8 @@ import json
 from typing import Any, Dict, List
 from rich.console import Console
 from rich.logging import RichHandler
-from trade_lifecycle_manager import TradeLifecycleManager
-from utils.utils_1_2 import safe_float
+from stage3.trade_manager import TradeLifecycleManager
+from utils.utils import safe_float
 
 # --- Налаштування логування ---
 logger = logging.getLogger("app.screening_producer")

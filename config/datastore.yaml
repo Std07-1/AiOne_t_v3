@@ -1,0 +1,38 @@
+namespace: ai_one
+base_dir: ./datastore
+
+profile:
+  name: small
+  ram_limit_mb: 512
+  max_symbols_hot: 96
+  hot_ttl_sec: 21600      # 6h
+  warm_ttl_sec: 86400     # 24h
+  flush_batch_max: 8
+  flush_queue_soft: 200
+  flush_queue_hard: 1000
+
+intervals_ttl:
+  "1m": 21600             # 6h
+  "5m": 43200             # 12h
+  "15m": 86400
+  "1h": 259200            # 3d
+  "4h": 604800            # 7d
+  "1d": 2592000           # 30d
+
+write_behind: true
+validate_on_write: true
+validate_on_read: true
+
+io_retry_attempts: 3
+io_retry_backoff: 0.25
+
+prometheus:
+  enabled: true
+  port: 9109
+  path: /metrics
+
+admin:
+  # вмикає командний канал для живого керування (через redis pubsub)
+  commands_channel: ai_one:admin:commands
+  # раз у N секунд робити короткий health ping у логи/метрики
+  health_ping_sec: 30

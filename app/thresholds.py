@@ -1,4 +1,12 @@
-# app/thresholds.py
+"""Порогові значення для сигналів (без динамічного калібрування).
+
+Шлях: ``app/thresholds.py``
+
+Завдання:
+    • модель `Thresholds` з калібруванням на основі ATR та історії;
+    • серіалізація/десеріалізація для кешу (Redis / файл);
+    • допоміжні утиліти завантаження/збереження порогів.
+"""
 
 from __future__ import annotations
 import json
@@ -6,34 +14,34 @@ import logging
 import numpy as np
 import pandas as pd
 from datetime import timedelta
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import Any, Dict, Optional, Union
 
-from data.cache_handler import SimpleCacheHandler
-from stage1.indicators.atr_indicator import compute_atr, ATRManager
+from rich.console import Console
+from rich.logging import RichHandler
 
-log = logging.getLogger("thresholds")
-log.setLevel(logging.WARNING)
+from stage1.indicators.atr_indicator import ATRManager  # залишено для сумісності типів
+from config.config import CACHE_TTL_DAYS, OPTUNA_SQLITE_URI
 
-# Константи
-CACHE_TTL_DAYS: int = 14
-OPTUNA_SQLITE_URI = "sqlite:///storage/optuna.db"
+# ───────────────────────────── Логування ─────────────────────────────
+log = logging.getLogger("app.thresholds")
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    log.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    log.propagate = False
+
+# Константи перенесено до config.config (CACHE_TTL_DAYS, OPTUNA_SQLITE_URI)
 
 
-@dataclass
 class Thresholds:
-    """Адаптивні порогові значення для символу з калібруванням на основі ATR."""
+    """Статичні порогові значення для символу (спрощено, без ATR-калібрування)."""
 
     def __init__(
         self,
         symbol: str,
         config: dict,  # Конфігурація передається ззовні
-        data: Optional[pd.DataFrame] = None,
-        atr_manager: Optional[ATRManager] = None,
-        calibrated_params: Optional[
-            Dict
-        ] = None,  # Додано параметр для каліброваних значень
+        data: Optional[pd.DataFrame] = None,  # ігнорується (калібрування вимкнено)
+        atr_manager: Optional[ATRManager] = None,  # ігнорується
+        calibrated_params: Optional[Dict] = None,  # legacy (ігнорується)
     ):
         """
         symbol: Біржовий символ (наприклад "BTCUSDT")
@@ -45,90 +53,18 @@ class Thresholds:
         self.low_gate = config.get("low_gate", 0.006)
         self.high_gate = config.get("high_gate", 0.015)
         self.atr_target = config.get("atr_target", 0.5)
-        self.vol_z_threshold = config.get("vol_z_threshold", 1.2)
+        # Canonical key: volume_z_threshold (backward compat: vol_z_threshold)
+        self.vol_z_threshold = config.get(
+            "volume_z_threshold",
+            config.get("vol_z_threshold", 1.2),
+        )
         self.rsi_oversold = config.get("rsi_oversold", 30.0)
         self.rsi_overbought = config.get("rsi_overbought", 70.0)
 
-        # Застосування каліброваних параметрів
-        if calibrated_params:
-            for key, value in calibrated_params.items():
-                if hasattr(self, key):
-                    setattr(self, key, value)
-
-        # Калібрування тільки якщо є дані
-        if data is not None and not data.empty:
-            self._calibrate(data, config, atr_manager)
-
+        # Калібрування відключено – просто пост-обробка
         self._post_init()
 
-    def _calibrate(
-        self, data: pd.DataFrame, config: dict, atr_manager: ATRManager = None
-    ):
-        """Виконує адаптивне калібрування параметрів на основі ATR"""
-        # Дефолтні значення з конфігурації
-        self.low_gate = config.get("low_gate", 0.0015)  # Нижня межа ATR/price (0.15%)
-        self.high_gate = config.get(
-            "high_gate", 0.0134
-        )  # Верхня межа ATR/price (1.34%)
-        self.atr_target = config.get(
-            "atr_target", 0.3
-        )  # Цільовий ATR у відсотках від ціни (30%)
-        self.vol_z_threshold = config.get(
-            "volume_z_threshold", 1.2
-        )  # Сплеск обсягу ≥1.2σ (уніфіковано)
-        self.rsi_oversold = config.get(
-            "rsi_oversold", 23.0
-        )  # Рівень перепроданності RSI (23%)
-        self.rsi_overbought = config.get(
-            "rsi_overbought", 74.0
-        )  # Рівень перекупленості RSI (74%)
-
-        # Перевірка наявності даних
-        min_bars = config.get("atr_period") + 1
-        if data.empty or len(data) < min_bars:
-            log.warning(f"[{self.symbol}] Недостатньо даних для калібрування")
-            return
-
-        current_price = data["close"].iloc[-1]
-
-        # Розрахунок ATR
-        if atr_manager:
-            # Інкрементальний розрахунок через ATRManager
-            atr_manager.ensure_state(self.symbol, data)
-            atr_value = atr_manager.get_state(self.symbol)
-        else:
-            # Векторний розрахунок
-            atr_value = compute_atr(
-                data, window=config.get("atr_period", 14), symbol=self.symbol
-            )
-
-        if not np.isnan(atr_value):
-            # Адаптивне калібрування low_gate
-            min_atr_percent = config.get("min_atr_percent", 0.002)
-            self.low_gate = max((atr_value * 1.5) / current_price, min_atr_percent)
-
-            # Адаптивне калібрування high_gate
-            self.high_gate = min(self.low_gate * 1.8, config.get("high_gate", 0.015))
-
-            # Валідація співвідношення
-            if self.high_gate <= self.low_gate:
-                self.high_gate = self.low_gate * 1.5
-
-            # Адаптивне калібрування atr_target
-            if self.atr_target is None:
-                self.atr_target = max(atr_value * 0.5, 0.5)  # Мінімум 0.5 ATR
-            else:
-                self.atr_target = max(self.atr_target, atr_value * 0.5)
-        else:
-            log.warning(
-                f"[{self.symbol}] ATR не розраховано, використано дефолтні значення"
-            )
-            self.low_gate = config.get("low_gate", 0.0015)
-            self.high_gate = config.get("high_gate", 0.0134)
-            self.atr_target = config.get("atr_target", 0.5)
-
-        # Автокорекція точності
-        self._post_init()
+    # _calibrate видалено – динамічне калібрування не підтримується
 
     def _post_init(self) -> None:
         """Автокорекція точності значень"""
@@ -165,12 +101,12 @@ class Thresholds:
                 "high_gate": data.get(
                     "high_gate", 0.0134
                 ),  # Верхня межа ATR/price (1.34%)
-                "atr_target": data.get(
-                    "atr_target", [0.3, 1.5]
-                ),  # Цільовий ATR у відсотках
+                "atr_target": float(
+                    data.get("atr_target", 0.3)
+                ),  # Цільовий ATR (float; раніше помилково список)
                 "volume_z_threshold": data.get(
-                    "vol_z_threshold", 1.2
-                ),  # сплеск обсягу ≥1.2σ (уніфіковано)
+                    "volume_z_threshold", data.get("vol_z_threshold", 1.2)
+                ),  # сплеск обсягу ≥1.2σ (уніфіковано з fallback)
                 "rsi_oversold": data.get(
                     "rsi_oversold", 23.0
                 ),  # Рівень перепроданності RSI (23%)
@@ -180,7 +116,7 @@ class Thresholds:
                 "atr_period": 14,  # Період ATR (14)
                 "min_atr_percent": 0.002,  # Мінімальний ATR у відсотках (0.002)
             },
-            calibrated_params=params,  # symbol не передаємо
+            calibrated_params=None,  # калібрування вимкнено
         )
 
     def to_dict(self) -> Dict[str, Union[float, str]]:
@@ -204,7 +140,7 @@ def _redis_key(symbol: str) -> str:
 async def save_thresholds(
     symbol: str,
     thr: Thresholds,
-    cache: SimpleCacheHandler,
+    cache_or_store: Any,
 ) -> None:
     """Зберігає калібровані параметри в Redis"""
     key = _redis_key(symbol)
@@ -221,18 +157,28 @@ async def save_thresholds(
         ensure_ascii=False,
     )
 
-    await cache.store_in_cache(
-        key,
-        "global",
-        payload,
-        ttl=timedelta(days=CACHE_TTL_DAYS),
-        raw=True,
-    )
+    # UnifiedDataStore path (has redis.jset)
+    if hasattr(cache_or_store, "redis") and hasattr(cache_or_store.redis, "jset"):
+        ttl = int(timedelta(days=CACHE_TTL_DAYS).total_seconds())
+        await cache_or_store.redis.jset(
+            "thresholds", symbol, value=json.loads(payload), ttl=ttl
+        )
+    # Legacy SimpleCacheHandler
+    elif hasattr(cache_or_store, "store_in_cache"):
+        await cache_or_store.store_in_cache(
+            key,
+            "global",
+            payload,
+            ttl=timedelta(days=CACHE_TTL_DAYS),
+            raw=True,
+        )
+    else:  # fallback log
+        log.warning("save_thresholds: Unsupported cache interface for %s", symbol)
 
 
 async def load_thresholds(
     symbol: str,
-    cache: SimpleCacheHandler,
+    cache_or_store: Any,
     data: pd.DataFrame = pd.DataFrame(),
     config: dict = {},
     atr_manager: ATRManager = None,
@@ -242,7 +188,14 @@ async def load_thresholds(
 
     # 1. Спроба завантажити з thresholds-кешу
     key = f"thresholds:{symbol}"
-    raw = await cache.fetch_from_cache(key, "global", raw=True)
+    raw = None
+    # UnifiedDataStore path
+    if hasattr(cache_or_store, "redis") and hasattr(cache_or_store.redis, "jget"):
+        rec = await cache_or_store.redis.jget("thresholds", symbol, default=None)
+        if rec:
+            raw = json.dumps(rec, ensure_ascii=False)
+    elif hasattr(cache_or_store, "fetch_from_cache"):
+        raw = await cache_or_store.fetch_from_cache(key, "global", raw=True)
 
     if raw:
         try:
@@ -250,28 +203,7 @@ async def load_thresholds(
         except Exception as e:
             log.warning(f"[{symbol}] Помилка декодування thresholds: {e}")
 
-    # 2. Спроба завантажити з calib-кешу (де зберігає CalibrationQueue)
-    calib_key = f"calib:{symbol}"
-    calib_data = await cache.fetch_from_cache(calib_key, "global", raw=True)
-
-    if calib_data:
-        try:
-            params = json.loads(calib_data)
-            thr = Thresholds.from_mapping(params)
-            await save_thresholds(symbol, thr, cache)
-            return thr
-        except Exception as e:
-            log.warning(f"[{symbol}] Помилка декодування calib: {e}")
-
-    # 3. Калібрування лише при наявності даних
-    if not data.empty and config:
-        thr = Thresholds(symbol, data, config, atr_manager)
-        await save_thresholds(
-            symbol, thr, cache
-        )  # Виправлено: зберігаємо thr, не config
-        return thr
-
-    # 4. Дефолтний fallback
+    # 2. Калібрування та calib-кеш видалені – перехід одразу до дефолтів
     log.info(f"[{symbol}] Використання дефолтних порогів")
     return Thresholds.from_mapping(
         {

@@ -1,34 +1,31 @@
-# asset_state_manager.py
-import asyncio
+"""Менеджер стану активів (спрощена версія без калібрування).
+
+Шлях: ``app/asset_state_manager.py``
+
+Призначення:
+    • централізоване зберігання стану активів (signal / thresholds / stats);
+    • легкі геттер-и для UI/Stage2 (alerts, всі активи);
+    • без історичної логіки калібрування (видалено).
+"""
+
 import logging
 from datetime import datetime
 from rich.console import Console
 from rich.logging import RichHandler
 
 from typing import Any, Dict, List, Optional
-from app.thresholds import Thresholds, save_thresholds
+from config.config import STAGE2_STATUS, ASSET_STATE
 
-# --- Налаштування логування ---
+# ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.asset_state_manager")
-logger.setLevel(logging.INFO)  # Змінено на INFO для зменшення шуму
-logger.handlers.clear()
-logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-logger.propagate = False
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
 class AssetStateManager:
-    """Централізований менеджер стану активів з підтримкою калібрування.
-
-    Забезпечує:
-    - базовий стан активів,
-    - асинхронні події калібрування,
-    - інтеграцію з кешем/сховищем порогів та локальною мапою конфігів символів.
-
-    Args:
-        initial_assets: Початковий список символів.
-        cache_handler: Опціональний кеш/сховище для збереження порогів.
-        symbol_cfg: Опціональна мапа локальних конфігів порогів на символ.
-    """
+    """Централізований менеджер стану активів без підтримки калібрування."""
 
     def __init__(
         self,
@@ -37,10 +34,7 @@ class AssetStateManager:
         symbol_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.state: Dict[str, Dict[str, Any]] = {}
-        self.calibration_events: Dict[str, asyncio.Event] = {}
-        self.cache: Optional[Any] = (
-            cache_handler  # може бути задано пізніше через сеттер
-        )
+        self.cache: Optional[Any] = cache_handler
         self._symbol_cfg: Dict[str, Any] = symbol_cfg or {}
         for asset in initial_assets:
             self.init_asset(asset)
@@ -65,30 +59,12 @@ class AssetStateManager:
             "sl": None,
             "cluster_factors": [],
             "stats": {},
-            "state": "init",
+            "state": ASSET_STATE["INIT"],
             "stage2": False,
-            "stage2_status": "pending",
+            "stage2_status": STAGE2_STATUS["PENDING"],
             "last_updated": datetime.utcnow().isoformat(),
             "visible": True,
-            "calib_status": "pending",
-            "last_calib": None,
-            "calib_priority": "normal",  # +++ НОВЕ ПОЛЕ +++
-            "calib_queued_at": None,
         }
-        # Створюємо подію для очікування калібрування
-        self.calibration_events[symbol] = asyncio.Event()
-
-    async def wait_for_calibration(self, symbol: str, timeout: float = 120):
-        """Асинхронно чекає завершення калібрування активу або таймауту"""
-        event = self.calibration_events.get(symbol)
-        if event is None:
-            # Якщо подія не створена, ініціалізуємо актив
-            self.init_asset(symbol)
-            event = self.calibration_events[symbol]
-        try:
-            await asyncio.wait_for(event.wait(), timeout)
-        except asyncio.TimeoutError:
-            pass
 
     def update_asset(self, symbol: str, updates: Dict[str, Any]):
         """Оновлення стану активу з мерджем існуючих даних"""
@@ -96,12 +72,9 @@ class AssetStateManager:
             self.init_asset(symbol)
 
         current = self.state[symbol]
-        # Додаємо статуси для відстеження термінових завдань
-        if "calib_status" in updates:
-            logger.debug(f"Updating {symbol} calib_status: {updates['calib_status']}")
-        if "calib_status" in updates and updates["calib_status"] == "queued_urgent":
-            updates["calib_priority"] = "urgent"
-            updates["calib_queued_at"] = datetime.utcnow().isoformat()
+        # Нормалізація trigger_reasons якщо приходить None
+        if "trigger_reasons" in updates and updates["trigger_reasons"] is None:
+            updates["trigger_reasons"] = []
         self.state[symbol] = {
             **current,
             **updates,
@@ -124,39 +97,4 @@ class AssetStateManager:
             if str(asset.get("signal", "")).upper().startswith("ALERT")
         ]
 
-    async def update_calibration(self, symbol: str, params: Dict[str, Any]):
-        """Оновити калібрування символу та зберегти пороги у кеш/сховищі.
-
-        Захищено від відсутності ``cache``/``_symbol_cfg``. Якщо кеш не задано,
-        збереження в сховищі пропускається з попередженням.
-        """
-        # Генерація та (опційне) збереження порогів
-        thr = Thresholds.from_mapping(params)
-        if getattr(self, "cache", None) is not None:
-            try:
-                await save_thresholds(symbol, thr, self.cache)
-            except Exception:
-                logger.exception("Помилка збереження порогів для %s", symbol)
-        else:
-            logger.warning(
-                "Cache handler не задано — пропускаємо збереження порогів для %s",
-                symbol,
-            )
-
-        # Оновлення стану
-        if symbol in self.state:
-            self.state[symbol].update(
-                {"calibrated_params": params, "calib_status": "completed"}
-            )
-
-        # Оновлення локальної мапи порогів (створимо/оновимо запис)
-        try:
-            if not hasattr(self, "_symbol_cfg") or self._symbol_cfg is None:
-                self._symbol_cfg = {}
-            self._symbol_cfg[symbol] = thr
-        except Exception:
-            logger.debug("Не вдалося оновити локальну мапу порогів для %s", symbol)
-
-        # Сигнал про завершення
-        if event := self.calibration_events.get(symbol):
-            event.set()
+    # update_calibration видалено — калібрування не підтримується

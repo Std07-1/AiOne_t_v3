@@ -4,7 +4,7 @@ import asyncio
 import pandas as pd
 from stage3.trade_manager import TradeLifecycleManager
 from stage1.asset_monitoring import AssetMonitorStage1
-from data.ram_buffer import RAMBuffer
+from typing import Any
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -19,7 +19,7 @@ logger.propagate = False
 
 async def trade_manager_updater(
     trade_manager: TradeLifecycleManager,
-    buffer: RAMBuffer,
+    store: Any,
     monitor: AssetMonitorStage1,
     timeframe: str = "1m",
     lookback: int = 20,
@@ -35,11 +35,20 @@ async def trade_manager_updater(
         active = await trade_manager.get_active_trades()
         for tr in active:
             sym = tr["symbol"]
-            bars = buffer.get(sym, timeframe, lookback)
-            if not bars or len(bars) < lookback:
+            df: pd.DataFrame | None = None
+            try:
+                df = await store.get_df(sym, timeframe, limit=lookback)
+                if (
+                    df is not None
+                    and "open_time" in df.columns
+                    and "timestamp" not in df.columns
+                ):
+                    df = df.rename(columns={"open_time": "timestamp"})
+            except Exception as e:
+                logger.debug(f"Failed to fetch bars for {sym}: {e}")
                 continue
-
-            df = pd.DataFrame(bars)
+            if df is None or df.empty or len(df) < lookback:
+                continue
             # Використовуємо AssetMonitorStage1 для отримання stats
             stats = (
                 await monitor.get_current_stats(sym, df)

@@ -53,8 +53,16 @@ def breakout_level_trigger(
         return triggers
 
     # Локальні рівні
-    recent_high = df["high"].rolling(window).max().iloc[-2]
-    recent_low = df["low"].rolling(window).min().iloc[-2]
+    # Використовуємо min_periods щоб уникнути RuntimeWarning при недостатній кількості точок
+    recent_high = (
+        df["high"]
+        .rolling(window=window, min_periods=max(3, window // 3))
+        .max()
+        .iloc[-2]
+    )
+    recent_low = (
+        df["low"].rolling(window=window, min_periods=max(3, window // 3)).min().iloc[-2]
+    )
     current_close = df["close"].iloc[-1]
     prev_close = df["close"].iloc[-2]
 

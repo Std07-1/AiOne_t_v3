@@ -11,7 +11,7 @@ import json
 import uuid
 from datetime import datetime
 from typing import Dict, Any, List, Optional
-from utils.utils_1_2 import safe_float
+from utils.utils import safe_float
 
 # --- Логування ---
 logger = logging.getLogger("trade_manager")

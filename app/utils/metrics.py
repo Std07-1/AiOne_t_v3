@@ -1,7 +1,11 @@
-# app/utils/metrics.py
-"""
-Система збору метрик для моніторингу продуктивності CalibrationQueue.
-Підтримує лічильники, гістограми та датчики для Prometheus/Grafana.
+"""Колектор метрик (Counters / Histograms / Gauges) для внутрішнього моніторингу.
+
+Шлях: ``app/utils/metrics.py``
+
+Призначення:
+    • Легка in-process альтернативa Prometheus для локальної діагностики
+    • Вимірювання часу (контекстні менеджери timer / async_timer)
+    • Квантилі / p95 без зовнішніх залежностей
 """
 
 import asyncio

@@ -1,24 +1,21 @@
-# raw_data.py
-# -*- coding: utf-8 -*-
-"""
-AiOne_t • Data Fetcher (RAW)
-============================
+"""Data Fetcher (історичні Binance Futures свічки).
 
-Асинхронний модуль для масового завантаження та кешування історичних свічок
-з Binance Futures API. Розроблено спеціально під AiOne_t з урахуванням:
-  • висока паралельність і back‑off‑повторення;
-  • спільний CacheHandler (Redis + файловий фелбек);
-  • ефективна серіалізація (JSON / LZ4 + orjson);
-  • детальне логування у форматі head:3\tail:3 на DEBUG‑рівні;
-  • готовність до інтеграції в pipeline «збір → валідація → підготовка».
+Шлях: ``data/raw_data.py``
 
-Швидкий огляд API
------------------
->>> async with aiohttp.ClientSession() as sess:
-...     cache = CacheHandler(redis_url="rediss://…", ttl_default=3600)
-...     fetcher = OptimizedDataFetcher(cache_handler=cache, session=sess)
-...     data = await fetcher.get_data_batch(["BTCUSDT", "ETHUSDT"],
-...                                         interval="1h", limit=720)
+Асинхронне масове завантаження OHLCV з інкрементальним оновленням і кешем
+для прискорення подальших стадій (Stage1/Stage2, індикатори, QDE).
+
+Особливості:
+    • паралельність із семафорами та backoff‑retry;
+    • кеш-сумісність через інтерфейс ``fetch_from_cache/store_in_cache`` (UnifiedDataStore);
+    • серіалізація DataFrame → JSON (orjson) + опційне LZ4 стискання;
+    • діагностичне DEBUG‑логування (head:3\tail:3);
+    • інкрементальний догруз замість повного REST при актуальному кеші.
+
+Приклад (спрощено):
+        >>> async with aiohttp.ClientSession() as sess:
+        ...     fetcher = OptimizedDataFetcher(cache_handler=store, session=sess)
+        ...     data = await fetcher.get_data_batch(["btcusdt"], interval="1h", limit=720)
 """
 
 from __future__ import annotations
@@ -45,22 +42,23 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-from .utils import get_ttl_for_interval
+from utils.utils import get_ttl_for_interval
 
-# ───────────────────────────── ЛОГУВАННЯ ─────────────────────────────
-logger = logging.getLogger("raw_data")
-logger.setLevel(logging.INFO)
+# ───────────────────────────── Логування ─────────────────────────────
+logger = logging.getLogger("app.data.raw_data")
 progress_console = Console(file=sys.stderr)
-_handler = rich.logging.RichHandler(
-    console=progress_console,
-    show_level=True,
-    show_path=False,
-    markup=False,  # ← НЕ парсить розмітку!
-    rich_tracebacks=True,
-)
-if not logger.handlers:
-    logger.addHandler(_handler)
-logger.propagate = False
+if not logger.handlers:  # захист від дублювання
+    logger.setLevel(logging.INFO)
+    logger.addHandler(
+        rich.logging.RichHandler(
+            console=progress_console,
+            show_level=True,
+            show_path=False,
+            markup=False,  # НЕ парсити розмітку у повідомленнях
+            rich_tracebacks=True,
+        )
+    )
+    logger.propagate = False
 
 # ──────────────────────────────── КОНСТАНТИ ───────────────────────────────
 BINANCE_FUTURES_KLINES = "https://fapi.binance.com/fapi/v1/klines"

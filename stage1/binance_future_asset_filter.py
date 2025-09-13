@@ -1,16 +1,15 @@
-# stage1/binance_future_asset_filter.py
+"""Швидкий фільтр USDT‑M Binance Futures із розширеними метриками.
 
-"""
-Супершвидкий фільтр USDT‑M‑ф'ючерсів Binance з розширеними метриками
-Головні можливості
-* Паралельний збір даних з обмеженням семафорів
-* Динамічні пороги на основі перцентилів
-* Кешування exchangeInfo у Redis (3 год)
-* Pydantic валідація параметрів
-* Детальне логування та обробка помилок
-* Ранжування за комбінованим liquidity_score
-* Миттєва обробка до 500+ символів
-Вихід: відсортований список тікерів, готовий для подальшої обробки
+Шлях: ``stage1/binance_future_asset_filter.py``
+
+Можливості:
+    • паралельний збір (open interest / depth / ATR) під семафорами;
+    • динамічні перцентильні пороги (quoteVolume / priceChangePercent);
+    • кешування exchangeInfo (Redis) + повторні спроби;
+    • ранжування активів за комбінованим liquidity_score;
+    • інтеграція з візуалізацією (``stage1.visualization.print_results``).
+
+Вихід: відсортований список тікерів для подальших стадій.
 """
 
 import logging
@@ -21,8 +20,15 @@ import aiohttp
 import asyncio
 import pandas as pd
 
-from stage1.config import SymbolInfo, FilterParams
-from stage1.utils import format_open_interest, format_volume_usd
+from config.config import (
+    SymbolInfo,
+    FilterParams,
+    OI_SEMAPHORE,
+    KLINES_SEMAPHORE,
+    DEPTH_SEMAPHORE,
+    MetricResults,
+)
+from utils.utils import format_open_interest, format_volume_usd
 
 from stage1.helpers import (
     _fetch_json,
@@ -31,11 +37,6 @@ from stage1.helpers import (
     fetch_orderbook_depth,
     fetch_atr,
     fetch_concurrently,
-)
-from stage1.config import (
-    OI_SEMAPHORE,
-    KLINES_SEMAPHORE,
-    DEPTH_SEMAPHORE,
 )
 
 from rich.progress import (
@@ -49,17 +50,16 @@ from rich.progress import (
 )
 
 from stage1.visualization import print_results
-from stage1.config import MetricResults
 
 from rich.console import Console
 from rich.logging import RichHandler
 
-# --- Налаштування логування ---
-logger = logging.getLogger("binance_future_asset_filter")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-logger.propagate = False
+# ───────────────────────────── Логування ─────────────────────────────
+logger = logging.getLogger("app.stage1.binance_future_asset_filter")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 # Глобальний консоль для зручності
 console = Console()

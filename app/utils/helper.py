@@ -1,23 +1,43 @@
-# utils/helpers.py
+"""Допоміжні перетворення даних для UI та сервісів.
+
+Шлях: ``app/utils/helper.py``
+
+Функції:
+    • buffer_to_dataframe / store_to_dataframe — уніфікація форматів барів
+    • resample_5m — агрегація 1m → 5m
+    • estimate_atr_pct — груба оцінка ATR% для адаптивних порогів
+    • get_tick_size — вибір tick_size (overrides → config map → brackets → fallback)
+    • make_serializable_safe — рекурсивне приведення структур до JSON-сумісних
+
+Примітка:
+    normalize_result_types тепер єдиний у ``utils.utils`` (single source of truth).
+"""
+
 import logging
 from rich.console import Console
 from rich.logging import RichHandler
 import pandas as pd
 from typing import Optional, Dict, Any
-from utils.utils_1_2 import safe_float
+from utils.utils import safe_float, normalize_result_types  # re-export use only
 
 try:
-    # якщо в тебе є мапа в конфігу — використовуємо її
-    from app.config import TICK_SIZE_MAP  # optional
+    # якщо в тебе є мапа та формалізовані brackets у конфігу — використовуємо їх
+    from config.config import (
+        TICK_SIZE_MAP,
+        TICK_SIZE_BRACKETS,
+        TICK_SIZE_DEFAULT,
+    )  # optional
 except Exception:
     TICK_SIZE_MAP = {}
+    TICK_SIZE_BRACKETS = []  # type: ignore
+    TICK_SIZE_DEFAULT = 1e-3  # fallback
 
-# --- Налаштування логування ---
-logger = logging.getLogger("app.helpers")
-logger.setLevel(logging.INFO)  # Змінено на INFO для зменшення шуму
-logger.handlers.clear()
-logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-logger.propagate = False
+# ───────────────────────────── Логування ─────────────────────────────
+logger = logging.getLogger("app.utils.helper")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
 def buffer_to_dataframe(RAMBuffer, symbol: str, limit: int = 500) -> pd.DataFrame:
@@ -28,6 +48,33 @@ def buffer_to_dataframe(RAMBuffer, symbol: str, limit: int = 500) -> pd.DataFram
     df = df.dropna().reset_index(drop=True)
     df = df.rename(columns={"timestamp": "time"})
     return df
+
+
+async def store_to_dataframe(
+    store, symbol: str, interval: str = "1m", limit: int = 500
+) -> pd.DataFrame:
+    """Отримує бари з UnifiedDataStore і повертає DataFrame у форматі time,open,high,low,close,volume.
+
+    store.get_df повертає DataFrame з колонками open_time,...; конвертуємо у старий формат для сумісності.
+    """
+    try:
+        df = await store.get_df(symbol, interval, limit=limit)
+    except Exception as e:
+        logger.warning(f"store_to_dataframe error for {symbol}: {e}")
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+    # Normalize column names
+    if "open_time" in df.columns:
+        df = df.rename(columns={"open_time": "time"})
+    # Ensure required columns exist
+    needed = ["time", "open", "high", "low", "close", "volume"]
+    for c in needed:
+        if c not in df.columns:
+            df[c] = 0.0
+    out = df[needed].tail(limit).copy()
+    out = out.dropna().reset_index(drop=True)
+    return out
 
 
 def resample_5m(df_1m: pd.DataFrame) -> pd.DataFrame:
@@ -60,94 +107,28 @@ def resample_5m(df_1m: pd.DataFrame) -> pd.DataFrame:
 def estimate_atr_pct(df_1m: pd.DataFrame) -> float:
     if df_1m is None or df_1m.empty:
         return 0.5
-    tr = (
-        (df_1m["high"] - df_1m["low"]).rolling(14).mean().iloc[-1]
-        if len(df_1m) >= 14
-        else (df_1m["high"] - df_1m["low"]).mean()
-    )
-    price = float(df_1m["close"].values[-1])
-    return float(max(0.05, min(5.0, (tr / max(price, 1e-9)) * 100.0)))
+    try:
+        rng = df_1m["high"] - df_1m["low"]
+        if len(rng) >= 14:
+            # min_periods захищає від degrees-of-freedom warning на коротких серіях
+            tr_val = rng.rolling(window=14, min_periods=5).mean().iloc[-1]
+        else:
+            tr_val = rng.mean()
+        if pd.isna(tr_val) or not (tr_val >= 0):  # noqa: E701 simplify
+            return 0.5
+        price = float(df_1m["close"].iloc[-1]) if len(df_1m["close"]) else 0.0
+        if price <= 0:
+            return 0.5
+        pct = (tr_val / price) * 100.0
+        return float(max(0.05, min(5.0, pct)))
+    except Exception:
+        return 0.5
 
 
-def get_tick_size(
-    symbol: str,
-    price_hint: Optional[float] = None,
-    overrides: Optional[Dict[str, float]] = None,
-) -> float:
-    """
-    Повертає tick_size для символу.
-    Пріоритет: overrides → TICK_SIZE_MAP → евристика за ціною.
-    """
-    sym = (symbol or "").lower()
-
-    if overrides and sym in overrides:
-        return float(overrides[sym])
-    if isinstance(TICK_SIZE_MAP, dict) and sym in TICK_SIZE_MAP:
-        return float(TICK_SIZE_MAP[sym])
-
-    # Евристика, якщо немає довідника:
-    # (Binance часто має дрібні кроки на дешевих активах і крупніші — на дорогих)
-    if price_hint is not None:
-        p = float(price_hint)
-        if p < 0.01:
-            return 1e-6
-        if p < 0.1:
-            return 1e-5
-        if p < 1:
-            return 1e-4
-        if p < 10:
-            return 1e-3
-        if p < 100:
-            return 1e-2
-        if p < 1000:
-            return 1e-1
-        return 1.0
-
-    # дефолт, якщо зовсім нічого не знаємо
-    return 1e-3
+## get_tick_size перенесено у utils.utils (single source)
 
 
-def normalize_result_types(result: dict) -> dict:
-    """Нормалізує типи даних та додає стан для UI"""
-    numeric_fields = [
-        "confidence",
-        "tp",
-        "sl",
-        "current_price",
-        "atr",
-        "rsi",
-        "volume",
-        "volume_mean",
-        "volume_usd",
-        "volume_z",
-        "open_interest",
-        "btc_dependency_score",
-    ]
-
-    if "calibrated_params" in result:
-        result["calibrated_params"] = {
-            k: float(v) for k, v in result["calibrated_params"].items()
-        }
-
-    for field in numeric_fields:
-        if field in result:
-            result[field] = safe_float(result[field])
-        elif "stats" in result and field in result["stats"]:
-            result["stats"][field] = safe_float(result["stats"][field])
-
-    # Визначення стану сигналу
-    signal_type = result.get("signal", "NONE").upper()
-    if signal_type == "ALERT" or signal_type.startswith("ALERT_"):
-        result["state"] = "alert"
-    elif signal_type == "NORMAL":
-        result["state"] = "normal"
-    else:
-        result["state"] = "no_trade"
-
-    # Додаємо поле для відображення в UI
-    result["visible"] = True
-
-    return result
+## Видалено локальний duplicate normalize_result_types — використовуй імпортований із utils.utils
 
 
 def make_serializable_safe(data) -> Any:

@@ -1,7 +1,12 @@
-# stage1\helpers.py
+"""Допоміжні утиліти Stage1 (фільтр активів Binance Futures).
 
-"""
-Утиліти для фільтрації активів на Binance Futures
+Шлях: ``stage1/helpers.py``
+
+Надає:
+    • універсальний кешований fetch (``fetch_cached_data``);
+    • паралельний збір метрик із семафорами (``fetch_concurrently``);
+    • індивідуальні функції для ATR / order book depth / open interest;
+    • retry логіку через tenacity з кастомним фільтром винятків.
 """
 
 from aiohttp import ClientResponseError, ClientConnectionError
@@ -19,9 +24,9 @@ from tenacity import (
     retry_if_exception,
     before_sleep_log,
 )
-from utils.utils_1_2 import ensure_timestamp_column
+from utils.utils import ensure_timestamp_column
 
-from stage1.config import (
+from config.config import (
     OI_SEMAPHORE,
     KLINES_SEMAPHORE,
     DEPTH_SEMAPHORE,
@@ -30,12 +35,12 @@ from stage1.config import (
 from rich.console import Console
 from rich.logging import RichHandler
 
-# --- Налаштування логування ---
-logger = logging.getLogger("helpers")
-logger.setLevel(logging.INFO)
-logger.handlers.clear()
-logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-logger.propagate = False
+# ───────────────────────────── Логування ─────────────────────────────
+logger = logging.getLogger("app.stage1.helpers")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.propagate = False
 
 
 def _is_retryable(exc: BaseException) -> bool:

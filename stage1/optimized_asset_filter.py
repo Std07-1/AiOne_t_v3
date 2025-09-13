@@ -21,7 +21,7 @@ from typing import List
 
 import aiohttp
 
-from stage1.config import FilterParams
+from config.config import FilterParams
 from stage1.binance_future_asset_filter import BinanceFutureAssetFilter
 import logging
 

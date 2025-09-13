@@ -24,8 +24,40 @@ import pandas as pd
 import websockets
 from rich.console import Console
 from rich.logging import RichHandler
+import orjson
+from lz4.frame import compress, decompress
 
-from .raw_data import _df_to_bytes, _bytes_to_df
+
+# ── Вбудовані (мінімальні) серіалізатори DataFrame (видалено raw_data.py) ──
+def _df_to_bytes(df: pd.DataFrame, *, compress_lz4: bool = True) -> bytes:
+    """Серіалізація DataFrame → bytes (orjson + опційно LZ4).
+
+    Тільки колонки та індекс: використовує формат orient="split".
+    Якщо є datetime колонка `timestamp`, перетворюємо у int64 ms для JS.
+    """
+    df_out = df.copy()
+    if "timestamp" in df_out.columns and pd.api.types.is_datetime64_any_dtype(
+        df_out["timestamp"]
+    ):
+        df_out["timestamp"] = (df_out["timestamp"].astype("int64") // 1_000_000).astype(
+            "int64"
+        )
+    raw_json = orjson.dumps(df_out.to_dict(orient="split"))
+    return compress(raw_json) if compress_lz4 else raw_json
+
+
+def _bytes_to_df(buf: bytes | str, *, compressed: bool = True) -> pd.DataFrame:
+    """Десеріалізація bytes → DataFrame (reverse _df_to_bytes)."""
+    raw = buf.encode() if isinstance(buf, str) else buf
+    if compressed:
+        raw = decompress(raw)
+    obj = orjson.loads(raw)
+    df = pd.DataFrame(**obj)
+    if "timestamp" in df.columns and pd.api.types.is_integer_dtype(df["timestamp"]):
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    return df
+
+
 from data.unified_store import (
     UnifiedDataStore,
 )  # unified store (single source of truth)

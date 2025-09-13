@@ -190,6 +190,7 @@ def build_observations(sections: Dict[str, Any]) -> List[str]:
     system = sections.get("system", {})
     stage1 = sections.get("stage1", {})
     stage2 = sections.get("stage2", {})
+    deltas = sections.get("deltas", {})
 
     def tag(level: str, msg: str) -> str:
         return f"[{level}] {msg}"
@@ -311,6 +312,12 @@ def build_observations(sections: Dict[str, Any]) -> List[str]:
         elif s1_lag > 3:
             obs.append(tag("INFO", f"Stage1 feed lag {s1_lag:.1f}s > 3s"))
 
+    # Stage1 missing bars delta
+    mb_delta = deltas.get("stage1_missing_bars_delta")
+    if isinstance(mb_delta, (int, float)) and mb_delta is not None and mb_delta > 0:
+        lvl = "WARN" if mb_delta >= 3 else "INFO"
+        obs.append(tag(lvl, f"Stage1 missing bars +{int(mb_delta)} vs prev"))
+
     # Stage2 latency heuristics (p99 thresholds)
     s2_lat = stage2.get("latency") or {}
     p99 = s2_lat.get("p99")
@@ -319,6 +326,19 @@ def build_observations(sections: Dict[str, Any]) -> List[str]:
             obs.append(tag("WARN", f"Stage2 latency p99 {p99:.3f}s > 0.08s"))
         elif p99 > 0.04:
             obs.append(tag("INFO", f"Stage2 latency p99 {p99:.3f}s > 0.04s"))
+
+    # Stage2 regression deltas
+    p99_ch = deltas.get("stage2_latency_p99_change_pct")
+    if isinstance(p99_ch, (int, float)) and p99_ch is not None:
+        if p99_ch > 40:
+            obs.append(tag("WARN", f"Stage2 p99 latency Δ{p99_ch:.1f}%"))
+        elif p99_ch > 15:
+            obs.append(tag("INFO", f"Stage2 p99 latency Δ{p99_ch:.1f}%"))
+    err_ch = deltas.get("stage2_error_rate_change_pp")
+    if isinstance(err_ch, (int, float)) and err_ch is not None and err_ch > 2:
+        # 2 percentage points – mild regression
+        level = "WARN" if err_ch > 5 else "INFO"
+        obs.append(tag(level, f"Stage2 error rate +{err_ch:.2f}pp"))
 
     if not obs:
         obs.append(tag("OK", "No critical anomalies detected."))
@@ -532,6 +552,79 @@ def build_conclusions(sections: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     return out
+
+
+# ── Delta / Regression Support ─────────────────────────────────────────────
+def compute_deltas(current: Dict[str, Any], previous: Dict[str, Any]) -> Dict[str, Any]:
+    """Обчислення ключових дельт між поточним і попереднім snapshot.
+
+    Повертає:
+        stage1_missing_bars_delta – різниця missing bars
+        stage2_latency_p99_change_pct – % зміна p99 (від prev до current)
+        stage2_error_rate_change_pp – зміна error rate у процентних пунктах
+    """
+    out: Dict[str, Any] = {}
+    try:
+        cur_s1 = current.get("stage1", {}) or {}
+        prev_s1 = previous.get("stage1", {}) or {}
+        out["stage1_missing_bars_delta"] = (cur_s1.get("missing_bars_total") or 0) - (
+            prev_s1.get("missing_bars_total") or 0
+        )
+    except Exception:
+        pass
+    try:
+        cur_s2 = current.get("stage2", {}) or {}
+        prev_s2 = previous.get("stage2", {}) or {}
+        cur_p99 = ((cur_s2.get("latency") or {}).get("p99") or 0.0) or 0.0
+        prev_p99 = ((prev_s2.get("latency") or {}).get("p99") or 0.0) or 0.0
+        if prev_p99 > 0:
+            out["stage2_latency_p99_change_pct"] = (
+                (cur_p99 - prev_p99) / prev_p99 * 100.0
+            )
+        cur_proc = cur_s2.get("processed_total") or 0
+        cur_err = cur_s2.get("errors_total") or 0
+        prev_proc = prev_s2.get("processed_total") or 0
+        prev_err = prev_s2.get("errors_total") or 0
+        cur_err_rate = (cur_err / cur_proc * 100.0) if cur_proc > 0 else 0.0
+        prev_err_rate = (prev_err / prev_proc * 100.0) if prev_proc > 0 else 0.0
+        out["stage2_error_rate_change_pp"] = cur_err_rate - prev_err_rate
+    except Exception:
+        pass
+    return out
+
+
+def enrich_conclusions_with_deltas(
+    conclusions: Dict[str, Any], deltas: Dict[str, Any]
+) -> None:
+    """Ескалація статусів з урахуванням регресій (оновлює на місці)."""
+    try:
+        stage2_block = conclusions.get("stage2")
+        if stage2_block:
+            p99_ch = deltas.get("stage2_latency_p99_change_pct")
+            if isinstance(p99_ch, (int, float)) and p99_ch is not None:
+                if p99_ch > 40:
+                    stage2_block["status"] = "WARN"
+                elif p99_ch > 15 and stage2_block.get("status") == "OK":
+                    stage2_block["status"] = "INFO"
+                if p99_ch > 15:
+                    stage2_block["summary"] += f"; p99 Δ{p99_ch:+.1f}%"
+                    if not stage2_block.get("recommendation"):
+                        stage2_block["recommendation"] = (
+                            "Профілювати Stage2 або оптимізувати важкі ділянки"
+                        )
+            err_ch = deltas.get("stage2_error_rate_change_pp")
+            if isinstance(err_ch, (int, float)) and err_ch is not None and err_ch > 2:
+                if err_ch > 5 and stage2_block.get("status") != "WARN":
+                    stage2_block["status"] = "WARN"
+                elif stage2_block.get("status") == "OK":
+                    stage2_block["status"] = "INFO"
+                stage2_block["summary"] += f"; err Δ{err_ch:+.2f}pp"
+                if not stage2_block.get("recommendation"):
+                    stage2_block["recommendation"] = (
+                        "Перевірити логіку обробки помилок Stage2"
+                    )
+    except Exception:
+        pass
 
 
 # ── Async Fetchers ──────────────────────────────────────────────────────────
@@ -1110,6 +1203,7 @@ async def collect(
     fresh_sec: int,
     late_sec: int,
     stale_sec: int,
+    prev_json_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     # Fetch concurrently
     prom_task = asyncio.create_task(fetch_prometheus(prom_url))
@@ -1129,8 +1223,20 @@ async def collect(
         "stage2": section_stage2(metrics),
         "health": section_health(redis_data, fresh_sec, late_sec, stale_sec),
     }
+    sections["deltas"] = {}
+    prev_data: Dict[str, Any] = {}
+    if prev_json_path:
+        try:
+            with open(prev_json_path, "r", encoding="utf-8") as fh:
+                prev_data = json.load(fh)
+        except Exception:
+            prev_data = {}
+    if prev_data:
+        sections["deltas"] = compute_deltas(sections, prev_data)
     sections["observations"] = build_observations(sections)
     sections["conclusions"] = build_conclusions(sections)
+    if sections.get("deltas"):
+        enrich_conclusions_with_deltas(sections["conclusions"], sections["deltas"])
     return sections
 
 
@@ -1157,6 +1263,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--explain", action="store_true", help="Додати короткі пояснення до секцій"
     )
+    parser.add_argument(
+        "--prev-json",
+        default=None,
+        help="Шлях до попереднього JSON snapshot для порівняння регресій",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1167,6 +1278,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 args.fresh_sec,
                 args.late_sec,
                 args.stale_sec,
+                args.prev_json,
             )
         )
     except Exception as e:

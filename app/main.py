@@ -150,6 +150,7 @@ async def bootstrap() -> UnifiedDataStore:
     admin = DataStoreAdmin(store, store.redis, cfg)
     asyncio.create_task(admin_command_loop(admin))
     asyncio.create_task(health_pinger(store.metrics, cfg))
+    asyncio.create_task(event_loop_lag_sampler())
     logger.info("[Launch] Admin command loop + health pinger started")
     return store
 
@@ -185,6 +186,65 @@ async def health_pinger(metrics, cfg) -> None:
             except Exception:
                 pass
         await asyncio.sleep(cfg.admin.health_ping_sec)
+
+
+async def event_loop_lag_sampler(interval: float = 0.5) -> None:
+    """Періодично вимірює лаг планування event loop та експортує histogram event_loop_lag_seconds.
+
+    Лаг = (фактичний інтервал між циклами) - interval якщо позитивний. Негативні/нульові ігноруємо.
+    Використовується кастомний набір бакетів для коротких затримок.
+    """
+    try:
+        from prometheus_client import Histogram  # type: ignore
+    except Exception:  # pragma: no cover
+        return
+
+    try:
+        loop_lag = Histogram(
+            "event_loop_lag_seconds",
+            "Asyncio event loop scheduling lag (actual sleep - expected)",
+            buckets=(
+                0.0005,
+                0.001,
+                0.002,
+                0.005,
+                0.01,
+                0.02,
+                0.05,
+                0.1,
+                0.2,
+                0.5,
+                1.0,
+                2.0,
+            ),
+        )
+    except Exception:  # already registered
+        try:  # pragma: no cover
+            from prometheus_client import REGISTRY  # type: ignore
+
+            loop_lag = None
+            for m in REGISTRY.collect():
+                if m.name == "event_loop_lag_seconds":
+                    loop_lag = m
+                    break
+            if loop_lag is None:
+                return
+        except Exception:
+            return
+
+    loop = asyncio.get_event_loop()
+    prev = loop.time()
+    while True:
+        await asyncio.sleep(interval)
+        now = loop.time()
+        actual = now - prev
+        diff = actual - interval
+        if diff > 0:
+            try:
+                loop_lag.observe(diff)  # type: ignore
+            except Exception:
+                pass
+        prev = now
 
 
 def launch_ui_consumer() -> None:

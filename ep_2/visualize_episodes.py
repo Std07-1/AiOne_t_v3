@@ -354,13 +354,14 @@ def visualize_episodes(
     save_path: Optional[str] = None,
     *,
     signals_df: Optional[pd.DataFrame] = None,
+    global_signals_df: Optional[pd.DataFrame] = None,
     show_signals: bool = True,
     show_anchors: bool = True,
     price_col: str = "close",
     show_trade_lines: bool = True,
     show_episode_arrow: bool = True,
     annotate_metrics: bool = True,
-    rsi_panel: Optional[pd.Series] = None,  # optional second panel (0-100)
+    rsi_panel: Optional[pd.Series] = None,
     rsi_name: str = "RSI",
     # NEW: TP/SL & PnL options
     show_tp_sl_zones: bool = True,
@@ -371,43 +372,80 @@ def visualize_episodes(
     sl_color: str = "#FFB74D",  # orange-ish
     tp_alpha: float = 0.12,
     sl_alpha: float = 0.12,
+    # NEW global signals options
+    show_global_signals: bool = True,
+    global_sig_marker: str = "*",
+    global_sig_size: int = 110,
+    global_sig_edge: str = "#FF8C00",
+    global_sig_face: str = "gold",
+    global_coverage_warn_ratio: float = 0.25,
+    # NEW: buffer for deciding if global signal lies “inside” episode window
+    inside_buffer_minutes: int = 0,
+    # Highlight near-edge signals
+    highlight_edge_minutes: int = 5,
+    edge_marker: str = "o",
+    edge_size: int = 60,
+    edge_face: str = "#FFD54F",
+    edge_edge: str = "#FF6F00",
+    # NEW outside mode
+    outside_mode: str = "all",
 ) -> None:
-    """
-    Draw episodes on a price chart with crisp markers/lines and inline metrics.
+    """Draw episodes with optional global (non-episode) system signals.
 
-    Args:
-        df: DataFrame with DatetimeIndex and price in `price_col`.
-        episodes: List of Episode-like objects/dicts.
-        save_path: If provided, saves (PNG/PDF based on extension).
-        show_signals: Render per-type signal dots.
-        show_anchors: Render t_anchor/t_confirm/t_end vertical lines.
-        price_col: Name of price column.
-        show_trade_lines: Connect entry->exit (or to episode end) with thin line.
-        show_episode_arrow: Arrow from t_start to t_end following close values.
-        annotate_metrics: Inline badge near peak with move% and duration bars.
-        rsi_panel: Optional RSI series to render as a separate panel.
-        rsi_name: Label for RSI panel.
-        show_tp_sl_zones: Draw TP/SL rectangles from entry time to exit/end.
-        label_trade_pnl: Put PnL % at midpoint of each trade line.
-        tp_pct/sl_pct: Default % (0.02 = 2%) if not supplied per entry/episode.
-        tp_color/sl_color: Colors for TP/SL zones. tp_alpha/sl_alpha: transparency.
+    Parameters (new / extended):
+        global_signals_df: Повний список глобальних сигналів (усі типи). Якщо відсутній стовпчик
+            `type` – автоматично проставиться `SYSTEM_SIGNAL`.
+        inside_buffer_minutes: Розширення вікна епізоду (t_start/t_end) при визначенні
+            чи сигнал належить епізоду.
+        highlight_edge_minutes: Діапазон (у хвилинах) від країв епізоду, в якому глобальні
+            сигнали вважаються "edge" і підсвічуються окремим стилем.
+        outside_mode: Контролює, що робити з глобальними сигналами поза епізодами:
+            - 'all': малювати всі (з edge підсвіткою для крайових);
+            - 'edge-only': показувати тільки ті, що в межах highlight_edge_minutes від країв;
+            - 'none': не малювати зовсім позаепізодні глобальні сигнали.
+
+    Додатково: у заголовок графіку додається статистика глобальних сигналів.
     """
-    logger.debug("Початок візуалізації епізодів")
-    try:
-        logger.debug(
-            "DF: rows=%d, cols=%d, index_type=%s",
-            len(df),
-            len(df.columns),
-            type(df.index),
+    if outside_mode not in {"all", "edge-only", "none"}:
+        logger.warning(
+            "[visualize_episodes] Некоректний outside_mode=%s -> використано 'all'",
+            outside_mode,
         )
-        if not isinstance(df.index, pd.DatetimeIndex):
-            logger.debug(
-                "Увага: індекс df не є DatetimeIndex (тип: %s)", type(df.index)
-            )
-            raise ValueError("df must have a DatetimeIndex")
-    except Exception as e:
-        logger.debug("Помилка при перевірці df: %s", e, exc_info=True)
-        raise
+        outside_mode = "all"
+    logger.info(
+        "[visualize_episodes] Параметри візуалізації: signals_df=%s, global_signals_df=%s, show_signals=%s, show_anchors=%s, price_col='%s', show_trade_lines=%s, show_episode_arrow=%s, annotate_metrics=%s, rsi_panel=%s, rsi_name='%s', show_tp_sl_zones=%s, label_trade_pnl=%s, tp_pct=%s, sl_pct=%s, tp_color='%s', sl_color='%s', tp_alpha=%.2f, sl_alpha=%.2f, show_global_signals=%s, global_sig_marker='%s', global_sig_size=%d, global_sig_edge='%s', global_sig_face='%s', global_coverage_warn_ratio=%.2f, inside_buffer_minutes=%d, highlight_edge_minutes=%d, edge_marker='%s', edge_size=%d, edge_face='%s', edge_edge='%s', outside_mode='%s'",
+        signals_df is not None and not signals_df.empty,
+        global_signals_df is not None and not global_signals_df.empty,
+        show_signals,
+        show_anchors,
+        price_col,
+        show_trade_lines,
+        show_episode_arrow,
+        annotate_metrics,
+        rsi_panel is not None,
+        rsi_name,
+        show_tp_sl_zones,
+        label_trade_pnl,
+        tp_pct,
+        sl_pct,
+        tp_color,
+        sl_color,
+        tp_alpha,
+        sl_alpha,
+        show_global_signals,
+        global_sig_marker,
+        global_sig_size,
+        global_sig_edge,
+        global_sig_face,
+        global_coverage_warn_ratio,
+        inside_buffer_minutes,
+        highlight_edge_minutes,
+        edge_marker,
+        edge_size,
+        edge_face,
+        edge_edge,
+        outside_mode,
+    )
 
     # ---------- Figure layout ----------
     if rsi_panel is None:
@@ -435,6 +473,18 @@ def visualize_episodes(
 
     # Нормалізуємо episodes у список словників і при потребі приєднаємо сигнали
     eps: List[Dict[str, Any]] = [_ep_to_dict(ep) for ep in (episodes or [])]
+    # Нормалізація global_signals_df + підрахунок
+    total_global = 0
+    gdf = None
+    if global_signals_df is not None and not global_signals_df.empty:
+        gdf = global_signals_df.copy()
+        if "ts" not in gdf.columns:
+            gdf = gdf.reset_index().rename(columns={gdf.columns[0]: "ts"})
+        gdf["ts"] = pd.to_datetime(gdf["ts"], utc=True, errors="coerce")
+        if "type" not in gdf.columns:
+            gdf["type"] = "SYSTEM_SIGNAL"
+        total_global = len(gdf)
+
     if signals_df is not None and not signals_df.empty:
         try:
             eps = attach_signals_to_episodes(eps, signals_df, df)
@@ -443,6 +493,34 @@ def visualize_episodes(
             logger.debug(
                 "Не вдалось прикріпити сигнали до епізодів: %s", e, exc_info=True
             )
+
+    # Формуємо episode_windows з буфером
+    episode_windows: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    for ep in episodes or []:
+        if isinstance(ep, dict):
+            ts0, ts1 = ep.get("t_start"), ep.get("t_end")
+        else:
+            ts0, ts1 = getattr(ep, "t_start", None), getattr(ep, "t_end", None)
+        if ts0 is not None and ts1 is not None:
+            a = pd.Timestamp(ts0) - pd.Timedelta(minutes=inside_buffer_minutes)
+            b = pd.Timestamp(ts1) + pd.Timedelta(minutes=inside_buffer_minutes)
+            episode_windows.append((a, b))
+
+    # Підрахунок сигналів у епізодах для coverage
+    attached_count = sum(len(ep.get("signals", [])) for ep in eps)
+    if total_global > 0:
+        ratio = attached_count / total_global
+        log_level = (
+            logging.WARNING if ratio < global_coverage_warn_ratio else logging.INFO
+        )
+        logger.log(
+            log_level,
+            "[SIGNALS COVERAGE] %.1f%% (%d/%d) глобальних сигналів в епізодах (поріг=%.0f%%)",
+            ratio * 100,
+            attached_count,
+            total_global,
+            global_coverage_warn_ratio * 100,
+        )
 
     # Improved grid
     for a in axs:
@@ -864,6 +942,21 @@ def visualize_episodes(
                         ec, fc, marker = "#333366", "#7986CB", "D"
                     else:
                         ec, fc, marker = "#424242", "#BDBDBD", "o"
+                    if stype == "SYSTEM_SIGNAL":
+                        # Перемальовуємо як зірку окремо (ігноруємо базову стилізацію)
+                        h = ax.scatter(
+                            data["t"],
+                            data["p"],
+                            s=140,
+                            marker="*",
+                            edgecolor="darkorange",
+                            facecolor="gold",
+                            linewidths=1.2,
+                            alpha=0.9,
+                            zorder=10,
+                        )
+                        _legend_once(h, "Системний сигнал")
+                        continue
                     h = ax.scatter(
                         data["t"],
                         data["p"],

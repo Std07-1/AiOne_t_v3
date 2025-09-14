@@ -19,23 +19,250 @@ import logging
 from enum import Enum
 from pathlib import Path
 import time
+import asyncio
 
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from config_episodes import EPISODE_CONFIG, EPISODE_CONFIG_1M, EPISODE_CONFIG_5M
-from indicators import (
+from ep_2.config_episodes import EPISODE_CONFIG, EPISODE_CONFIG_1M, EPISODE_CONFIG_5M
+from ep_2.indicators import (
     ensure_indicators,
     analyze_data_volatility,
-    create_early_burst_signals,
-    calculate_atr_percent,
-    calculate_vwap,
-    calculate_ema,
-    calculate_linreg_slope,
-    segment_data,
     calculate_max_runup_drawdown,
     find_impulse_peak,
 )
-from visualize_episodes import visualize_episodes
+from ep_2.core import (
+    Episode,
+    Direction,
+    EpisodeConfig,
+    build_features_table,
+    cluster_patterns,
+    reference_ranges,
+    event_hits,
+    coverage_score_from_hits,
+    analyze_episode_coverage,
+)
+
+try:  # валідація без залежностей візуалізації
+    from ep_2.visualize_episodes import visualize_episodes
+except Exception:  # noqa: BLE001
+
+    def visualize_episodes(*args, **kwargs):  # type: ignore
+        logger.warning("visualize_episodes пропущено (matplotlib не встановлено)")
+
+
+# Новий єдиний шлях отримання даних (централізація через data.raw_data)
+from data.raw_data import OptimizedDataFetcher  # type: ignore
+
+# CacheHandler більше не використовується — нова логіка отримання даних без прямого кеш-хендлера
+import aiohttp  # type: ignore
+
+# ── Інтеграція з основною системою сигналів (Stage1) ──
+from stage1.asset_monitoring import AssetMonitorStage1
+from app.asset_state_manager import AssetStateManager  # type: ignore
+
+
+# Параметри для генерації системних сигналів (можна винести в config_episodes)
+SYSTEM_SIGNAL_PARAMS = {
+    "lookback": 100,  # кількість барів для вікна аналізу
+    "symbol": "BTCUSDT",
+}
+
+
+def generate_system_signals(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    lookback: int = 100,
+    log_every: int = 200,
+) -> pd.DataFrame:
+    """Генерує системні сигнали (Stage1) використовуючи наявний AssetMonitorStage1.
+
+    Повертає DataFrame колонок: ts, price, side, type, reasons
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ts", "price", "side", "type", "reasons"])
+
+    # Нормалізація: переконаємось, що індекс UTC DatetimeIndex
+    if not isinstance(df.index, pd.DatetimeIndex):
+        df = df.copy()
+        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    else:
+        df.index = df.index.tz_convert("UTC")
+
+    records: List[Dict[str, Any]] = []
+
+    # Ініціалізація стану Stage1
+    # Ініціалізуємо менеджер з мінімально необхідним списком активів
+    state_manager = AssetStateManager(initial_assets=[symbol])
+    # AssetMonitorStage1 не приймає 'symbol' у конструкторі в актуальній версії
+    # Передаємо тільки state_manager (cache_handler=None для спрощеного офлайн середовища)
+    monitor = AssetMonitorStage1(cache_handler=None, state_manager=state_manager)
+
+    closes = df["close"].astype(float)
+    total_iters = len(df) - lookback
+    if total_iters <= 0:
+        return pd.DataFrame(columns=["ts", "price", "side", "type", "reasons"])
+
+    for i in range(lookback, len(df)):
+        window = df.iloc[i - lookback : i]
+        # emulate processing — в реальній системі monitor оновлюється стрімом
+        # У production монітор оновлюється інкрементальним стрімом барів.
+        # Для офлайн/батч режиму змоделюємо мінімальну логіку: оновимо статистику
+        # і вручну перевіримо тригери через приватні/внутрішні методи якщо доступні.
+        signal = None
+        try:  # ensure statistics (імітуючи інкрементальний апдейт)
+            # update_statistics очікує асинхронний виклик, але ми маємо синхронний цикл
+            # тому викличемо через asyncio.run у тимчасовому loop.
+            async def _upd():
+                await monitor.update_statistics(symbol, window.copy())
+
+            asyncio.run(_upd())
+        except Exception:
+            pass
+        # Простий евристичний сигнал: якщо останній volume_z або RSI екстремальні
+        try:
+            stats = monitor.asset_stats.get(symbol) or {}
+            rsi = stats.get("rsi")
+            volz = stats.get("volume_z")
+            trigger_reasons: List[str] = []
+            if rsi is not None and rsi >= 80:
+                trigger_reasons.append("RSI_OVERBOUGHT")
+            if rsi is not None and rsi <= 20:
+                trigger_reasons.append("RSI_OVERSOLD")
+            if volz is not None and volz >= 3:
+                trigger_reasons.append("VOLUME_SPIKE")
+            if trigger_reasons:
+                signal = {
+                    "type": (
+                        "ALERT_BUY"
+                        if ("RSI_OVERSOLD" in trigger_reasons)
+                        else "ALERT_SELL"
+                    ),
+                    "trigger_reasons": trigger_reasons,
+                }
+        except Exception:
+            signal = None
+        if signal:
+            sig_type = signal.get("type") or signal.get("signal_type") or "generic"
+            records.append(
+                {
+                    "ts": window.index[-1],
+                    "price": float(window["close"].iloc[-1]),
+                    "side": "BUY" if "up" in str(sig_type).lower() else "SELL",
+                    "type": "SYSTEM_SIGNAL",
+                    "reasons": signal.get("trigger_reasons")
+                    or signal.get("reasons", []),
+                }
+            )
+        iter_idx = i - lookback + 1
+        if iter_idx % log_every == 0 or iter_idx == total_iters:
+            logger.info(
+                f"[SYSTEM_SIG/{symbol}] прогрес {iter_idx}/{total_iters} ({iter_idx/total_iters:.1%}), зібрано={len(records)}"
+            )
+
+    if not records:
+        return pd.DataFrame(columns=["ts", "price", "side", "type", "reasons"])
+    out_df = pd.DataFrame(records)
+    return out_df
+
+
+#############################################
+#  ЄДИНИЙ LOADER ЧЕРЕЗ OptimizedDataFetcher  #
+#############################################
+_FETCHER_SINGLETON: Optional[OptimizedDataFetcher] = None
+_FETCH_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _get_fetch_loop() -> asyncio.AbstractEventLoop:
+    """Глобальний loop для усіх викликів fetcher (не закриваємо до завершення процесу)."""
+    global _FETCH_LOOP
+    if _FETCH_LOOP is None:
+        _FETCH_LOOP = asyncio.new_event_loop()
+    return _FETCH_LOOP
+
+
+def _get_fetcher() -> OptimizedDataFetcher:
+    global _FETCHER_SINGLETON
+    if _FETCHER_SINGLETON is None:
+        loop = _get_fetch_loop()
+        # Прив'язуємося до глобального loop
+        try:
+            asyncio.set_event_loop(loop)
+        except Exception:
+            pass
+        session = aiohttp.ClientSession()
+        _FETCHER_SINGLETON = OptimizedDataFetcher(session=session, compress_cache=True)
+        # Закриття сесії при завершенні процесу
+        try:
+            import atexit
+
+            def _close_session():  # pragma: no cover
+                try:
+                    if not session.closed:
+                        loop = _get_fetch_loop()
+                        if loop.is_running():
+                            loop.create_task(session.close())
+                        else:
+                            loop.run_until_complete(session.close())
+                except Exception:
+                    pass
+
+            atexit.register(_close_session)
+        except Exception:
+            pass
+    return _FETCHER_SINGLETON
+
+
+def fetch_bars_via_raw_data(symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
+    """Синхронна обгортка над OptimizedDataFetcher.get_data(...).
+
+    Викликається з синхронного коду (episodes.py) через asyncio.run.
+    Повертає DataFrame з індексом часу (UTC) та колонками open/high/low/close/volume.
+    """
+
+    async def _runner():
+        fetcher = _get_fetcher()
+        df = await fetcher.get_data(
+            symbol,
+            timeframe,
+            limit=limit,
+            read_cache=True,
+            write_cache=True,
+        )
+        return df
+
+    # Використовуємо окремий тимчасовий event loop замість asyncio.run, щоб уникнути
+    # помилки "Event loop is closed" при багаторазових послідовних викликах у цьому модулі.
+    try:
+        loop = _get_fetch_loop()
+        try:
+            asyncio.set_event_loop(loop)
+        except Exception:
+            pass
+        df = loop.run_until_complete(_runner())
+    except Exception as e:  # pragma: no cover
+        logger.error("[DATA] Помилка під час виконання fetch_bars_via_raw_data: %s", e)
+        df = None
+    if df is None or df.empty:
+        logger.error(
+            "[DATA] Не вдалося отримати дані через OptimizedDataFetcher для %s %s",
+            symbol,
+            timeframe,
+        )
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if "timestamp" in df.columns:
+            df.index = pd.to_datetime(df["timestamp"], utc=True)
+        else:
+            df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+    df.index.name = "time"
+    base_cols = ["open", "high", "low", "close", "volume"]
+    extra_cols = [c for c in df.columns if c not in base_cols]
+    df = df[base_cols + extra_cols]
+    if limit and len(df) > limit:
+        df = df.iloc[-limit:]
+    return df
+
 
 # Налаштування логування
 try:
@@ -60,42 +287,7 @@ if not logger.handlers:
     logger.propagate = False
 
 
-class Direction(str, Enum):
-    UP = "up"
-    DOWN = "down"
-
-
-# МОДЕЛІ ДАНИХ
-@dataclass
-class Episode:
-    """Відрізок потужного руху ціни."""
-
-    start_idx: int
-    end_idx: int
-    direction: Direction
-    peak_idx: int
-    move_pct: float
-    duration_bars: int
-    max_drawdown_pct: float
-    max_runup_pct: float
-    t_start: pd.Timestamp
-    t_end: pd.Timestamp
-
-    def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        d["t_start"] = self.t_start.isoformat()
-        d["t_end"] = self.t_end.isoformat()
-        d["direction"] = self.direction.value
-        return d
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> Episode:
-        """Створює Episode з словника."""
-        data = data.copy()
-        data["direction"] = Direction(data["direction"])
-        data["t_start"] = pd.Timestamp(data["t_start"])
-        data["t_end"] = pd.Timestamp(data["t_end"])
-        return cls(**data)
+## Direction, Episode перенесені у ep_2.core
 
 
 # утиліти
@@ -137,9 +329,6 @@ def _log_params(logger, params: Dict[str, Any], title="Параметри пош
         "tp_mult",
         "sl_mult",
         "low_gate",
-        "signal_type",
-        "early_burst_pad",
-        "weights",
     ]
     pretty = {}
     for k in keys_order:
@@ -529,281 +718,17 @@ def find_episodes_v2(
 
 
 # Додамо наступні функції та модифікації
-def create_sample_signals(df: pd.DataFrame, signal_prob: float = 0.1) -> pd.Series:
-    """
-    Створює випадкові сигнали для тестування покриття епізодів.
-
-    Args:
-        df: DataFrame з даними
-        signal_prob: Ймовірність сигналу в кожному барі
-
-    Returns:
-        Серія з булевими сигналами
-    """
-    np.random.seed(42)  # Для відтворюваності
-    signals = np.random.random(len(df)) < signal_prob
-    return pd.Series(signals, index=df.index, name="entry_signal")
+## Генерація тестових сигналів (create_sample_signals) та early_burst вилучено — використовуються лише системні Stage1 сигнали
 
 
-def analyze_episode_coverage(
-    episodes: List[Episode], entry_mask: pd.Series, df: pd.DataFrame, pad: int = 5
-) -> pd.DataFrame:
-    """
-    Детальний аналіз покриття епізодів сигналами.
-
-    Args:
-        episodes: Список епізодів
-        entry_mask: Маска сигналів входу
-        df: DataFrame з даними
-        pad: Кількість барів для розширення вікна пошуку
-
-    Returns:
-        DataFrame з детальною статистикою покриття
-    """
-    if not episodes:
-        return pd.DataFrame()
-
-    results = []
-
-    for i, ep in enumerate(episodes):
-        # Знаходимо пік імпульсу
-        segment = df.iloc[ep.start_idx : ep.end_idx + 1]
-        peak_time = find_impulse_peak(segment, ep.direction.value)
-
-        # Вікно пошуку навколо піку
-        peak_idx = df.index.get_loc(peak_time)
-        start_search = max(0, peak_idx - pad)
-        end_search = min(len(df) - 1, peak_idx + pad)
-
-        # Вибірка сигналів у вікні
-        window_signals = entry_mask.iloc[start_search : end_search + 1]
-        signal_indices = window_signals[window_signals].index.tolist()
-
-        # Перший сигнал та його зміщення від піку
-        first_signal_idx = None
-        first_signal_offset = None
-        if signal_indices:
-            first_signal_idx = signal_indices[0]
-            first_signal_offset = entry_mask.index.get_loc(first_signal_idx) - peak_idx
-
-        # Підрахунок сигналів до, під час та після епізоду
-        signals_before = entry_mask.iloc[:start_search].sum()
-        signals_during = entry_mask.iloc[start_search : end_search + 1].sum()
-        signals_after = entry_mask.iloc[end_search + 1 :].sum()
-
-        results.append(
-            {
-                "episode_id": i,
-                "direction": ep.direction.value,
-                "move_pct": ep.move_pct,
-                "duration_bars": ep.duration_bars,
-                "signals_in_window": len(signal_indices),
-                "first_signal_offset": first_signal_offset,
-                "signals_before": signals_before,
-                "signals_during": signals_during,
-                "signals_after": signals_after,
-                "covered": len(signal_indices) > 0,
-            }
-        )
-
-    return pd.DataFrame(results)
+## analyze_episode_coverage тепер імпортується з ep_2.core
 
 
-# ФІЧІ НА ЕПІЗОД
-def episode_features(
-    df: pd.DataFrame,
-    ep: Episode,
-    ema_span: int = 50,
-    impulse_k: int = 8,
-) -> Dict[str, Any]:
-    seg = segment_data(df, ep.start_idx, ep.end_idx).copy()
-    seg_len = len(seg)
-
-    if seg_len == 0:
-        return {}
-
-    def safe_get(series: pd.Series, idx: pd.Timestamp, default: float = 0.0) -> float:
-        try:
-            return float(series.loc[idx])
-        except (KeyError, ValueError):
-            return default
-
-    atrp = calculate_atr_percent(seg)
-    rsi = (
-        seg["rsi"]
-        if "rsi" in seg.columns
-        else pd.Series([0.0] * seg_len, index=seg.index)
-    )
-    volz = (
-        seg["volume_z"]
-        if "volume_z" in seg.columns
-        else pd.Series([0.0] * seg_len, index=seg.index)
-    )
-    close = seg["close"].astype(float)
-
-    s_idx = seg.index[0]
-    e_idx = seg.index[-1]
-    p_idx = df.index[ep.peak_idx]
-
-    rsi_s = safe_get(rsi, s_idx)
-    rsi_p = safe_get(rsi, p_idx)
-    rsi_e = safe_get(rsi, e_idx)
-    atrp_s = safe_get(atrp, s_idx)
-    atrp_p = safe_get(atrp, p_idx)
-    atrp_e = safe_get(atrp, e_idx)
-    volz_s = safe_get(volz, s_idx)
-    volz_p = safe_get(volz, p_idx)
-    volz_e = safe_get(volz, e_idx)
-
-    agg_stats = {
-        "rsi_mean": float(rsi.mean()),
-        "rsi_median": float(rsi.median()),
-        "rsi_std": float(rsi.std(ddof=0)),
-        "atrp_mean": float(atrp.mean()),
-        "atrp_median": float(atrp.median()),
-        "atrp_std": float(atrp.std(ddof=0)),
-        "volz_mean": float(volz.mean()),
-        "volz_median": float(volz.median()),
-        "volz_std": float(volz.std(ddof=0)),
-    }
-
-    ema = calculate_ema(close, span=ema_span)
-    vwap_series = calculate_vwap(seg)
-    slope_ema = calculate_linreg_slope(ema)
-    slope_vwap = calculate_linreg_slope(vwap_series)
-
-    if seg_len > impulse_k:
-        impulse = (close - close.shift(impulse_k)).abs() / close.shift(impulse_k)
-        impulse = impulse.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        imp_mean = float(impulse.mean())
-        imp_max = float(impulse.max())
-    else:
-        imp_mean = 0.0
-        imp_max = 0.0
-
-    base_features = {
-        "t_start": pd.Timestamp(ep.t_start),
-        "t_end": pd.Timestamp(ep.t_end),
-        "direction": ep.direction.value,
-        "move_pct": ep.move_pct,
-        "duration_bars": ep.duration_bars,
-        "max_drawdown_pct": ep.max_drawdown_pct,
-        "max_runup_pct": ep.max_runup_pct,
-        "rsi_s": rsi_s,
-        "rsi_p": rsi_p,
-        "rsi_e": rsi_e,
-        "atrp_s": atrp_s,
-        "atrp_p": atrp_p,
-        "atrp_e": atrp_e,
-        "volz_s": volz_s,
-        "volz_p": volz_p,
-        "volz_e": volz_e,
-        "slope_ema": slope_ema,
-        "slope_vwap": slope_vwap,
-        "impulse_mean": imp_mean,
-        "impulse_max": imp_max,
-    }
-
-    base_features.update(agg_stats)
-    return base_features
-
-
-def build_features_table(
-    df: pd.DataFrame,
-    episodes: List[Episode],
-    ema_span: int = 50,
-    impulse_k: int = 8,
-) -> pd.DataFrame:
-    if not episodes:
-        return pd.DataFrame()
-
-    rows = [
-        episode_features(df, ep, ema_span=ema_span, impulse_k=impulse_k)
-        for ep in episodes
-    ]
-
-    features_df = pd.DataFrame(rows)
-    if not features_df.empty:
-        features_df = features_df.sort_values("t_start").reset_index(drop=True)
-
-    return features_df
+## episode_features / build_features_table тепер у ep_2.core
 
 
 # КОНФІГУРАЦІЯ
-class EpisodeConfig:
-    def __init__(
-        self,
-        symbol: str = "BTCUSDT",
-        timeframe: str = "1m",
-        limit: int = 26000,
-        move_pct_up: float = 0.01,
-        move_pct_down: float = 0.01,
-        min_bars: int = 5,
-        max_bars: int = 120,
-        close_col: str = "close",
-        ema_span: int = 50,
-        impulse_k: int = 8,
-        cluster_k: int = 3,
-        pad_bars: int = 5,
-        retrace_ratio: float = 0.33,
-        require_retrace: bool = True,
-        min_gap_bars: int = 0,
-        merge_adjacent: bool = True,
-        max_episodes: Optional[int] = None,
-        adaptive_threshold: bool = False,
-        save_results: bool = True,
-        create_sample_signals: bool = False,
-        # Нові параметри
-        volume_z_threshold: float = 2.0,
-        rsi_overbought: float = 80.0,
-        rsi_oversold: float = 20.0,
-        tp_mult: float = 3.0,
-        sl_mult: float = 2.0,
-        vwap_gate: float = 0.001,
-        low_gate: float = 0.001,
-        signal_type: str = "random",  # 'random' або 'early_burst'
-        early_burst_pad: int = 3,
-        weights: Optional[Dict[str, float]] = None,
-    ):
-        self.symbol = symbol
-        self.timeframe = timeframe
-        self.limit = limit
-        self.move_pct_up = move_pct_up
-        self.move_pct_down = move_pct_down
-        self.min_bars = min_bars
-        self.max_bars = max_bars
-        self.close_col = close_col
-        self.ema_span = ema_span
-        self.impulse_k = impulse_k
-        self.cluster_k = cluster_k
-        self.pad_bars = pad_bars
-        self.retrace_ratio = retrace_ratio
-        self.require_retrace = require_retrace
-        self.min_gap_bars = min_gap_bars
-        self.merge_adjacent = merge_adjacent
-        self.max_episodes = max_episodes
-        self.adaptive_threshold = adaptive_threshold
-        self.save_results = save_results
-        self.create_sample_signals = create_sample_signals
-
-        # Нові параметри
-        self.volume_z_threshold = volume_z_threshold
-        self.rsi_overbought = rsi_overbought
-        self.rsi_oversold = rsi_oversold
-        self.tp_mult = tp_mult
-        self.sl_mult = sl_mult
-        self.vwap_gate = vwap_gate
-        self.low_gate = low_gate
-        self.signal_type = signal_type
-        self.early_burst_pad = early_burst_pad
-        self.weights = weights or {"slope_vwap": 0.5, "slope_ema": 0.5}
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
-
-    @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> EpisodeConfig:
-        return cls(**config_dict)
+## EpisodeConfig тепер імпортується з ep_2.core
 
 
 # ОСНОВНА ФУНКЦІЯ
@@ -816,14 +741,7 @@ def main_analysis(
     # 1) Індикатори (RSI/ATR/atr_pct/volume_z)
     df = ensure_indicators(df)
 
-    # Створюємо тестові сигнали, якщо потрібно
-    if create_sample and entry_mask is None:
-        if config.signal_type == "early_burst":
-            entry_mask = create_early_burst_signals(df, config)
-            logger.info(f"Створено {entry_mask.sum()} тестових сигналів (early burst)")
-        else:
-            entry_mask = create_sample_signals(df, signal_prob=0.05)
-            logger.info(f"Створено {entry_mask.sum()} тестових сигналів (випадкові)")
+    # (Вилучено) Генерація штучних сигналів — тепер працюємо виключно з системними сигналами Stage1
 
     # 2) Аналіз волатильності
     volatility = analyze_data_volatility(df)
@@ -963,229 +881,97 @@ def read_csv_smart(path: str) -> pd.DataFrame:
     return df
 
 
-# КЛАСТЕРИ ПАТЕРНІВ
-def _kmeans_numpy(X: np.ndarray, k: int, iters: int = 50, seed: int = 0) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    n, d = X.shape
+# --- УНІВЕРСАЛЬНЕ ЗАВАНТАЖЕННЯ ДАНИХ (Hierarchical Loader) ---
+def _read_datastore_snapshot(
+    symbol: str, timeframe: str, base_dir: str = "datastore"
+) -> Optional[pd.DataFrame]:
+    """Пробує прочитати snapshot з datastore/, який створює UnifiedDataStore.
 
-    if n == 0:
-        return np.array([], dtype=int)
-
-    centers = X[rng.choice(n, size=min(k, n), replace=False)]
-
-    if centers.shape[0] < k:
-        missing = k - centers.shape[0]
-        centers = np.vstack(
-            [centers, centers[rng.choice(centers.shape[0], missing, replace=True)]]
-        )
-
-    labels = np.zeros(n, dtype=int)
-
-    for _ in range(iters):
-        dists = np.linalg.norm(X[:, None, :] - centers[None, :, :], axis=2)
-        new_labels = dists.argmin(axis=1)
-
-        if np.array_equal(new_labels, labels):
-            break
-
-        labels = new_labels
-
-        for c in range(k):
-            members = X[labels == c]
-            if len(members) > 0:
-                centers[c] = members.mean(axis=0)
+    Формат файлу:  {base_dir}/{symbol}_bars_{timeframe}_snapshot.jsonl
+    Кожен рядок – JSON-об'єкт із обов'язковими колонками open_time, open, high, low, close, volume.
+    """
+    path = Path(base_dir) / f"{symbol}_bars_{timeframe}_snapshot.jsonl"
+    if not path.exists():
+        return None
+    try:
+        rows = []
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        # Очікуваний timestamp стовпець: open_time (ms)
+        if "open_time" in df.columns:
+            # підтримка як ms (int) так і ISO
+            if pd.api.types.is_integer_dtype(df["open_time"]):
+                df["open_time"] = pd.to_datetime(
+                    df["open_time"], unit="ms", utc=True, errors="coerce"
+                )
             else:
-                centers[c] = X[rng.integers(0, n)]
-
-    return labels
-
-
-def cluster_patterns(
-    features: pd.DataFrame,
-    k: int = 3,
-    by_direction: bool = True,
-    cols: Optional[List[str]] = None,
-    seed: int = 0,
-) -> pd.Series:
-    if features.empty:
-        return pd.Series(dtype=int)
-
-    if cols is None:
-        cols = [
-            "move_pct",
-            "duration_bars",
-            "rsi_s",
-            "rsi_p",
-            "rsi_e",
-            "atrp_s",
-            "atrp_p",
-            "atrp_e",
-            "volz_s",
-            "volz_p",
-            "volz_e",
-            "slope_ema",
-            "slope_vwap",
-            "impulse_mean",
-            "impulse_max",
-        ]
-        cols = [c for c in cols if c in features.columns]
-
-    labels_all = np.full(len(features), -1, dtype=int)
-
-    if by_direction and "direction" in features.columns:
-        for direction in [Direction.UP.value, Direction.DOWN.value]:
-            mask = (features["direction"] == direction).values
-            sub = features.loc[mask, cols]
-
-            if sub.empty:
-                continue
-
-            X = sub.values.astype(float)
-            mu = X.mean(axis=0, keepdims=True)
-            sigma = X.std(axis=0, keepdims=True)
-            sigma[sigma == 0.0] = 1.0
-            Z = (X - mu) / sigma
-
-            labels = _kmeans_numpy(Z, k=k, iters=50, seed=seed)
-            labels_all[mask] = labels
-    else:
-        X = features[cols].values.astype(float)
-        mu = X.mean(axis=0, keepdims=True)
-        sigma = X.std(axis=0, keepdims=True)
-        sigma[sigma == 0.0] = 1.0
-        Z = (X - mu) / sigma
-        labels_all = _kmeans_numpy(Z, k=k, iters=50, seed=seed)
-
-    return pd.Series(labels_all, index=features.index, name="cluster")
+                df["open_time"] = pd.to_datetime(
+                    df["open_time"], utc=True, errors="coerce"
+                )
+            df = df.dropna(subset=["open_time"]).set_index("open_time").sort_index()
+        elif "time" in df.columns:
+            df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+            df = df.dropna(subset=["time"]).set_index("time").sort_index()
+        # Стандартизуємо назви
+        rename_map = {"Time": "time", "Volume": "volume", "Close": "close"}
+        for k, v in rename_map.items():
+            if k in df.columns and v not in df.columns:
+                df.rename(columns={k: v}, inplace=True)
+        return df
+    except Exception as e:
+        logger.warning(f"Не вдалося прочитати datastore snapshot: {e}")
+        return None
 
 
-def reference_ranges(
-    features: pd.DataFrame,
-    lower_q: float = 0.30,
-    upper_q: float = 0.70,
-) -> Dict[str, Dict[str, Tuple[float, float]]]:
-    out: Dict[str, Dict[str, Tuple[float, float]]] = {}
+def _scan_csv_variants(symbol: str, timeframe: str) -> List[Path]:
+    """Повертає список CSV файлів формату bars_{symbol}_{timeframe}_*.csv (відсортований за числовим * у спадному порядку)."""
+    pattern = f"bars_{symbol}_{timeframe}_*.csv"
+    files = list(Path(".").glob(pattern))
 
-    if features.empty:
-        return out
+    def _extract_limit(p: Path) -> int:
+        try:
+            # bars_SYMBOL_TF_LIMIT.csv -> беремо останній компонент перед .csv
+            return int(p.stem.split("_")[-1])
+        except Exception:
+            return -1
 
-    metrics = {
-        "rsi": ("rsi_s", "rsi_p", "rsi_e", "rsi_mean"),
-        "atrp": ("atrp_s", "atrp_p", "atrp_e", "atrp_mean"),
-        "volz": ("volz_s", "volz_p", "volz_e", "volz_mean"),
-    }
-
-    for direction in [Direction.UP.value, Direction.DOWN.value]:
-        group = features[features["direction"] == direction]
-        if group.empty:
-            continue
-
-        dres: Dict[str, Tuple[float, float]] = {}
-        for mname, cols in metrics.items():
-            col_vals = pd.concat([group[c] for c in cols if c in group.columns], axis=0)
-            if col_vals.empty:
-                continue
-
-            low = float(col_vals.quantile(lower_q))
-            high = float(col_vals.quantile(upper_q))
-            dres[mname] = (low, high)
-
-        out[direction] = dres
-
-    return out
+    files.sort(key=_extract_limit, reverse=True)
+    return files
 
 
-# ПОКРИТТЯ ПОДІЙ СИГНАЛАМИ
-def event_hits(
-    entry_mask: pd.Series,
-    episodes: List[Episode],
-    pad: int = 5,
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    if not episodes:
-        return pd.DataFrame(columns=["hit", "first_hit_offset", "hit_count"]), {
-            "coverage": 0.0,
-            "avg_abs_offset": 0.0,
-            "misses": 0,
-            "total": 0,
-        }
+def load_bars_auto(config: "EpisodeConfig") -> pd.DataFrame:
+    """Спрощений loader: завжди отримує дані через OptimizedDataFetcher (raw_data).
 
-    idx = entry_mask.index
-    hits_rows = []
-
-    for ep in episodes:
-        s = max(0, ep.start_idx - pad)
-        e = min(len(idx) - 1, ep.end_idx + pad)
-        window = entry_mask.iloc[s : e + 1]
-        hit_positions = np.flatnonzero(window.values.astype(bool))
-
-        if hit_positions.size > 0:
-            first_rel = int(hit_positions[0])
-            first_abs_idx = s + first_rel
-            offset = first_abs_idx - ep.start_idx
-
-            hits_rows.append(
-                {
-                    "t_start": ep.t_start,
-                    "t_end": ep.t_end,
-                    "direction": ep.direction.value,
-                    "hit": True,
-                    "first_hit_offset": int(offset),
-                    "hit_count": int(hit_positions.size),
-                }
-            )
-        else:
-            hits_rows.append(
-                {
-                    "t_start": ep.t_start,
-                    "t_end": ep.t_end,
-                    "direction": ep.direction.value,
-                    "hit": False,
-                    "first_hit_offset": np.nan,
-                    "hit_count": 0,
-                }
-            )
-
-    hits_df = pd.DataFrame(hits_rows)
-
-    coverage = float(hits_df["hit"].mean()) if not hits_df.empty else 0.0
-
-    if hits_df["hit"].any():
-        avg_abs_offset = float(
-            hits_df.loc[hits_df["hit"], "first_hit_offset"].abs().mean()
-        )
-    else:
-        avg_abs_offset = 0.0
-
-    misses = int((~hits_df["hit"]).sum())
-    total = int(len(hits_df))
-
-    stats = {
-        "coverage": coverage,
-        "avg_abs_offset": avg_abs_offset,
-        "misses": misses,
-        "total": total,
-    }
-
-    return hits_df, stats
-
-
-def coverage_score_from_hits(
-    stats: Dict[str, float],
-    w_cover: float = 1.0,
-    w_offset: float = 0.2,
-    miss_penalty: float = 1.0,
-    max_offset_norm: float = 20.0,
-) -> float:
-    cov = stats.get("coverage", 0.0)
-    avg_off = stats.get("avg_abs_offset", 0.0)
-
-    score = (
-        w_cover * cov
-        - w_offset * (avg_off / max_offset_norm)
-        - miss_penalty * (1.0 - cov)
+    Видалено підтримку snapshot/CSV та параметр force_live. Єдиним джерелом є кеш + REST.
+    """
+    symbol = config.symbol
+    timeframe = config.timeframe
+    limit = getattr(config, "limit", 0) or 0
+    logger.info(
+        "[DATA] Завантаження через OptimizedDataFetcher (single-source) %s %s limit=%s",
+        symbol,
+        timeframe,
+        limit,
     )
+    df = fetch_bars_via_raw_data(symbol, timeframe, limit)
+    if df.empty:
+        raise RuntimeError(
+            f"Не вдалося отримати дані для {symbol} {timeframe} (single-source raw_data)"
+        )
+    return df
 
-    return float(np.clip(score, -1.0, 1.0))
+
+## cluster_patterns / reference_ranges / event_hits / coverage_score_from_hits тепер у ep_2.core
 
 
 if __name__ == "__main__":
@@ -1207,15 +993,11 @@ if __name__ == "__main__":
 
     for tf, config in configs.items():
         logger.info(f"Аналіз для таймфрейму {tf}")
-
-        csv_path = f"bars_{config.symbol}_{config.timeframe}_{config.limit}.csv"
-        logger.debug(f"Зчитування даних з CSV: {csv_path}")
-
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"Не знайдено файл: {csv_path}")
-
-        df = read_csv_smart(csv_path)
-        logger.debug(f"Розмір DataFrame: {df.shape}, колонки: {list(df.columns)}")
+        # Використовуємо ієрархічний loader замість жорсткого CSV
+        df = load_bars_auto(config)
+        logger.debug(
+            f"Розмір DataFrame після auto-load: {df.shape}, колонки: {list(df.columns)}"
+        )
 
         if df.empty:
             logger.error("Дані не прочитані або порожні!")
@@ -1223,13 +1005,39 @@ if __name__ == "__main__":
 
         logger.info(f"Аналіз символу: {config.symbol}")
 
-        # Запуск аналізу
+        # Генерація системних сигналів (Stage1) ДО основного аналізу для інтеграції в coverage
+        system_signals_df = None
+        try:
+            system_signals_df = generate_system_signals(
+                df,
+                symbol=config.symbol,
+                lookback=SYSTEM_SIGNAL_PARAMS.get("lookback", 100),
+            )
+            if system_signals_df is not None and not system_signals_df.empty:
+                logger.info(
+                    f"Інтегровано {len(system_signals_df)} системних сигналів (Stage1) для {tf} у coverage"
+                )
+        except Exception as e:
+            logger.warning(f"Не вдалося згенерувати системні сигнали: {e}")
+            system_signals_df = None
+
+        # Формуємо entry_mask з системних сигналів (true на таймстемпах сигналів)
+        entry_mask = None
+        if system_signals_df is not None and not system_signals_df.empty:
+            # нормалізувати індекси до наявних у df (nearest exact match)
+            ts_set = set(system_signals_df["ts"].astype("datetime64[ns, UTC]").values)
+            entry_mask = df.index.isin(ts_set)
+            entry_mask = pd.Series(entry_mask, index=df.index, dtype=bool)
+
+        # Запуск аналізу з побудованим entry_mask
         results = main_analysis(
             df,
             config,
-            entry_mask=None,
-            create_sample=config.create_sample_signals,
+            entry_mask=entry_mask,
+            create_sample=False,
         )
+        # Додаємо системні сигнали у результати для подальшого використання/збереження
+        results["system_signals"] = system_signals_df
         all_results[tf] = results
 
         # Логування результатів
@@ -1300,42 +1108,24 @@ if __name__ == "__main__":
         if not results["features"].empty:
             log_features_vertical(results["features"], logger, title="Preview features")
 
-        # Візуалізація з TP/SL зонами та PnL підписами
+        # Візуалізація з TP/SL зонами, PnL та інтегрованими системними сигналами
         try:
             Path("results").mkdir(exist_ok=True)
             out_file = f"results/{config.symbol}_{tf}_episodes.pdf"
+            merged_signals = results.get("system_signals")
 
             visualize_episodes(
                 df,
                 results["episodes"],
-                signals_df=(
-                    pd.DataFrame(
-                        {
-                            "ts": results.get("entry_mask")[
-                                results.get("entry_mask")
-                            ].index,
-                            "side": ["BUY"] * int(results.get("entry_mask").sum()),
-                            "price": [
-                                float(df.loc[t, config.close_col])
-                                for t in results.get("entry_mask")[
-                                    results.get("entry_mask")
-                                ].index
-                            ],
-                        }
-                    )
-                    if results.get("entry_mask") is not None
-                    and results.get("entry_mask").any()
-                    else None
-                ),
+                signals_df=merged_signals,  # локальні сигнали, прикріплені до епізодів
+                global_signals_df=merged_signals,  # повний список для глобального шару
                 save_path=out_file,
                 show_signals=True,
                 show_anchors=True,
                 price_col="close",
                 annotate_metrics=True,
-                # NEW:
                 show_tp_sl_zones=True,
                 label_trade_pnl=True,
-                # Якщо не передаєш TP/SL у епізодах/ентрі — можеш задати глобально, напр. 2%/1.2%
                 tp_pct=(
                     0.02
                     if getattr(config, "default_tp_pct", None) is None
@@ -1346,6 +1136,12 @@ if __name__ == "__main__":
                     if getattr(config, "default_sl_pct", None) is None
                     else config.default_sl_pct
                 ),
+                # --- нові параметри глобальних сигналів / покриття ---
+                show_global_signals=True,
+                global_coverage_warn_ratio=0.25,  # попередження якщо <25% всередині
+                inside_buffer_minutes=0,  # можна підняти для «м'якого» вікна
+                highlight_edge_minutes=5,
+                outside_mode="all",  # 'edge-only' або 'none' для фільтрації
             )
             logger.info(f"Збережено візуалізацію: {out_file}")
         except ImportError:
@@ -1379,12 +1175,20 @@ if __name__ == "__main__":
             ht_out = f"results/{prefix}_hits.csv"
             results["hits"].fillna("").to_csv(ht_out, index=False)
 
+            # Зберігаємо системні сигнали (якщо є) для прозорості
+            if results.get("system_signals") is not None and not results["system_signals"].empty:  # type: ignore[attr-defined]
+                sys_out = f"results/{prefix}_system_signals.csv"
+                results["system_signals"].to_csv(sys_out, index=False)  # type: ignore[index]
+            else:
+                sys_out = None
+
             config_out = f"results/{prefix}_config.json"
             with open(config_out, "w", encoding="utf-8") as f:
                 json.dump(config.to_dict(), f, indent=2)
 
+            extra_line = f"\n  {sys_out}" if sys_out else ""
             logger.info(
-                f"Результати збережено у теці results:\n  {ep_out}\n  {ft_out}\n  {rr_out}\n  {ht_out}\n  {config_out}"
+                f"Результати збережено у теці results:\n  {ep_out}\n  {ft_out}\n  {rr_out}\n  {ht_out}\n  {config_out}{extra_line}"
             )
 
     end_time = time.time()

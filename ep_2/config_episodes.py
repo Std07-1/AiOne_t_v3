@@ -5,7 +5,9 @@
 EPISODE_CONFIG_1M = {
     "symbol": "TONUSDT",
     "timeframe": "1m",
-    "limit": 26000,
+    # Binance Futures /fapi/v1/klines підтримує максимум ~1500 свічок за запит
+    # (раніше стояло 2000, що спричиняло HTTP 400 code -1130)
+    "limit": 3000,
     "min_gap_bars": 12,  # Зменшено з 4
     "merge_adjacent": True,
     "max_episodes": None,
@@ -22,7 +24,7 @@ EPISODE_CONFIG_1M = {
     "require_retrace": False,  # для оцінки @anchor
     "adaptive_threshold": True,
     "save_results": True,
-    "create_sample_signals": True,
+    # create_sample_signals: (видалено — використовуються лише системні сигнали Stage1)
     # Нові параметри
     "volume_z_threshold": 1.5,  # +0.2, якщо ATR% < low_gate (дуже низька волатильність)
     # або <0.2, якщо ATR% > high_gate (дуже висока волатильність)
@@ -32,15 +34,12 @@ EPISODE_CONFIG_1M = {
     "tp_mult": 8,
     "sl_mult": 3.5,
     "low_gate": 0.0008,  # Зменшено з 0.001
-    "signal_type": "early_burst",
-    "early_burst_pad": 2,  # Зменшено з 3
-    "weights": {"slope_vwap": 0.6, "slope_ema": 0.4},
 }
 
 EPISODE_CONFIG_5M = {
     "symbol": "BTCUSDT",
     "timeframe": "5m",
-    "limit": 26000,
+    "limit": 3000,
     "min_gap_bars": 12,
     "merge_adjacent": True,
     "max_episodes": None,
@@ -57,7 +56,7 @@ EPISODE_CONFIG_5M = {
     "require_retrace": False,
     "adaptive_threshold": True,
     "save_results": True,
-    "create_sample_signals": True,
+    # create_sample_signals: (видалено — використовуються лише системні сигнали Stage1)
     # Нові параметри
     "volume_z_threshold": 1.5,
     "rsi_overbought": 84,
@@ -65,15 +64,12 @@ EPISODE_CONFIG_5M = {
     "tp_mult": 8,
     "sl_mult": 3.5,
     "low_gate": 0.001,
-    "signal_type": "early_burst",
-    "early_burst_pad": 2,
-    "weights": {"slope_vwap": 0.6, "slope_ema": 0.4},
 }
 
 EPISODE_CONFIG = {
     "symbol": "BTCUSDT",  # Торговий символ для аналізу
     "timeframe": "5m",  # Таймфрейм для барів
-    "limit": 26000,  # Ліміт барів
+    "limit": 3000,  # Ліміт барів (макс. для Binance klines)
     # Параметри обробки епізодів
     "min_gap_bars": [
         3,
@@ -99,8 +95,18 @@ EPISODE_CONFIG = {
     "adaptive_threshold": True,  # Чи використовувати адаптивний поріг
     # Параметри експорту
     "save_results": True,  # Чи зберігати результати аналізу
-    "create_sample_signals": True,  # Чи створювати тестові сигнали
+    # create_sample_signals: True,  # (застаріло) тестові сигнали більше не генеруються
 }
+
+# Параметри генерації системних сигналів (Stage1) для епізодного аналізу
+SYSTEM_SIGNAL_CONFIG = {
+    "enabled": True,
+    "lookback": 100,  # розмір ковзного вікна для аналізу історії
+    # майбутні параметри можна додати тут (наприклад, мультиплікатори RSI, vol_z overrides)
+}
+
+# Для імпорту:
+# from config_episodes import SYSTEM_SIGNAL_CONFIG
 
 # Для імпорту:
 # from config_episodes import EPISODE_CONFIG

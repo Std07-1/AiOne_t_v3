@@ -573,7 +573,7 @@ class QDEngine:
             conf["composite_confidence"],
             reco,
         )
-        return {
+        result = {
             "symbol": symbol,
             "market_context": context,
             "confidence_metrics": conf,
@@ -582,6 +582,7 @@ class QDEngine:
             "narrative": narr,
             "risk_parameters": risk,
         }
+        return result
 
 
 # ── Приклад ──

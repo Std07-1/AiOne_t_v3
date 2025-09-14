@@ -27,7 +27,6 @@ import asyncio
 import json
 import logging
 import time
-import os
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -44,7 +43,6 @@ from rich.progress import (
     SpinnerColumn,
     TextColumn,
     TimeElapsedColumn,
-    TimeRemainingColumn,
 )
 
 from utils.utils import get_ttl_for_interval

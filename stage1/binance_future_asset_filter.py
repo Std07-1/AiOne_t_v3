@@ -12,47 +12,42 @@
 Вихід: відсортований список тікерів для подальших стадій.
 """
 
+import asyncio
 import logging
 import time
-from typing import List, Union
 
 import aiohttp
-import asyncio
 import pandas as pd
-
-from config.config import (
-    SymbolInfo,
-    FilterParams,
-    OI_SEMAPHORE,
-    KLINES_SEMAPHORE,
-    DEPTH_SEMAPHORE,
-    MetricResults,
-)
-from utils.utils import format_open_interest, format_volume_usd
-
-from stage1.helpers import (
-    _fetch_json,
-    fetch_cached_data,
-    fetch_open_interest,
-    fetch_orderbook_depth,
-    fetch_atr,
-    fetch_concurrently,
-)
-
-from rich.progress import (
-    Progress,
-    SpinnerColumn,
-    BarColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    MofNCompleteColumn,
-    TaskProgressColumn,
-)
-
-from stage1.visualization import print_results
-
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+
+from config.config import (
+    DEPTH_SEMAPHORE,
+    KLINES_SEMAPHORE,
+    OI_SEMAPHORE,
+    FilterParams,
+    MetricResults,
+    SymbolInfo,
+)
+from stage1.helpers import (
+    _fetch_json,
+    fetch_atr,
+    fetch_cached_data,
+    fetch_concurrently,
+    fetch_open_interest,
+    fetch_orderbook_depth,
+)
+from stage1.visualization import print_results
+from utils.utils import format_open_interest, format_volume_usd
 
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.stage1.binance_future_asset_filter")
@@ -67,6 +62,9 @@ console = Console()
 
 # CORE LOGIC
 class BinanceFutureAssetFilter:
+    # class-level для швидкого доступу до останніх метрик із зовнішніх модулів
+    last_metrics: MetricResults | dict[str, object] | None = None
+
     def __init__(self, session: aiohttp.ClientSession, store):
         """
         Ініціалізація фільтра активів Binance Futures.
@@ -75,19 +73,21 @@ class BinanceFutureAssetFilter:
         """
         self.session = session
         self.store = store  # історичне cache_handler → тепер чіткіше
-        self.metrics = {}
-        self.progress = None
-        self.metrics_progress = None  # Додатковий атрибут для прогресу метрик
+        self.metrics: MetricResults | dict[str, object] = {}
+        self.progress: Progress | None = None
+        self.metrics_progress: Progress | None = (
+            None  # Додатковий атрибут для прогресу метрик
+        )
         logger.debug("BinanceFutureAssetFilter ініціалізовано")
 
-    async def load_exchange_info(self) -> List[SymbolInfo]:
+    async def load_exchange_info(self) -> list[SymbolInfo]:
         """
         Завантаження інформації про символи з кешу або API Binance.
         Повертає список SymbolInfo для USDT-PERPETUAL TRADING символів.
         """
         logger.debug("[STEP] Початок завантаження exchangeInfo")
 
-        def process_data(data: Union[dict, list]) -> List[dict]:
+        def process_data(data: dict | list) -> list[dict]:
             # Обробка різних форматів вхідних даних
             logger.debug(f"[EVENT] Обробка exchangeInfo, тип: {type(data)}")
             symbols = data.get("symbols", []) if isinstance(data, dict) else data
@@ -111,7 +111,9 @@ class BinanceFutureAssetFilter:
             process_data,
         )
         logger.debug(f"[STEP] Завантажено exchangeInfo, кількість: {len(data)}")
-        return [SymbolInfo(**s) for s in data]
+        # data expected as {"symbols": [...]} ; normalize to list
+        items = data.get("symbols", []) if isinstance(data, dict) else data
+        return [SymbolInfo(**s) for s in items if isinstance(s, dict)]
 
     async def fetch_ticker_data(self) -> pd.DataFrame:
         """
@@ -156,7 +158,9 @@ class BinanceFutureAssetFilter:
                     params.min_price_change,
                 )
                 logger.debug(
-                    f"[EVENT] Встановлено пороги: min_quote_volume={params.min_quote_volume}, min_price_change={params.min_price_change}"
+                    "[EVENT] Встановлено пороги: "
+                    f"min_quote_volume={params.min_quote_volume}, "
+                    f"min_price_change={params.min_price_change}"
                 )
             else:
                 logger.debug("[EVENT] Недостатньо даних для динамічних порогів")
@@ -165,7 +169,7 @@ class BinanceFutureAssetFilter:
             logger.error("Помилка розрахунку динамічних порогів: %s", e)
             return params
 
-    async def filter_assets(self, params: FilterParams) -> List[str]:
+    async def filter_assets(self, params: FilterParams) -> list[str]:
         """
         Основний пайплайн фільтрації активів Binance Futures.
         Виконує всі етапи: завантаження, фільтрація, збір метрик, ранжування.
@@ -269,7 +273,9 @@ class BinanceFutureAssetFilter:
 
         # Створюємо завдання для метрик тільки зараз, коли знаємо symbols
         total_metrics = len(symbols) * 3
-        metrics_task = self.progress.add_task(
+        assert self.progress is not None
+        prog = self.progress
+        metrics_task = prog.add_task(
             "[bold yellow] OI • Depth • ATR[/bold yellow]", total=total_metrics
         )
 
@@ -279,7 +285,7 @@ class BinanceFutureAssetFilter:
             symbols,
             fetch_open_interest,
             OI_SEMAPHORE,
-            progress_callback=lambda: self.progress.advance(metrics_task),
+            progress_callback=lambda: prog.advance(metrics_task),
         )
         logger.debug(f"[EVENT] Зібрано openInterest для {len(oi_data)} символів")
 
@@ -291,7 +297,7 @@ class BinanceFutureAssetFilter:
             symbols,
             fetch_orderbook_depth,
             DEPTH_SEMAPHORE,
-            progress_callback=lambda: self.progress.advance(metrics_task),
+            progress_callback=lambda: prog.advance(metrics_task),
         )
         logger.debug(f"[EVENT] Зібрано orderbookDepth для {len(depth_data)} символів")
 
@@ -303,7 +309,7 @@ class BinanceFutureAssetFilter:
             symbols,
             fetch_atr,
             KLINES_SEMAPHORE,
-            progress_callback=lambda: self.progress.advance(metrics_task),
+            progress_callback=lambda: prog.advance(metrics_task),
         )
         logger.debug(f"[EVENT] Зібрано ATR для {len(atr_data)} символів")
 
@@ -405,6 +411,18 @@ class BinanceFutureAssetFilter:
 
         # Зберігаємо метрики для налагодження
         self.metrics = metrics
+        # також як class-level для швидкого доступу з інших модулів (plain dict)
+        try:
+            type(self).last_metrics = metrics.dict()
+        except Exception:
+            type(self).last_metrics = {
+                "initial_count": metrics.initial_count,
+                "prefiltered_count": metrics.prefiltered_count,
+                "filtered_count": metrics.filtered_count,
+                "result_count": metrics.result_count,
+                "elapsed_time": metrics.elapsed_time,
+                "params": metrics.params,
+            }
         logger.debug(f"[EVENT] Збережено метрики: {self.metrics}")
 
         return result

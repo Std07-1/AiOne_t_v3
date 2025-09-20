@@ -9,31 +9,30 @@
     • retry логіку через tenacity з кастомним фільтром винятків.
 """
 
-from aiohttp import ClientResponseError, ClientConnectionError
 import asyncio
-import aiohttp
-import pandas as pd
 import json
 import logging
-from typing import Dict, List, Tuple, Optional
+from collections.abc import Awaitable, Callable
+from typing import Any, Protocol, runtime_checkable
 
-from tenacity import (
-    retry,
-    stop_after_attempt,
-    wait_exponential,
-    retry_if_exception,
-    before_sleep_log,
-)
-from utils.utils import ensure_timestamp_column
-
-from config.config import (
-    OI_SEMAPHORE,
-    KLINES_SEMAPHORE,
-    DEPTH_SEMAPHORE,
-    REDIS_CACHE_TTL,
-)
+import aiohttp
+from aiohttp import ClientConnectionError, ClientResponseError
 from rich.console import Console
 from rich.logging import RichHandler
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from config.config import (
+    DEPTH_SEMAPHORE,
+    KLINES_SEMAPHORE,
+    OI_SEMAPHORE,
+    REDIS_CACHE_TTL,
+)
 
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.stage1.helpers")
@@ -69,7 +68,32 @@ retry_decorator = retry(
 )
 
 
-async def _fetch_json(session: aiohttp.ClientSession, url: str) -> list | dict:
+# ───────────────────────────── Протоколи типів ─────────────────────────────
+@runtime_checkable
+class RedisJSONLike(Protocol):
+    async def jget(self, *parts: str, default: object | None = None) -> object: ...
+
+    async def jset(
+        self, *parts: str, value: object, ttl: int | None = None
+    ) -> None: ...
+
+
+@runtime_checkable
+class CacheLike(Protocol):
+    redis: RedisJSONLike
+
+    async def fetch_from_cache(
+        self, symbol: str, interval: str, *, prefix: str = "candles", raw: bool = True
+    ) -> object: ...
+
+    async def delete_from_cache(
+        self, symbol: str, interval: str, *, prefix: str = "candles"
+    ) -> None: ...
+
+
+async def _fetch_json(
+    session: aiohttp.ClientSession, url: str
+) -> list[Any] | dict[str, Any]:
     """
     Виконує HTTP GET запит до вказаного URL і повертає JSON.
     Якщо виникає помилка (наприклад, HTTP 451 або інша),
@@ -86,7 +110,12 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> list | dict:
             resp.raise_for_status()
             result = await resp.json()
             logger.debug(f"[EVENT] JSON отримано: {type(result)}")
-            return result
+            if isinstance(result, dict):
+                return result
+            if isinstance(result, list):
+                return result
+            # Нестандартна відповідь – повертаємо порожній словник
+            return {}
     except ClientResponseError as e:
         if e.status == 451:
             logger.error("HTTP 451: Доступ заблоковано для URL %s", url)
@@ -102,8 +131,12 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> list | dict:
 
 @retry_decorator
 async def fetch_cached_data(
-    session: aiohttp.ClientSession, cache_handler, key: str, url: str, process_fn=None
-) -> dict:
+    session: aiohttp.ClientSession,
+    cache_handler: CacheLike,
+    key: str,
+    url: str,
+    process_fn: Callable[[Any], Any] | None = None,
+) -> dict[str, Any]:
     """
     Універсальна функція для кешованих запитів.
     :param session: aiohttp.ClientSession
@@ -115,7 +148,7 @@ async def fetch_cached_data(
     """
     logger.debug(f"[STEP] _fetch_cached_data (JSON-first): key={key}, url={url}")
     # НОВИЙ ПІДХІД: пробуємо структурований JSON ключ замість blob
-    json_cached = None
+    json_cached: object | None = None
     try:
         json_cached = await cache_handler.redis.jget(
             "selectors", "meta", key, default=None
@@ -123,7 +156,7 @@ async def fetch_cached_data(
     except Exception as e:  # pragma: no cover
         logger.debug(f"[EVENT] jget не вдалось для {key}: {e}")
 
-    if json_cached is not None:
+    if isinstance(json_cached, dict):
         logger.debug(f"[EVENT] JSON кеш знайдено: {type(json_cached)}")
         return json_cached
 
@@ -136,7 +169,8 @@ async def fetch_cached_data(
         legacy_blob = None
     if isinstance(legacy_blob, (bytes, str)) and legacy_blob:
         try:
-            parsed = json.loads(legacy_blob)
+            parsed_any = json.loads(legacy_blob)
+            parsed = parsed_any if isinstance(parsed_any, dict) else {}
             logger.debug("[EVENT] Використано legacy blob кеш (parsed JSON)")
             # Міг бути збережений старим шляхом — перепишемо у новий JSON ключ
             try:
@@ -159,10 +193,23 @@ async def fetch_cached_data(
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
         logger.debug(f"[EVENT] Відповідь API отримано, статус: {resp.status}")
         resp.raise_for_status()
-        data = await resp.json()
-        logger.debug(f"[EVENT] Дані з API отримано: {type(data)}")
+        data_any = await resp.json()
+        logger.debug(f"[EVENT] Дані з API отримано: {type(data_any)}")
 
-        processed = process_fn(data) if process_fn else data
+        # Очікуємо словник; якщо список – обгортаємо або ігноруємо за замовчанням
+        data: dict[str, Any]
+        if isinstance(data_any, dict):
+            data = data_any
+        else:
+            # Безпечний дефолт: зберігаємо під ключем "data"
+            data = {"data": data_any}
+
+        processed_any = process_fn(data) if process_fn else data
+        processed: dict[str, Any] = (
+            processed_any
+            if isinstance(processed_any, dict)
+            else {"data": processed_any}
+        )
         logger.debug(f"[EVENT] Дані оброблено: {type(processed)}")
 
         try:
@@ -177,11 +224,11 @@ async def fetch_cached_data(
 
 async def fetch_concurrently(
     session: aiohttp.ClientSession,
-    symbols: List[str],
-    endpoint_fn,
+    symbols: list[str],
+    endpoint_fn: Callable[[aiohttp.ClientSession, str], Awaitable[float]],
     semaphore: asyncio.Semaphore,
-    progress_callback: Optional[callable] = None,  # Додаємо callback
-) -> Dict[str, float]:
+    progress_callback: Callable[[], None] | None = None,  # Додаємо callback
+) -> dict[str, float]:
     """
     Паралельний збір даних для списку символів.
     :param session: aiohttp.ClientSession
@@ -192,7 +239,7 @@ async def fetch_concurrently(
     """
     logger.debug(f"[STEP] _fetch_concurrently: symbols={symbols}")
 
-    async def _fetch_single(sym: str) -> Tuple[str, float]:
+    async def _fetch_single(sym: str) -> tuple[str, float]:
         async with semaphore:
             try:
                 logger.debug(f"[EVENT] Запит метрики для {sym}")
@@ -211,7 +258,7 @@ async def fetch_concurrently(
     tasks = [_fetch_single(sym) for sym in symbols]
     results = await asyncio.gather(*tasks)
     logger.debug(f"[EVENT] Зібрано результати: {results}")
-    return {sym: value for sym, value in results}
+    return dict(results)
 
 
 async def fetch_atr(session: aiohttp.ClientSession, symbol: str) -> float:
@@ -235,7 +282,7 @@ async def fetch_atr(session: aiohttp.ClientSession, symbol: str) -> float:
 
             closes = [float(c[4]) for c in data]
             highs = [float(h[2]) for h in data]
-            lows = [float(l[3]) for l in data]
+            lows = [float(low_row[3]) for low_row in data]
 
             tr_values = []
             for i in range(1, len(data)):
@@ -270,9 +317,16 @@ async def fetch_orderbook_depth(session: aiohttp.ClientSession, symbol: str) -> 
             data = await _fetch_json(session, url)
             logger.debug(f"[EVENT] Дані для depth: {type(data)}")
             total_value = 0.0
-            for side in ["bids", "asks"]:
-                for price, qty in data.get(side, [])[:10]:
-                    total_value += float(price) * float(qty)
+            if isinstance(data, dict):
+                for side in ["bids", "asks"]:
+                    side_list = data.get(side, [])
+                    if isinstance(side_list, list):
+                        for item in side_list[:10]:
+                            try:
+                                price, qty = item
+                                total_value += float(price) * float(qty)
+                            except Exception:
+                                continue
             logger.debug(f"[EVENT] Глибина стакану для {symbol}: {total_value}")
             return total_value
         except Exception as e:
@@ -292,7 +346,9 @@ async def fetch_open_interest(session: aiohttp.ClientSession, symbol: str) -> fl
     async with OI_SEMAPHORE:
         try:
             data = await _fetch_json(session, url)
-            value = float(data.get("openInterest", 0.0))
+            value = (
+                float(data.get("openInterest", 0.0)) if isinstance(data, dict) else 0.0
+            )
             logger.debug(f"[EVENT] Open Interest для {symbol}: {value}")
             return value
         except Exception as e:

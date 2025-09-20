@@ -3,9 +3,9 @@
 Перевіряє наскільки поточна ціна відхилилась від VWAP останніх N барів.
 """
 
-import pandas as pd
 import logging
 
+import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 

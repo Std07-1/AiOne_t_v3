@@ -10,11 +10,11 @@
 
 import logging
 from datetime import datetime
+
 from rich.console import Console
 from rich.logging import RichHandler
 
-from typing import Any, Dict, List, Optional
-from config.config import STAGE2_STATUS, ASSET_STATE
+from config.config import ASSET_STATE, STAGE2_STATUS
 
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.asset_state_manager")
@@ -29,25 +29,25 @@ class AssetStateManager:
 
     def __init__(
         self,
-        initial_assets: List[str],
-        cache_handler: Optional[Any] = None,
-        symbol_cfg: Optional[Dict[str, Any]] = None,
-    ):
-        self.state: Dict[str, Dict[str, Any]] = {}
-        self.cache: Optional[Any] = cache_handler
-        self._symbol_cfg: Dict[str, Any] = symbol_cfg or {}
+        initial_assets: list[str],
+        cache_handler: object | None = None,
+        symbol_cfg: dict[str, object] | None = None,
+    ) -> None:
+        self.state: dict[str, dict[str, object]] = {}
+        self.cache: object | None = cache_handler
+        self._symbol_cfg: dict[str, object] = symbol_cfg or {}
         for asset in initial_assets:
             self.init_asset(asset)
 
-    def set_cache_handler(self, cache_handler: Any) -> None:
+    def set_cache_handler(self, cache_handler: object) -> None:
         """Встановити обробник кешу/сховища порогів для збереження калібрування."""
         self.cache = cache_handler
 
-    def set_symbol_config(self, symbol_cfg: Dict[str, Any]) -> None:
+    def set_symbol_config(self, symbol_cfg: dict[str, object]) -> None:
         """Встановити локальну мапу конфігів порогів на символ (in-memory)."""
         self._symbol_cfg = symbol_cfg or {}
 
-    def init_asset(self, symbol: str):
+    def init_asset(self, symbol: str) -> None:
         """Ініціалізація базового стану для активу"""
         self.state[symbol] = {
             "symbol": symbol,
@@ -66,7 +66,7 @@ class AssetStateManager:
             "visible": True,
         }
 
-    def update_asset(self, symbol: str, updates: Dict[str, Any]):
+    def update_asset(self, symbol: str, updates: dict[str, object]) -> None:
         """Оновлення стану активу з мерджем існуючих даних"""
         if symbol not in self.state:
             self.init_asset(symbol)
@@ -81,7 +81,7 @@ class AssetStateManager:
             "last_updated": datetime.utcnow().isoformat(),
         }
 
-    def get_all_assets(self) -> List[Dict[str, Any]]:
+    def get_all_assets(self) -> list[dict[str, object]]:
         """Отримати всі активи для відображення в UI"""
         if not self.state:
             logger.warning("Стан активів порожній, немає даних для відображення")
@@ -89,7 +89,7 @@ class AssetStateManager:
 
         return list(self.state.values())
 
-    def get_alert_signals(self) -> List[Dict[str, Any]]:
+    def get_alert_signals(self) -> list[dict[str, object]]:
         """Отримати сигнали ALERT* (ALERT/ALERT_BUY/ALERT_SELL) для Stage2."""
         return [
             asset

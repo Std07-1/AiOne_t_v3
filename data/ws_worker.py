@@ -18,14 +18,18 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, cast
 
+import orjson
 import pandas as pd
 import websockets
+from lz4.frame import compress, decompress
 from rich.console import Console
 from rich.logging import RichHandler
-import orjson
-from lz4.frame import compress, decompress
+
+from data.unified_store import (  # unified store (single source of truth)
+    UnifiedDataStore,
+)
 
 
 # ── Вбудовані (мінімальні) серіалізатори DataFrame (видалено raw_data.py) ──
@@ -43,7 +47,10 @@ def _df_to_bytes(df: pd.DataFrame, *, compress_lz4: bool = True) -> bytes:
             "int64"
         )
     raw_json = orjson.dumps(df_out.to_dict(orient="split"))
-    return compress(raw_json) if compress_lz4 else raw_json
+    if compress_lz4:
+        return cast(bytes, compress(raw_json))
+    # raw_json is bytes from orjson.dumps
+    return raw_json
 
 
 def _bytes_to_df(buf: bytes | str, *, compressed: bool = True) -> pd.DataFrame:
@@ -58,15 +65,13 @@ def _bytes_to_df(buf: bytes | str, *, compressed: bool = True) -> pd.DataFrame:
     return df
 
 
-from data.unified_store import (
-    UnifiedDataStore,
-)  # unified store (single source of truth)
+# (moved UnifiedDataStore import to top for ruff E402 compliance)
 
 # ── Налаштування / константи ───────────────────────────────────────────────
 PARTIAL_CHANNEL = "klines.1m.partial"
 FINAL_CHANNEL = "klines.1h.update"
 # Default TTLs for legacy blob snapshot (NOT the canonical ds.cfg.intervals_ttl)
-DEFAULT_INTERVALS_TTL: Dict[str, int] = {"1m": 90, "1h": 65 * 60}
+DEFAULT_INTERVALS_TTL: dict[str, int] = {"1m": 90, "1h": 65 * 60}
 SELECTOR_REFRESH_S = 30  # how often to refresh symbol whitelist
 
 STATIC_SYMBOLS = os.getenv("STREAM_SYMBOLS", "")
@@ -94,20 +99,20 @@ class WSWorker:
 
     def __init__(
         self,
-        symbols: Optional[List[str]] = None,
+        symbols: list[str] | None = None,
         *,
         store: UnifiedDataStore,
-        selectors_key: Optional[str] = None,
-        intervals_ttl: Optional[Dict[str, int]] = None,
+        selectors_key: str | None = None,
+        intervals_ttl: dict[str, int] | None = None,
     ):
         if store is None:
             raise ValueError("WSWorker requires a UnifiedDataStore instance")
         self.store = store
-        self._symbols: Set[str] = set(
+        self._symbols: set[str] = set(
             [s.lower() for s in symbols] if symbols else DEFAULT_SYMBOLS
         )
         # optional override for selector redis key ("part1:part2:..")
-        self._selectors_key: Optional[Tuple[str, ...]] = (
+        self._selectors_key: tuple[str, ...] | None = (
             tuple(p for p in selectors_key.split(":") if p) if selectors_key else None
         )
         # TTLs for legacy blob snapshots; fall back to defaults above
@@ -116,12 +121,13 @@ class WSWorker:
             mapping.update(intervals_ttl)
         self._ttl_1m = mapping.get("1m", DEFAULT_INTERVALS_TTL["1m"])
         self._ttl_1h = mapping.get("1h", DEFAULT_INTERVALS_TTL["1h"])
-        self._ws_url: Optional[str] = None
+        self._ws_url: str | None = None
         self._backoff: int = 3
-        self._refresh_task: Optional[asyncio.Task] = None
+        self._refresh_task: asyncio.Task[Any] | None = None
+        self._hb_task: asyncio.Task[Any] | None = None
         self._stop_event = asyncio.Event()
 
-    async def _get_live_symbols(self) -> List[str]:
+    async def _get_live_symbols(self) -> list[str]:
         """Fetch whitelist symbols either via custom selectors_key or store helper.
 
         selectors_key (if provided) is a colon-delimited path inside the store namespace
@@ -141,6 +147,8 @@ class WSWorker:
             syms = list(data.keys())
         elif isinstance(data, list):
             syms = data
+        # Нормалізуємо до нижнього регістру для сумісності з Binance streams
+        syms = [s.lower() for s in syms]
         # Fallback якщо порожній
         if not syms:
             logger.warning(
@@ -161,11 +169,11 @@ class WSWorker:
         logger.debug("[WSWorker] Символи для стріму: %d (%s...)", len(syms), syms[:10])
         return syms
 
-    def _build_ws_url(self, symbols: Set[str]) -> str:
+    def _build_ws_url(self, symbols: set[str]) -> str:
         streams = "/".join(f"{s}@kline_1m" for s in sorted(symbols))
         return f"wss://fstream.binance.com/stream?streams={streams}"
 
-    async def _store_minute(self, sym: str, ts: int, k: Dict[str, Any]) -> pd.DataFrame:
+    async def _store_minute(self, sym: str, ts: int, k: dict[str, Any]) -> pd.DataFrame:
         """Incrementally update 1m history snapshot blob (legacy format) for quick replay.
 
         This keeps backward compatibility for any code still reading the old serialized
@@ -180,13 +188,11 @@ class WSWorker:
         else:
             df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         dt = pd.to_datetime(ts, unit="ms", utc=True)
-        df.loc[dt] = [
-            float(k["o"]),
-            float(k["h"]),
-            float(k["l"]),
-            float(k["c"]),
-            float(k["v"]),
-        ]
+        df.at[dt, "open"] = float(k["o"])  # set by label to avoid dtype issues
+        df.at[dt, "high"] = float(k["h"])
+        df.at[dt, "low"] = float(k["l"])
+        df.at[dt, "close"] = float(k["c"])
+        df.at[dt, "volume"] = float(k["v"])
         await self.store.store_in_cache(
             sym, "1m", _df_to_bytes(df), ttl=self._ttl_1m, prefix="candles", raw=True
         )
@@ -213,7 +219,7 @@ class WSWorker:
         await self.store.redis.r.publish(FINAL_CHANNEL, sym)
         logger.debug("[%s] 1h closed → published %s", sym, FINAL_CHANNEL)
 
-    async def _handle_kline(self, k: Dict[str, Any]) -> None:
+    async def _handle_kline(self, k: dict[str, Any]) -> None:
         """
         Обробка WS kline:
         - зберігає 1m в RAMBuffer (оновлення bar по timestamp, без дублювання),
@@ -250,10 +256,10 @@ class WSWorker:
             logger.warning("Failed to put bars into UnifiedDataStore: %s", e)
         # Лічильник отриманих повідомлень WS
         try:
-            self.store.metrics.errors.labels(stage="ws_msg").inc()  # type: ignore
+            self.store.metrics.errors.labels(stage="ws_msg").inc()
         except Exception:
             try:
-                self.store.metrics.errors.inc()  # type: ignore
+                self.store.metrics.errors.inc()
             except Exception:
                 pass
 
@@ -262,8 +268,47 @@ class WSWorker:
         await self.store.redis.r.publish(PARTIAL_CHANNEL, sym)
         if k.get("x"):
             await self._on_final_candle(sym, df_1m)
+            # Transcript recorder: лог бару при закритті хвилини (якщо увімкнено)
+            try:
+                tr = getattr(self.store, "transcript", None)
+                if tr is not None:
+                    # Діагностика: чи проходить фільтр allowed_symbols
+                    try:
+                        cfg = getattr(tr, "cfg", None)
+                        allowed_set = getattr(cfg, "allowed_symbols", None)
+                        allowed = (allowed_set is None) or (sym in allowed_set)
+                        tr.log_meta(event="bar_seen", symbol=sym, allowed=allowed)
+                    except Exception:
+                        pass
+                    tr.log_bar(
+                        symbol=sym,
+                        interval=tf,
+                        ts_ms=ts,
+                        open=bar["open"],
+                        high=bar["high"],
+                        low=bar["low"],
+                        close=bar["close"],
+                        volume=bar["volume"],
+                        source="ws",
+                        closed=True,
+                    )
+            except Exception:
+                pass
+            # Опціональний reactive Stage1 hook: викликати монітор одразу після закриття бару
+            try:
+                import os
 
-    async def _refresh_symbols(self, ws: websockets.WebSocketClientProtocol) -> None:
+                reactive = os.getenv("REACTIVE_STAGE1", "0") in ("1", "true", "True")
+                monitor = getattr(self.store, "stage1_monitor", None)
+                if reactive and monitor is not None:
+                    # не блокуємо WS – запускаємо як окрему задачу
+                    import asyncio as _asyncio
+
+                    _asyncio.create_task(self._reactive_stage1_call(monitor, sym, bar))
+            except Exception:  # pragma: no cover
+                pass
+
+    async def _refresh_symbols(self, ws: Any) -> None:
         """Фоновий таск: refresh whitelist і ресабскрайб."""
         while not self._stop_event.is_set():
             await asyncio.sleep(SELECTOR_REFRESH_S)
@@ -274,9 +319,7 @@ class WSWorker:
             except Exception as e:
                 logger.warning("Refresh symbols error: %s", e)
 
-    async def _resubscribe(
-        self, ws: websockets.WebSocketClientProtocol, new_syms: Set[str]
-    ) -> None:
+    async def _resubscribe(self, ws: Any, new_syms: set[str]) -> None:
         """UNSUBSCRIBE/SUBSCRIBE WS-канали без reconnect."""
         old_syms = self._symbols
         to_unsub = [f"{s}@kline_1m" for s in old_syms - new_syms]
@@ -317,11 +360,41 @@ class WSWorker:
                     len(self._symbols),
                     list(self._symbols)[:5],
                 )
+                # Діагностика: запишемо у стенограму початок WS та перші символи
+                try:
+                    tr = getattr(self.store, "transcript", None)
+                    if tr is not None:
+                        tr.log_meta(
+                            event="ws_connect",
+                            total=len(self._symbols),
+                            symbols=list(self._symbols)[:10],
+                        )
+                except Exception:
+                    pass
                 async with websockets.connect(self._ws_url, ping_interval=20) as ws:
                     logger.debug("WS connected (%d streams)…", len(self._symbols))
                     self._backoff = 3
                     self._stop_event.clear()
                     self._refresh_task = asyncio.create_task(self._refresh_symbols(ws))
+                    # Heartbeat meta: підтверджує живість стріму навіть без повідомлень
+                    try:
+                        _tr = getattr(self.store, "transcript", None)
+                        if _tr is not None:
+
+                            async def _hb(tr_local=_tr) -> None:
+                                while True:
+                                    try:
+                                        tr_local.log_meta(
+                                            event="ws_heartbeat",
+                                            total=len(self._symbols),
+                                        )
+                                    except Exception:
+                                        pass
+                                    await asyncio.sleep(30)
+
+                            self._hb_task = asyncio.create_task(_hb())
+                    except Exception:
+                        pass
                     async for msg in ws:
                         try:
                             data = json.loads(msg).get("data", {}).get("k")
@@ -329,21 +402,31 @@ class WSWorker:
                                 await self._handle_kline(data)
                         except Exception as e:
                             try:
-                                msg_for_log = msg
                                 if isinstance(msg, dict):
-                                    msg_for_log = json.dumps(msg, default=str)[:80]
+                                    _ = json.dumps(msg, default=str)[:80]
                                 logger.debug(
                                     "Bad WS message: %s… (%s)", str(msg)[:200], e
                                 )
-                            except Exception as e2:
+                            except Exception:
                                 logger.debug("Bad WS message: <unserializable> (%s)", e)
             except Exception as exc:
                 logger.warning("WS error: %s → reconnect in %ds", exc, self._backoff)
+                # Запишемо помилку у стенограму для діагностики
+                try:
+                    tr = getattr(self.store, "transcript", None)
+                    if tr is not None:
+                        tr.log_meta(
+                            event="ws_error", error=str(exc), backoff=self._backoff
+                        )
+                except Exception:
+                    pass
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * 2, 30)
             finally:
                 if self._refresh_task:
                     self._refresh_task.cancel()
+                if self._hb_task:
+                    self._hb_task.cancel()
 
     async def stop(self) -> None:
         """Зупиняє воркер і всі фонові таски."""
@@ -351,11 +434,68 @@ class WSWorker:
         if self._refresh_task:
             self._refresh_task.cancel()
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Сумісність із тестами: _reactive_stage1_call(mon, symbol, payload)
+    # Якщо у монітора є update_and_check → використовуємо його, інакше process_new_bar
+    async def _reactive_stage1_call(
+        self, monitor: Any, symbol: str, payload: Any
+    ) -> None:
+        # Якщо немає payload — одразу process_new_bar
+        if payload is None:
+            try:
+                maybe2 = monitor.process_new_bar(symbol)
+                await maybe2 if asyncio.iscoroutine(maybe2) else None  # type: ignore[misc]
+            except Exception:
+                pass
+            return
+        # Інакше — спробувати update_and_check, якщо є
+        try:
+            fn = getattr(monitor, "update_and_check", None)
+            if callable(fn):
+                maybe = fn(symbol, payload)
+                await maybe if asyncio.iscoroutine(maybe) else None  # type: ignore[misc]
+                return
+        except Exception:
+            pass
+        # Fallback
+        try:
+            maybe2 = monitor.process_new_bar(symbol)
+            await maybe2 if asyncio.iscoroutine(maybe2) else None  # type: ignore[misc]
+        except Exception:
+            pass
+
 
 # ──────────────── Запуск модуля ────────────────
 
 if __name__ == "__main__":
-    worker = WSWorker()
+    # Minimal bootstrap for manual run: create Redis-less store if available
+    try:
+        from redis.asyncio import Redis as _Redis
+
+        from data.unified_store import StoreConfig, StoreProfile, UnifiedDataStore
+
+        # default ephemeral config
+        _redis = _Redis(
+            host=os.getenv("REDIS_HOST", "localhost"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+        )
+        _cfg = StoreConfig(
+            namespace=os.getenv("AI_ONE_NS", "ai_one"),
+            base_dir=os.getcwd(),
+            profile=StoreProfile(),
+            intervals_ttl={"1m": 90, "1h": 65 * 60},
+            write_behind=False,
+            validate_on_read=False,
+            validate_on_write=False,
+            io_retry_attempts=2,
+            io_retry_backoff=0.5,
+        )
+        _store = UnifiedDataStore(redis=_redis, cfg=_cfg)
+    except Exception as _e:  # pragma: no cover
+        logger.error("Failed to init UnifiedDataStore: %s", _e)
+        raise
+
+    worker = WSWorker(store=_store)
     try:
         asyncio.run(worker.consume())
     except KeyboardInterrupt:

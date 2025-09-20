@@ -14,44 +14,46 @@ import asyncio
 import logging
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, cast
 
 # ───────────── Third-party ─────────────
 from rich.console import Console
 from rich.logging import RichHandler
 
-# ───────────── Внутрішні модулі ─────────────
-
+from app.utils.helper import (
+    estimate_atr_pct,
+    resample_5m,
+    store_to_dataframe,
+)
 from config.config import (
+    ASSET_STATE,
     DEFAULT_LOOKBACK,
     DEFAULT_TIMEFRAME,
-    MIN_READY_PCT,
     MAX_PARALLEL_STAGE2,
-    TRADE_REFRESH_INTERVAL,
+    MIN_READY_PCT,
     STAGE2_STATUS,
-    ASSET_STATE,
+    TRADE_REFRESH_INTERVAL,
 )
 from stage1.asset_monitoring import AssetMonitorStage1
-from stage3.trade_manager import TradeLifecycleManager
-from UI.publish_full_state import publish_full_state
-from utils.utils import (
-    ensure_timestamp_column,
-    map_reco_to_signal,
-    first_not_none,
-    normalize_tp_sl,
-    normalize_result_types,
-    create_no_data_signal,
-    create_error_signal,
-)
-from stage2.processor import Stage2Processor
 from stage2.level_manager import LevelManager
-from app.utils.helper import (
-    store_to_dataframe,
-    resample_5m,
-    estimate_atr_pct,
+from stage2.processor import Stage2Processor
+from stage3.trade_manager import TradeLifecycleManager
+from UI.publish_full_state import RedisLike, publish_full_state
+from utils.utils import (
+    create_error_signal,
+    create_no_data_signal,
+    ensure_timestamp_column,
+    first_not_none,
+    get_tick_size,
+    map_reco_to_signal,
+    normalize_result_types,
+    normalize_tp_sl,
 )
-from utils.utils import get_tick_size
+
 from .asset_state_manager import AssetStateManager
+
+# ───────────── Внутрішні модулі ─────────────
+
 
 if TYPE_CHECKING:  # pragma: no cover - only for type hints
     from data.unified_store import UnifiedDataStore
@@ -65,13 +67,13 @@ if not logger.handlers:
 
 
 async def process_asset_batch(
-    symbols: list,
+    symbols: list[str],
     monitor: AssetMonitorStage1,
     store: "UnifiedDataStore",
     timeframe: str,
     lookback: int,
     state_manager: AssetStateManager,
-):
+) -> None:
     """Обробляє батч символів через UnifiedDataStore.
 
     Очікується: store.get_df(symbol, interval, limit=lookback) -> DataFrame з open_time.
@@ -99,7 +101,7 @@ _normalize_tp_sl = normalize_tp_sl
 
 
 async def process_single_stage2(
-    signal: Dict[str, Any],
+    signal: dict[str, Any],
     processor: "Stage2Processor",
     state_manager: "AssetStateManager",
 ) -> None:
@@ -111,9 +113,9 @@ async def process_single_stage2(
         )
 
         # Stage2 (QDE_core під капотом)
-        result: Dict[str, Any] = await processor.process(signal)
+        result: dict[str, Any] = await processor.process(signal)
 
-        update: Dict[str, Any] = {
+        update: dict[str, Any] = {
             "stage2": True,
             "stage2_status": STAGE2_STATUS["COMPLETED"],
             "last_updated": datetime.utcnow().isoformat(),
@@ -148,7 +150,7 @@ async def process_single_stage2(
         composite_conf = conf.get("composite_confidence", 0.0)
 
         raw_narr = (result.get("narrative") or "").strip()
-        hints: List[str] = []
+        hints: list[str] = []
         if raw_narr:
             hints.append(raw_narr)
             try:
@@ -157,9 +159,14 @@ async def process_single_stage2(
                 logger.debug("[NARR] %s (logging failed)", symbol)
 
         anomaly_det = result.get("anomaly_detection")
-        trigger_reasons = result.get("trigger_reasons") or market_ctx.get(
-            "trigger_reasons"
+        # Об'єднуємо джерела причин: основний результат + market_context
+        tr_from_result = result.get("trigger_reasons") or []
+        tr_from_ctx = (
+            market_ctx.get("trigger_reasons") if isinstance(market_ctx, dict) else []
         )
+        if not isinstance(tr_from_ctx, list):
+            tr_from_ctx = []
+        trigger_reasons_raw = list(tr_from_result) + list(tr_from_ctx)
 
         update["signal"] = signal_type
         update["recommendation"] = recommendation or None
@@ -186,12 +193,15 @@ async def process_single_stage2(
         update["confidence_metrics"] = conf or None
         update["anomaly_detection"] = anomaly_det or None
         existing = state_manager.state.get(symbol, {}).get("trigger_reasons") or []
-        extra_triggers: List[str] = []
+        extra_triggers: list[str] = []
         if trigger_add:
             extra_triggers.append(trigger_add)
-        merged_triggers = list(
-            dict.fromkeys(list(existing) + list(trigger_reasons or []) + extra_triggers)
+        # Обережно приводимо типи до list[str]
+        existing_list: list[str] = list(cast(list[str], existing))
+        tr_list: list[str] = (
+            list(cast(list[str], trigger_reasons_raw)) if trigger_reasons_raw else []
         )
+        merged_triggers = list(dict.fromkeys(existing_list + tr_list + extra_triggers))
         if signal_type.startswith("ALERT") and not merged_triggers:
             merged_triggers = ["signal_generated"]
         update["trigger_reasons"] = merged_triggers
@@ -216,7 +226,7 @@ async def process_single_stage2(
 
 
 async def process_single_stage2_with_semaphore(
-    signal: Dict[str, Any],
+    signal: dict[str, Any],
     processor: "Stage2Processor",
     semaphore: asyncio.Semaphore,
     state_manager: "AssetStateManager",
@@ -229,24 +239,31 @@ async def screening_producer(
     monitor: AssetMonitorStage1,
     store: "UnifiedDataStore",
     store_fast_symbols: "UnifiedDataStore",
-    assets: List[str],
-    redis_conn: Any,
-    trade_manager: Optional[TradeLifecycleManager] = None,
+    assets: list[str],
+    redis_conn: RedisLike,
+    trade_manager: TradeLifecycleManager | None = None,
     reference_symbol: str = "BTCUSDT",
     timeframe: str = DEFAULT_TIMEFRAME,
     lookback: int = DEFAULT_LOOKBACK,
     interval_sec: int = TRADE_REFRESH_INTERVAL,
     min_ready_pct: float = MIN_READY_PCT,
-    state_manager: AssetStateManager = None,
-    level_manager: LevelManager = None,
+    state_manager: AssetStateManager | None = None,
+    level_manager: LevelManager | None = None,
     user_lang: str = "UA",
     user_style: str = "explain",
 ) -> None:
     logger.info(
-        f"🚀 Старт screening_producer: {len(assets)} активів, таймфрейм {timeframe}, глибина {lookback}, оновлення кожні {interval_sec} сек"
+        (
+            "🚀 Старт screening_producer: %d активів, таймфрейм %s, глибина %d, "
+            "оновлення кожні %d сек"
+        ),
+        len(assets),
+        timeframe,
+        lookback,
+        interval_sec,
     )
-    _last_levels_update_ts: Dict[str, int] = {}
-    LEVELS_UPDATE_EVERY = 25
+    _last_levels_update_ts: dict[str, int] = {}
+    levels_update_every = 25
     if state_manager is None:
         assets_current = [s.lower() for s in (assets or [])]
         state_manager = AssetStateManager(assets_current)
@@ -284,7 +301,10 @@ async def screening_producer(
                     state_manager.state.pop(symbol, None)
                 if added or removed:
                     logger.info(
-                        f"🔄 Оновлено список активів: +{len(added)}/-{len(removed)} (загалом: {len(assets_current)})"
+                        "🔄 Оновлено список активів: +%d/-%d (загалом: %d)",
+                        len(added),
+                        len(removed),
+                        len(assets_current),
                     )
             else:
                 logger.debug(
@@ -293,7 +313,7 @@ async def screening_producer(
                 )
         except Exception as e:
             logger.error(f"Помилка оновлення активів: {str(e)}")
-        ready_assets: List[str] = []
+        ready_assets: list[str] = []
         ref_ready = False
         for symbol in assets_current:
             try:
@@ -315,9 +335,13 @@ async def screening_producer(
         min_ready = max(1, int(len(assets_current) * min_ready_pct))
         if ready_count < min_ready:
             logger.warning(
-                f"⏳ Недостатньо даних: {ready_count}/{min_ready} активів готові. Очікування {interval_sec} сек..."
+                "⏳ Недостатньо даних: %d/%d активів готові. Очікування %d сек...",
+                ready_count,
+                min_ready,
+                interval_sec,
             )
             await asyncio.sleep(interval_sec)
+            # Переходимо до наступної ітерації while True
             continue
         logger.info(
             f"📊 Дані готові для {ready_count}/{len(assets_current)} активів"
@@ -326,7 +350,7 @@ async def screening_producer(
         now_ts = int(time.time())
         for symbol in ready_assets:
             last_ts = _last_levels_update_ts.get(symbol, 0)
-            if (now_ts - last_ts) < LEVELS_UPDATE_EVERY:
+            if (now_ts - last_ts) < levels_update_every:
                 continue
             df_1m = await store_to_dataframe(store, symbol, limit=500)
             if df_1m is None or df_1m.empty:
@@ -335,12 +359,13 @@ async def screening_producer(
             atr_pct = estimate_atr_pct(df_1m)
             price_hint = float(df_1m["close"].iloc[-1])
             tick_size = get_tick_size(symbol, price_hint=price_hint)
-            level_manager.update_meta(symbol, atr_pct=atr_pct, tick_size=tick_size)
-            level_manager.update_from_bars(symbol, df_1m=df_1m, df_5m=df_5m)
+            if level_manager is not None:
+                level_manager.update_meta(symbol, atr_pct=atr_pct, tick_size=tick_size)
+                level_manager.update_from_bars(symbol, df_1m=df_1m, df_5m=df_5m)
             _last_levels_update_ts[symbol] = now_ts
         try:
             batch_size = 20
-            tasks: List[asyncio.Task] = []
+            tasks: list[asyncio.Task[Any]] = []
             for i in range(0, len(ready_assets), batch_size):
                 batch = ready_assets[i : i + batch_size]
                 tasks.append(

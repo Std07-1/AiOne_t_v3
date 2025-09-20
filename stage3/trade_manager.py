@@ -1,18 +1,29 @@
 """Stage3 TradeLifecycleManager.
 
-Управління життєвим циклом угод: відкриття, оновлення за правилами,
-trail, дострокові виходи, контекстні адаптації. Уніфікований стиль:
-короткі секційні хедери, guard для логера, коментарі до broad except.
+Управління життєвим циклом угод:
+    • відкриття та оновлення за правилами;
+    • trailing (trail);
+    • дострокові виходи;
+    • контекстні адаптації.
+
+Стиль:
+    • короткі секційні хедери;
+    • guard для логера;
+    • коментарі до broad except.
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import json
+import logging
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Any, Protocol
+
+import pandas as pd
+
 from utils.utils import safe_float
 
 # ── Logger ───────────────────────────────────────────────────────────────────
@@ -20,16 +31,34 @@ logger = logging.getLogger("stage3.trade_manager")
 if not logger.handlers:  # guard від дублювання
     logger.setLevel(logging.DEBUG)
     try:
-        from rich.console import Console  # type: ignore
-        from rich.logging import RichHandler  # type: ignore
+        from rich.console import Console
+        from rich.logging import RichHandler
 
         logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
     except Exception:  # broad except: rich опціональний
         logger.addHandler(logging.StreamHandler())
     logger.propagate = False
 
+
+# ── Локальні хелпери ────────────────────────────────────────────────────────
+def as_float(value: object, default: float = 0.0) -> float:
+    """Приводить значення до float через safe_float, підставляє default, якщо None.
+
+    Args:
+        value: Вхідне значення (будь-що, що може бути float).
+        default: Значення за замовчуванням, якщо конвертація неможлива.
+
+    Returns:
+        float: Коректний float (або default).
+    """
+    v = safe_float(value)
+    if v is None:
+        return default
+    return v
+
+
 # ───── Статуси угод ─────
-TRADE_STATUS: Dict[str, str] = {
+TRADE_STATUS: dict[str, str] = {
     "OPEN": "open",
     "CLOSED_TP": "closed_tp",
     "CLOSED_SL": "closed_sl",
@@ -69,39 +98,39 @@ class Trade:
         predicted_profit: Прогнозований профіт (%) на момент відкриття.
     """
 
-    def __init__(self, signal: Dict[str, Any], strategy: str = "default") -> None:
+    def __init__(self, signal: dict[str, Any], strategy: str = "default") -> None:
         # Унікальний ідентифікатор угоди
         self.id: str = f"{signal.get('symbol','?')}_{uuid.uuid4().hex}"
         # Основні атрибути
         self.symbol: str = signal.get("symbol", "")
-        self.entry_price: float = safe_float(
-            signal.get("current_price"), name="current_price"
-        )
-        self.tp: float = safe_float(signal.get("tp"), name="tp")
-        self.sl: float = safe_float(signal.get("sl"), name="sl")
+        self.entry_price: float = as_float(signal.get("current_price"), 0.0)
+        self.tp: float = as_float(signal.get("tp"), 0.0)
+        self.sl: float = as_float(signal.get("sl"), 0.0)
         self.strategy: str = strategy
-        self.confidence: float = safe_float(
-            signal.get("confidence", 0.0), name="confidence"
-        )
+        self.confidence: float = as_float(signal.get("confidence", 0.0), 0.0)
         # Кластерні фактори, знайдені патерни та підтвердження контексту
-        self.cluster_factors: List[str] = signal.get("cluster_factors", [])
-        self.patterns: List[str] = signal.get("patterns", [])
-        self.context_confirmations: List[str] = signal.get("context_confirmations", [])
+        self.cluster_factors: list[str] = signal.get("cluster_factors", [])
+        self.patterns: list[str] = signal.get("patterns", [])
+        self.context_confirmations: list[str] = signal.get("context_confirmations", [])
         # Статус та часові мітки
         self.status: str = TRADE_STATUS["OPEN"]
         self.open_time: str = utc_now()
-        self.close_time: Optional[str] = None
-        self.exit_reason: Optional[str] = None
+        self.close_time: str | None = None
+        self.exit_reason: str | None = None
+        # Контекст, що може оновлювати EnhancedContextAwareTradeManager
+        self.context: dict[str, Any] = {}
         # Ціни та індикатори
         self.current_price: float = self.entry_price
-        self.close_price: Optional[float] = None
-        self.indicators: Dict[str, float] = {
-            "atr": safe_float(signal.get("atr"), name="atr"),
-            "rsi": safe_float(signal.get("rsi"), name="rsi"),
-            "volume": safe_float(signal.get("volume"), name="volume"),
+        self.close_price: float | None = None
+        self.indicators: dict[str, float] = {
+            "atr": as_float(signal.get("atr"), 0.0),
+            "rsi": as_float(signal.get("rsi"), 0.0),
+            "volume": as_float(signal.get("volume"), 0.0),
         }
         # Прогнозований прибуток (%) на момент відкриття
-        if self.tp >= self.entry_price:
+        if self.entry_price == 0:
+            self.predicted_profit = 0.0
+        elif self.tp >= self.entry_price:
             self.predicted_profit = (
                 (self.tp - self.entry_price) / self.entry_price * 100
             )
@@ -111,10 +140,10 @@ class Trade:
             )
 
         # Фінальний P&L (%) — спочатку None, встановиться при закритті
-        self.result: Optional[float] = None
+        self.result: float | None = None
 
         # Історія подій (open, update, trailing_stop тощо)
-        self.updates: List[Dict[str, Any]] = []
+        self.updates: list[dict[str, Any]] = []
         self._log_event("open", self._snapshot())
         logger.info(
             "🔔 Відкрито угоду %s: factors=%s patterns=%s conf=%.2f TP=%.4f SL=%.4f",
@@ -126,7 +155,7 @@ class Trade:
             self.sl,
         )
 
-    def _snapshot(self) -> Dict[str, Any]:
+    def _snapshot(self) -> dict[str, Any]:
         """Поточний зріз стану угоди (для логування)."""
         return {
             "symbol": self.symbol,
@@ -151,18 +180,20 @@ class Trade:
     @property
     def max_profit(self) -> float:
         """Максимальний профіт (%) від відкриття до теперішньої ціни."""
+        if self.entry_price == 0:
+            return 0.0
         if self.side == "buy":
             return (self.current_price - self.entry_price) / self.entry_price * 100
         return (self.entry_price - self.current_price) / self.entry_price * 100
 
-    def _log_event(self, event: str, data: Dict[str, Any]) -> None:
+    def _log_event(self, event: str, data: dict[str, Any]) -> None:
         """Додає запис в історію подій, фіксує поточний SL/TP."""
         data["sl"] = self.sl  # Фіксуємо поточний SL
         data["tp"] = self.tp  # Фіксуємо поточний TP
         record = {"event": event, "timestamp": utc_now(), **data}
         self.updates.append(record)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Повертає повне представлення угоди для запису в лог."""
         base = self._snapshot()
         base.update(
@@ -185,14 +216,14 @@ class Trade:
 class TradeRule:
     """Інтерфейс правила для оновлення угоди."""
 
-    async def __call__(self, trade: Trade, market: Dict[str, Any]) -> None:
+    async def __call__(self, trade: Trade, market: dict[str, Any]) -> None:
         raise NotImplementedError
 
 
 class ContextExitRule(TradeRule):
     """Правило закриття при зміні ринкового контексту."""
 
-    async def __call__(self, trade: Trade, market: Dict[str, Any]) -> None:
+    async def __call__(self, trade: Trade, market: dict[str, Any]) -> None:
         # Якщо market містить прапорець контр-тренду → закрити
         if market.get("context_break", False):
             trade.status = TRADE_STATUS["CLOSED_BY_SIGNAL"]
@@ -227,13 +258,13 @@ class TrailingStopRule(TradeRule):
         self.logger = logging.getLogger(f"{__name__}.TrailingStopRule")
         logger.setLevel(logging.DEBUG)
 
-    async def __call__(self, trade: Trade, market: Dict[str, Any]) -> None:
+    async def __call__(self, trade: Trade, market: dict[str, Any]) -> None:
         # Ігноруємо неактивні угоди
         if trade.status != TRADE_STATUS["OPEN"]:
             return
 
         # Забираємо дані
-        price = safe_float(market.get("price"), name="price")
+        price = as_float(market.get("price"), 0.0)
         atr = trade.indicators.get("atr", 0.0)
         if atr <= 0:
             return
@@ -279,9 +310,9 @@ class TrailingStopRule(TradeRule):
 class EarlyExitRule(TradeRule):
     """Правило дострокового закриття за зворотною зміною обсягу/RSI."""
 
-    async def __call__(self, trade: Trade, market: Dict[str, Any]) -> None:
-        vol = safe_float(market.get("volume"), name="volume")
-        rsi = safe_float(market.get("rsi"), name="rsi")
+    async def __call__(self, trade: Trade, market: dict[str, Any]) -> None:
+        vol = as_float(market.get("volume"), 0.0)
+        rsi = as_float(market.get("rsi"), 0.0)
         if trade.side == "buy" and vol < trade.indicators["volume"] * 0.7 and rsi < 50:
             trade.status = TRADE_STATUS["CLOSED_BY_SIGNAL"]
             trade.exit_reason = "early_exit"
@@ -310,15 +341,15 @@ class TradeLifecycleManager:
         reopen_cooldown: float = 60.0,  # секунди
         max_parallel_trades: int = 3,  # максимальна кількість одночасних угод
     ) -> None:
-        self.active_trades: Dict[str, Trade] = {}
-        self.closed_trades: List[Dict[str, Any]] = []
+        self.active_trades: dict[str, Trade] = {}
+        self.closed_trades: list[dict[str, Any]] = []
         self.reopen_cooldown = reopen_cooldown
         self.max_parallel_trades = max_parallel_trades
-        self.recently_closed: Dict[str, str] = {}  # symbol → ISO close_time
+        self.recently_closed: dict[str, str] = {}  # symbol → ISO close_time
         self.log_file = log_file
         self.summary_file = summary_file
         # Оновлені правила включають контекстний вихід
-        self.rules: List[TradeRule] = [
+        self.rules: list[TradeRule] = [
             ContextExitRule(),
             TrailingStopRule(),
             EarlyExitRule(),
@@ -326,8 +357,8 @@ class TradeLifecycleManager:
         self.lock = asyncio.Lock()
 
     async def open_trade(
-        self, signal: Dict[str, Any], strategy: str = "default"
-    ) -> Optional[str]:
+        self, signal: dict[str, Any], strategy: str = "default"
+    ) -> str | None:
         """
         Відкриває угоду, якщо для символа нема open-угоди
         і якщо не в cooldown після останнього закриття.
@@ -386,7 +417,7 @@ class TradeLifecycleManager:
 
             return trade.id
 
-    async def update_trade(self, trade_id: str, market: Dict[str, Any]) -> bool:
+    async def update_trade(self, trade_id: str, market: dict[str, Any]) -> bool:
         """
         Оновлює стан угоди: індикатори, правила, TP/SL, timeout.
 
@@ -402,7 +433,7 @@ class TradeLifecycleManager:
                 )
                 return False
 
-            tr.current_price = safe_float(market.get("price"), name="price")
+            tr.current_price = as_float(market.get("price"), 0.0)
             logger.debug(
                 "UPDATE ► %s: нова поточна ціна = %.6f",
                 trade_id,
@@ -525,11 +556,13 @@ class TradeLifecycleManager:
     @staticmethod
     def calculate_profit(tr: Trade, price: float) -> float:
         """Profit (%) для buy/sell."""
+        if tr.entry_price == 0:
+            return 0.0
         if tr.side == "buy":
             return (price - tr.entry_price) / tr.entry_price * 100
         return (tr.entry_price - price) / tr.entry_price * 100
 
-    def _make_summary(self, tr: Trade) -> Dict[str, Any]:
+    def _make_summary(self, tr: Trade) -> dict[str, Any]:
         """
         Формує підсумковий запис для summary_log.jsonl
         """
@@ -548,7 +581,7 @@ class TradeLifecycleManager:
             "events_count": len(tr.updates),
         }
 
-    async def _persist(self, file_path: str, data: Dict[str, Any]) -> None:
+    async def _persist(self, file_path: str, data: dict[str, Any]) -> None:
         """Асинхронно записує JSONL у вказаний файл."""
         loop = asyncio.get_event_loop()
         line = json.dumps(data, ensure_ascii=False) + "\n"
@@ -558,26 +591,48 @@ class TradeLifecycleManager:
         with open(file_path, "a", encoding="utf-8") as f:
             f.write(line)
 
-    async def get_active_trades(self) -> List[Dict[str, Any]]:
+    async def get_active_trades(self) -> list[dict[str, Any]]:
         """Повертає копію активних угод."""
         async with self.lock:
             return [tr.to_dict() for tr in self.active_trades.values()]
 
-    async def get_closed_trades(self) -> List[Dict[str, Any]]:
+    async def get_closed_trades(self) -> list[dict[str, Any]]:
         """Повертає копію закритих угод."""
         async with self.lock:
             return list(self.closed_trades)
 
 
 class EnhancedContextAwareTradeManager(TradeLifecycleManager):
-    def __init__(self, context_engine, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.context_engine = context_engine
+    class _ContextEngineProto(Protocol):
+        async def evaluate_context(self, symbol: str) -> dict[str, Any]: ...
+
+        def get_last_bar(self, symbol: str) -> dict[str, object]: ...
+
+        def load_data(self, symbol: str, interval: str = ...) -> object: ...
+
+    def __init__(
+        self,
+        context_engine: _ContextEngineProto,
+        *,
+        log_file: str = "trade_log.jsonl",
+        summary_file: str = "summary_log.jsonl",
+        reopen_cooldown: float = 60.0,
+        max_parallel_trades: int = 3,
+    ) -> None:
+        super().__init__(
+            log_file=log_file,
+            summary_file=summary_file,
+            reopen_cooldown=reopen_cooldown,
+            max_parallel_trades=max_parallel_trades,
+        )
+        self.context_engine: EnhancedContextAwareTradeManager._ContextEngineProto = (
+            context_engine
+        )
         # Додаткові параметри для керування чутливістю
         self.volatility_threshold = 0.005
         self.phase_change_threshold = 0.5
 
-    async def manage_active_trades(self):
+    async def manage_active_trades(self) -> None:
         """Періодична перевірка активних угод з урахуванням контексту"""
         while True:
             for trade_id in list(self.active_trades.keys()):
@@ -604,7 +659,9 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
 
             await asyncio.sleep(60)
 
-    def has_context_changed_significantly(self, trade, new_context: dict) -> bool:
+    def has_context_changed_significantly(
+        self, trade: Trade, new_context: dict[str, Any]
+    ) -> bool:
         """Визначає чи зміна контексту вимагає закриття угоди"""
         old_context = getattr(trade, "context", {})
         old_phase = old_context.get("market_phase", "")
@@ -631,7 +688,7 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
             # Розрахунок середньої зміни рівнів
             avg_change = sum(
                 abs(new - old)
-                for new, old in zip(sorted(new_levels), sorted(old_levels))
+                for new, old in zip(sorted(new_levels), sorted(old_levels), strict=True)
             ) / len(old_levels)
 
             if avg_change / trade.entry_price > 0.03:
@@ -645,7 +702,7 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
 
         return False
 
-    def adapt_trade_parameters(self, trade, context: dict):
+    def adapt_trade_parameters(self, trade: Trade, context: dict[str, Any]) -> None:
         """Адаптація параметрів угоди до нового контексту"""
         new_volatility = context["volatility"]
         old_context = getattr(trade, "context", {})
@@ -707,41 +764,54 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
                 },
             )
 
-    def get_market_data(self, symbol: str) -> dict:
+    def get_market_data(self, symbol: str) -> dict[str, float]:
         """Покращене отримання ринкових даних з реального контексту/буфера/біржі"""
         # Спробуємо отримати останній бар з context_engine (якщо є метод)
         try:
-            # Припускаємо, що context_engine має метод get_last_bar або load_data
             if hasattr(self.context_engine, "get_last_bar"):
-                bar = self.context_engine.get_last_bar(symbol)
+                raw = self.context_engine.get_last_bar(symbol)
+                bar: Mapping[str, object] = raw  # очікуємо мапу із числовими значеннями
+                price = as_float(bar.get("close", 0.0), 0.0)
+                volume = as_float(bar.get("volume", 0.0), 0.0)
+                rsi = as_float(bar.get("rsi", 0.0), 0.0)
+                ask = as_float(bar.get("ask", 0.0), 0.0)
+                bid = as_float(bar.get("bid", 0.0), 0.0)
+                spread = abs(ask - bid) if (ask and bid) else 0.0
+                return {
+                    "price": price,
+                    "volume": volume,
+                    "rsi": rsi,
+                    "bid_ask_spread": spread,
+                }
             else:
-                # Fallback: load_data повертає DataFrame
-                df = asyncio.get_event_loop().run_until_complete(
-                    self.context_engine.load_data(symbol, "1m")
-                )
-                bar = df.iloc[-1] if not df.empty else {}
+                df_obj = self.context_engine.load_data(symbol, "1m")
+                if isinstance(df_obj, pd.DataFrame) and not df_obj.empty:
+                    row = df_obj.iloc[-1]
+                    price = float(row.get("close", 0.0))
+                    volume = float(row.get("volume", 0.0))
+                    rsi = float(row.get("rsi", 0.0))
+                    ask = float(row.get("ask", 0.0)) if "ask" in row else 0.0
+                    bid = float(row.get("bid", 0.0)) if "bid" in row else 0.0
+                    spread = abs(ask - bid) if (ask and bid) else 0.0
+                    return {
+                        "price": price,
+                        "volume": volume,
+                        "rsi": rsi,
+                        "bid_ask_spread": spread,
+                    }
+                return {"price": 0.0, "volume": 0.0, "rsi": 0.0, "bid_ask_spread": 0.0}
         except Exception as e:
             logger.error(
                 f"[TradeManager] Не вдалося отримати ринкові дані для {symbol}: {e}"
             )
-            bar = {}
-        return {
-            "price": float(bar.get("close", 0.0)),
-            "volume": float(bar.get("volume", 0.0)),
-            "rsi": float(bar.get("rsi", 0.0)),
-            "bid_ask_spread": (
-                float(bar.get("ask", 0.0)) - float(bar.get("bid", 0.0))
-                if bar.get("ask") and bar.get("bid")
-                else 0.0
-            ),
-        }
+            return {"price": 0.0, "volume": 0.0, "rsi": 0.0, "bid_ask_spread": 0.0}
 
     def get_current_price(self, symbol: str) -> float:
         """Отримання поточної ціни з context_engine (остання ціна close)"""
         try:
-            df = self.context_engine.load_data(symbol)
-            if df is not None and not df.empty:
-                return float(df.iloc[-1]["close"])
+            df_obj = self.context_engine.load_data(symbol)
+            if isinstance(df_obj, pd.DataFrame) and not df_obj.empty:
+                return float(df_obj.iloc[-1]["close"])
         except Exception as e:  # broad except: тільки лог діагностики
             logger.error(f"get_current_price error for {symbol}: {e}")
         return 0.0
@@ -749,9 +819,9 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
     def get_current_volume(self, symbol: str) -> float:
         """Отримання поточного обсягу з context_engine (остній bar volume)"""
         try:
-            df = self.context_engine.load_data(symbol)
-            if df is not None and not df.empty:
-                return float(df.iloc[-1]["volume"])
+            df_obj = self.context_engine.load_data(symbol)
+            if isinstance(df_obj, pd.DataFrame) and not df_obj.empty:
+                return float(df_obj.iloc[-1]["volume"])
         except Exception as e:  # broad except: тільки лог діагностики
             logger.error(f"get_current_volume error for {symbol}: {e}")
         return 0.0
@@ -759,9 +829,13 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
     def get_current_rsi(self, symbol: str) -> float:
         """Отримання поточного RSI з context_engine (остній bar rsi)"""
         try:
-            df = self.context_engine.load_data(symbol)
-            if df is not None and not df.empty and "rsi" in df.columns:
-                return float(df.iloc[-1]["rsi"])
+            df_obj = self.context_engine.load_data(symbol)
+            if (
+                isinstance(df_obj, pd.DataFrame)
+                and not df_obj.empty
+                and "rsi" in df_obj.columns
+            ):
+                return float(df_obj.iloc[-1]["rsi"])
         except Exception as e:  # broad except: тільки лог діагностики
             logger.error(f"get_current_rsi error for {symbol}: {e}")
         return 0.0
@@ -769,15 +843,15 @@ class EnhancedContextAwareTradeManager(TradeLifecycleManager):
     def get_bid_ask_spread(self, symbol: str) -> float:
         """Отримання спреду з context_engine (bid/ask якщо є, інакше 0)"""
         try:
-            df = self.context_engine.load_data(symbol)
+            df_obj = self.context_engine.load_data(symbol)
             if (
-                df is not None
-                and not df.empty
-                and "bid" in df.columns
-                and "ask" in df.columns
+                isinstance(df_obj, pd.DataFrame)
+                and not df_obj.empty
+                and "bid" in df_obj.columns
+                and "ask" in df_obj.columns
             ):
-                bid = float(df.iloc[-1]["bid"])
-                ask = float(df.iloc[-1]["ask"])
+                bid = float(df_obj.iloc[-1]["bid"])
+                ask = float(df_obj.iloc[-1]["ask"])
                 return abs(ask - bid)
         except Exception as e:  # broad except: тільки лог діагностики
             logger.error(f"get_bid_ask_spread error for {symbol}: {e}")

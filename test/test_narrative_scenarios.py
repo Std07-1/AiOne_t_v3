@@ -38,6 +38,7 @@ test_narrative_scenarios.py
 
 
 import pytest
+
 from stage2.narrative_generator import generate_trader_narrative
 
 
@@ -348,26 +349,7 @@ def test_low_breakout_probability():
     ), f"Очікували '▼ Низька ймовірність пробою' в: {narrative}"
 
 
-def test_low_breakout_probability():
-    context = {
-        "symbol": "dotusdt",
-        "current_price": 6.5,
-        "key_levels": {
-            "immediate_support": {"value": 6.4, "type": "local"},
-            "immediate_resistance": {"value": 6.7, "type": "local"},
-        },
-        "scenario": "RANGE_BOUND",
-        "breakout_probability": 0.25,
-    }
-    anomalies = {}
-    triggers = []
-    stats = {}
-
-    narrative = generate_trader_narrative(
-        context, anomalies, triggers, stats=stats, lang="UA", style="explain"
-    )
-
-    assert "▼ Низька ймовірність пробою (<30%)" in narrative
+# noqa: F811 (keep single definition of test_low_breakout_probability above)
 
 
 def test_tight_range():

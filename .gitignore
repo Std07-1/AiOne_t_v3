@@ -1,4 +1,98 @@
-# Byte-compiled / optimized / DLL files
+# ───────────────────────────── ОС / загальне ─────────────────────────────
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+*.tmp
+*.temp
+
+# ───────────────────────────── Python ─────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.python-version
+
+# Віртуальні середовища
+.venv/
+venv/
+ENV/
+env/
+.env
+.env.*
+*.env
+
+# Пакетні менеджери / метадані
+pip-wheel-metadata/
+pip-log.txt
+pip-delete-this-directory.txt
+.pdm-python
+.pdm.toml
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+
+# Покриття / тести
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+hypothesis/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ───────────────────────────── Редактори ─────────────────────────────
+.vscode/
+.vscode-test/
+.idea/
+*.iml
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+*.swp
+*.swo
+
+# ───────────────────────────── Логи ─────────────────────────────
+logs/
+*.log
+*.log.*
+
+# ───────────────────────────── Рантайм-дані ─────────────────────────────
+# Локальний снапшот даних (див. DATASTORE_BASE_DIR). Не комітимо артефакти.
+datastore/
+
+# Тимчасові файли даних
+*.parquet
+*.jsonl
+*.json.tmp
+*.parquet.tmp
+
+# ───────────────────────────── Локальні оверрайди конфігів ─────────────────────────────
+# Залишаємо приклади в репозиторії, але ігноруємо локальні модифікації/секрети.
+*.local.*
+*secret*.*
+
+# ───────────────────────────── Git / інші ─────────────────────────────
+.git-credentials
+.gitconfig
+.orig
+
+# ───────────────────────────── Додаткові (за запитом) ─────────────────────────────
+# Конфіги/звіти та службові каталоги, які не хочемо випадково додати в коміт
+pytest.ini
+pyproject.toml
+ruff.toml
+pytest_report.txt
+ruff_report.txt
+TYPING_ROADMAP.md
+pyrightconfig.json
+tools/
+.github/
+.rej# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *.so

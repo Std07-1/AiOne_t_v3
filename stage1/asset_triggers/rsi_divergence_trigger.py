@@ -9,12 +9,12 @@
     • Без побічних ефектів поза логуванням
 """
 
-from scipy.signal import find_peaks
-import pandas as pd
 import logging
 
+import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
+from scipy.signal import find_peaks
 
 # ── Логування ───────────────────────────────────────────────────────────────
 logger = logging.getLogger("asset_triggers.rsi_divergence")
@@ -49,7 +49,8 @@ def rsi_divergence_trigger(
     rsi_series[avg_loss == 0] = 100
     rsi_series[avg_gain == 0] = 0
     current_rsi = rsi_series.iloc[-1]
-    prices = close.values
+    import numpy as np  # local import to avoid global dependency for tests
+    prices = np.asarray(close.values, dtype=float)
     peak_indices, _ = find_peaks(prices)
     trough_indices, _ = find_peaks(-prices)
     bearish_div = False

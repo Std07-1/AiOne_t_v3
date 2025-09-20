@@ -21,12 +21,15 @@ from __future__ import annotations
 # ІМПОРТИ
 # ──────────────────────────────────────────────────────────────────────────────
 import asyncio
+import builtins as _bl
 import logging
-from typing import Any, Dict, List
+from typing import Any
 
 import numpy as np
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+# Внутрішній підпис файлу для діагностики завантаження правильного модуля
+MODULE_SIGNATURE: str = "config.v2.2025-09-20.1"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ЛОГУВАННЯ МОДУЛЯ
@@ -39,6 +42,11 @@ if not logger.handlers:  # захист від повторної ініціал
 # ──────────────────────────────────────────────────────────────────────────────
 # БАЗОВІ КОНСТАНТИ ПАЙПЛАЙНА
 # ──────────────────────────────────────────────────────────────────────────────
+#: Глобальний namespace для ключів/каналів Redis і файлового сховища
+NAMESPACE: str = "ai_one"
+
+#: Базова директорія для локального сховища датастору (паркет/кеш)
+DATASTORE_BASE_DIR: str = "./datastore"
 #: Дефолтна глибина історії барів для швидких перевірок (шт.)
 DEFAULT_LOOKBACK: int = 20
 
@@ -71,6 +79,13 @@ REDIS_CHANNEL_ASSET_STATE: str = "asset_state_update"
 #: Ключ для зберігання останнього знімка стану (для «холодного» старту UI)
 REDIS_SNAPSHOT_KEY: str = "asset_state_snapshot"
 
+#: Канал для адмін-команд (узгоджено з AdminCfg.commands_channel)
+ADMIN_COMMANDS_CHANNEL: str = f"{NAMESPACE}:admin:commands"
+
+#: Ключі для агрегованих статистик у Redis
+STATS_CORE_KEY: str = f"{NAMESPACE}:stats:core"
+STATS_HEALTH_KEY: str = f"{NAMESPACE}:stats:health"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UI / ЛОКАЛІЗАЦІЯ
@@ -83,7 +98,7 @@ UI_COLUMN_VOLUME: str = "Оборот USD"
 
 #: Кастомні розміри кроку ціни (override), якщо потрібні точні значення по символах
 #: Використовується утилітою get_tick_size() через `from app.config import TICK_SIZE_MAP`
-TICK_SIZE_MAP: Dict[str, float] = {
+TICK_SIZE_MAP: dict[str, float] = {
     # приклад: "btcusdt": 0.1,
 }
 
@@ -131,7 +146,7 @@ TRIGGER_TP_SL_SWAP_SHORT = "tp_sl_swapped_short"
 TRIGGER_SIGNAL_GENERATED = "signal_generated"
 
 # Канонічні назви тригерів (уніфікація для всього пайплайна)
-TRIGGER_NAME_MAP: Dict[str, str] = {
+TRIGGER_NAME_MAP: dict[str, str] = {
     # volume / volatility
     "volume_spike_trigger": "volume_spike",
     "volume_spike": "volume_spike",
@@ -182,7 +197,11 @@ REDIS_CACHE_TTL: int = 3 * 3600  # 3 години
 # ПОМИЛКИ / ВИНЯТКИ
 # ──────────────────────────────────────────────────────────────────────────────
 class AssetFilterError(Exception):
-    """Базовий виняток для помилок фільтрації активів."""
+    """Базовий виняток для помилок фільтрації активів.
+
+    Args:
+        message: Людинозрозумілий опис помилки (українською).
+    """
 
     def __init__(self, message: str) -> None:
         self.message = str(message)
@@ -197,17 +216,49 @@ class AssetFilterError(Exception):
 # МОДЕЛІ ДАНИХ (Pydantic)
 # ──────────────────────────────────────────────────────────────────────────────
 class SymbolInfo(BaseModel):
-    """Схема одного запису з Binance `exchangeInfo["symbols"]` (USDT-PERPETUAL)."""
+    """Схема одного символу з Binance `exchangeInfo["symbols"]` (USDT‑PERPETUAL).
+
+    Поля приведено до snake_case; використовуються alias для сумісності з Binance JSON.
+
+    Args:
+        symbol: Код інструмента у біржі (наприклад, "BTCUSDT").
+        status: Статус символу на біржі (наприклад, "TRADING").
+        base_asset: Базовий актив (alias baseAsset у биржовому JSON).
+        quote_asset: Котирувальний актив (alias quoteAsset).
+        contract_type: Тип контракту ф'ючерса (alias contractType).
+
+    Raises:
+        pydantic.ValidationError: Якщо дані не відповідають очікуваній схемі.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     symbol: str
     status: str
-    baseAsset: str
-    quoteAsset: str
-    contractType: str
+    base_asset: str = Field(alias="baseAsset")
+    quote_asset: str = Field(alias="quoteAsset")
+    contract_type: str = Field(alias="contractType")
 
 
 class FilterParams(BaseModel):
-    """Вхідні параметри фільтрації активів (Stage1)."""
+    """Вхідні параметри фільтрації активів (Stage1).
+
+    Args:
+        min_quote_volume: Мінімальний денний оборот у USD для фільтра.
+        min_price_change: Мінімальна зміна ціни у відсотках.
+        min_open_interest: Мінімальний відкритий інтерес у USD.
+        min_orderbook_depth: Мінімальна глибина ордербука у USD.
+        min_atr_percent: Мінімальний ATR у відсотках від ціни.
+        max_symbols: Верхня межа символів у вибірці.
+        dynamic: Вмикає динамічні пороги залежно від ринку.
+        strict_validation: Якщо True, жорсткіша валідація вводів.
+
+    Notes:
+        Усі NaN у числових полях перед валідацією замінюються на 0 (див. `_replace_nan`).
+
+    Raises:
+        pydantic.ValidationError: Якщо параметри некоректні за типом/діапазоном.
+    """
 
     min_quote_volume: float = 1_000_000.0
     min_price_change: float = 3.0
@@ -218,24 +269,43 @@ class FilterParams(BaseModel):
     dynamic: bool = False
     strict_validation: bool = True
 
-    @validator("*", pre=True)
+    @field_validator("*", mode="before")
+    @classmethod
     def _replace_nan(cls, v: Any) -> Any:
         """Замінює NaN → 0 для float-параметрів (захист під час агрегацій)."""
         return 0 if isinstance(v, float) and np.isnan(v) else v
 
 
 class MetricResults(BaseModel):
-    """Метрики виконання фільтрації — корисно для логування та UI-діагностики."""
+    """Метрики виконання фільтрації — для логування та UI‑діагностики.
+
+    Args:
+        initial_count: Кількість інструментів до фільтрів.
+        prefiltered_count: Кількість після попереднього фільтрування.
+        filtered_count: Кількість після основного фільтрування.
+        result_count: Підсумковий розмір вибірки.
+        elapsed_time: Час виконання в секундах.
+        params: Використані параметри фільтрації (серіалізований словник).
+
+    Raises:
+        pydantic.ValidationError: За невідповідності типів полів.
+    """
 
     initial_count: int
     prefiltered_count: int
     filtered_count: int
     result_count: int
     elapsed_time: float
-    params: Dict[str, Any]
+    # Уникаємо конфлікту з методом `dict()` у класі: звертаємось до builtins.dict
+    # напряму через псевдонім _bl.dict, щоб Pydantic коректно інтерпретував тип.
+    params: _bl.dict[str, Any]
 
-    def dict(self, *args, **kwargs) -> Dict[str, Any]:  # noqa: D401
-        """Серіалізує модель у звичайний словник (стисле подання)."""
+    def dict(self, *args, **kwargs) -> _bl.dict[str, Any]:  # noqa: D401
+        """Серіалізує модель у звичайний словник (стисле подання).
+
+        Returns:
+            dict[str, Any]: Плоский словник із основними полями метрик.
+        """
         return {
             "initial_count": self.initial_count,
             "prefiltered_count": self.prefiltered_count,
@@ -249,7 +319,7 @@ class MetricResults(BaseModel):
 # ──────────────────────────────────────────────────────────────────────────────
 # ТАКСОНОМІЯ АКТИВІВ ТА КОНФІГ STAGE2 (QDE)
 # ──────────────────────────────────────────────────────────────────────────────
-ASSET_CLASS_MAPPING: Dict[str, List[str]] = {
+ASSET_CLASS_MAPPING: dict[str, list[str]] = {
     "spot": [
         ".*BTC.*",
         ".*ETH.*",
@@ -296,7 +366,7 @@ ASSET_CLASS_MAPPING: Dict[str, List[str]] = {
     "stable": [".*USDT$", ".*BUSD$", ".*DAI$", ".*USD$", ".*FDUSD$"],
 }
 
-STAGE2_CONFIG: Dict[str, Any] = {
+STAGE2_CONFIG: dict[str, Any] = {
     # Класи активів + їх ваги пріоритезації
     "asset_class_mapping": ASSET_CLASS_MAPPING,
     "priority_levels": {
@@ -392,7 +462,7 @@ STAGE2_CONFIG: Dict[str, Any] = {
     },
 }
 
-OPTUNA_PARAM_RANGES: Dict[str, tuple] = {
+OPTUNA_PARAM_RANGES: dict[str, tuple] = {
     "volume_z_threshold": (0.5, 3.0),
     "rsi_oversold": (15.0, 40.0),
     "rsi_overbought": (60.0, 85.0),
@@ -411,7 +481,7 @@ OPTUNA_PARAM_RANGES: Dict[str, tuple] = {
 # ──────────────────────────────────────────────────────────────────────────────
 # CACHE / TTL CONFIG (свічки / історія)
 # ──────────────────────────────────────────────────────────────────────────────
-INTERVAL_TTL_MAP: Dict[str, int] = {
+INTERVAL_TTL_MAP: dict[str, int] = {
     # ultra-short
     "15s": 30,
     "30s": 45,
@@ -438,7 +508,7 @@ INTERVAL_TTL_MAP: Dict[str, int] = {
 # APP DEFAULTS / PREFILTER / PRELOAD (перенесено з app/*.py)
 # ──────────────────────────────────────────────────────────────────────────────
 #: Базові пороги первинного Stage1 prefilter (раніше локальний dict у main.py)
-STAGE1_PREFILTER_THRESHOLDS: Dict[str, float | int] = {
+STAGE1_PREFILTER_THRESHOLDS: dict[str, float | int] = {
     "MIN_QUOTE_VOLUME": 1_000_000.0,  # Мінімальний об'єм торгів USDT
     "MIN_PRICE_CHANGE": 3.0,  # Мінімальна зміна ціни (%)
     "MIN_OPEN_INTEREST": 500_000.0,  # Мінімальний відкритий інтерес USD
@@ -508,6 +578,9 @@ PREFILTER_BASE_PARAMS: dict[str, float | int | bool] = {
 # ЕКСПОРТ СИМВОЛІВ МОДУЛЯ (публічний API)
 # ──────────────────────────────────────────────────────────────────────────────
 __all__ = [
+    # Узгоджені константи середовища/сховища
+    "NAMESPACE",
+    "DATASTORE_BASE_DIR",
     # Базові константи
     "DEFAULT_LOOKBACK",
     "DEFAULT_TIMEFRAME",
@@ -520,6 +593,9 @@ __all__ = [
     # Redis
     "REDIS_CHANNEL_ASSET_STATE",
     "REDIS_SNAPSHOT_KEY",
+    "ADMIN_COMMANDS_CHANNEL",
+    "STATS_CORE_KEY",
+    "STATS_HEALTH_KEY",
     # UI
     "UI_LOCALE",
     "UI_COLUMN_VOLUME",
@@ -565,3 +641,35 @@ __all__ = [
     "STAGE1_MONITOR_PARAMS",
     "PREFILTER_BASE_PARAMS",
 ]
+
+# Кінець модуля: без додаткових «бекфілів»; значення визначені статично вище.
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Fallbacks для сумісності зі старими збірками (не впливають на сучасну версію)
+# ──────────────────────────────────────────────────────────────────────────────
+try:
+    _ = NAMESPACE
+except NameError:  # pragma: no cover
+    NAMESPACE = "ai_one"
+
+try:
+    _ = DATASTORE_BASE_DIR
+except NameError:  # pragma: no cover
+    DATASTORE_BASE_DIR = "./datastore"
+
+try:
+    _ = ADMIN_COMMANDS_CHANNEL
+except NameError:  # pragma: no cover
+    ADMIN_COMMANDS_CHANNEL = f"{NAMESPACE}:admin:commands"
+
+try:
+    _ = __all__
+except NameError:  # pragma: no cover
+    __all__ = []  # type: ignore[assignment]
+
+for _name in ("NAMESPACE", "DATASTORE_BASE_DIR", "ADMIN_COMMANDS_CHANNEL"):
+    try:
+        if _name not in __all__:  # type: ignore[operator]
+            __all__.append(_name)  # type: ignore[union-attr]
+    except Exception:
+        pass

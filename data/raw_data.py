@@ -1,5 +1,4 @@
 # raw_data.py
-# -*- coding: utf-8 -*-
 """
 AiOne_t • Data Fetcher (RAW)
 ============================
@@ -22,14 +21,15 @@ AiOne_t • Data Fetcher (RAW)
 """
 
 from __future__ import annotations
-import sys
+
 import asyncio
+import datetime as dt
 import json
 import logging
+import sys
 import time
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Any
 
 import aiohttp
 import orjson
@@ -77,7 +77,10 @@ GLOBAL_SEMAPHORE = asyncio.Semaphore(25)
 def _log_dataframe(df: pd.DataFrame, label: str) -> None:
     """DEBUG‑знімок у форматі head:3\\tail:3 (економить простір у логах)."""
     if logger.isEnabledFor(logging.DEBUG) and not df.empty:
-        snippet = pd.concat([df.head(3), df.tail(3)]).to_dict("records")
+        # dict records: list of row dicts with mixed types
+        snippet: list[dict[str, Any]] = pd.concat([df.head(3), df.tail(3)]).to_dict(
+            "records"
+        )
         logger.debug("%s  head:3\\tail:3=%s", label, snippet)
 
 
@@ -172,7 +175,7 @@ async def fetch_with_retry(
     session: aiohttp.ClientSession,
     url: str,
     *,
-    params: Optional[Dict[str, str]] = None,
+    params: aiohttp.typedefs.Query | None = None,
     max_retries: int = 3,
     backoff_sec: float = 1.5,
     timeout_sec: float = 10.0,
@@ -196,9 +199,9 @@ async def fetch_with_retry(
                     text[:200],
                 )
         except (
+            TimeoutError,
             aiohttp.ClientConnectorError,
             aiohttp.ClientPayloadError,
-            asyncio.TimeoutError,
         ) as err:
             logger.warning("[fetch_with_retry] %s (спроба=%d) => %s", url, attempt, err)
         if attempt < max_retries:
@@ -206,7 +209,7 @@ async def fetch_with_retry(
     raise aiohttp.ClientError(f"Не вдалося отримати {url} після {max_retries} спроб.")
 
 
-def parse_futures_exchange_info(text: str) -> Dict[str, List[Dict[str, str]]]:
+def parse_futures_exchange_info(text: str) -> dict[str, list[dict[str, Any]]]:
     """
     Парсер JSON для exchangeInfo → {"symbols":[...]}.
     Навіть якщо поле відсутнє, повертає {"symbols":[]}.
@@ -215,16 +218,17 @@ def parse_futures_exchange_info(text: str) -> Dict[str, List[Dict[str, str]]]:
         parsed = json.loads(text)
     except json.JSONDecodeError as e:
         logger.error("[FUTURES EXCHANGE] Помилка JSON: %s", e)
-        return {"symbols": []}
+    return {"symbols": []}
 
     symbols = parsed.get("symbols")
     if not isinstance(symbols, list):
         logger.warning("[FUTURES EXCHANGE] Поле 'symbols' відсутнє або некоректне.")
-        return {"symbols": []}
+    return {"symbols": []}
 
     df = pd.DataFrame(symbols)
     logger.debug("[FUTURES EXCHANGE] Знайдено %d символів.", len(df))
-    return {"symbols": df.to_dict("records")}
+    records: list[dict[str, Any]] = df.to_dict("records")
+    return {"symbols": records}
 
 
 # ────────────────────── Основний клас ─────────────────────────────
@@ -240,7 +244,7 @@ class OptimizedDataFetcher:
         self.session = session
         self.compress_cache = compress_cache
         # in‑memory cache: (symbol, interval) -> (df, ts_fetch)
-        self._mem_cache: Dict[Tuple[str, str], Tuple[pd.DataFrame, float]] = {}
+        self._mem_cache: dict[tuple[str, str], tuple[pd.DataFrame, float]] = {}
         # директорія снапшотів (можна змінити ззовні до першого виклику)
         self.snapshot_dir = Path("data_snapshots")
         self.snapshot_dir.mkdir(exist_ok=True)
@@ -256,7 +260,7 @@ class OptimizedDataFetcher:
         *,
         max_age_sec: int,
         min_candles: int,
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         path = self._snapshot_path(symbol, interval)
         if not path.exists():
             return None
@@ -335,7 +339,7 @@ class OptimizedDataFetcher:
                 )
                 break
             batch = await self._fetch_binance_data(
-                symbol, interval, limit=min(1000, remaining), endTime=end_time
+                symbol, interval, limit=min(1000, remaining), end_time=end_time
             )
             if batch.empty:
                 break
@@ -360,7 +364,7 @@ class OptimizedDataFetcher:
     # ───────────────────── Пакетне отримання ───────────────────────────
     async def get_data_batch(
         self,
-        symbols: List[str],
+        symbols: list[str],
         *,
         interval: str = "1d",
         limit: int = 500,
@@ -368,7 +372,7 @@ class OptimizedDataFetcher:
         read_cache: bool = True,
         write_cache: bool = True,
         show_progress: bool = False,  # ← новий параметр
-    ) -> Dict[str, pd.DataFrame]:
+    ) -> dict[str, pd.DataFrame]:
         """Паралельне завантаження OHLCV для кількох символів.
 
         Parameters
@@ -393,11 +397,12 @@ class OptimizedDataFetcher:
             Успішно завантажені ряди (може бути менше за кількість вхідних символів).
         """
         total = len(symbols)
-        results: Dict[str, pd.DataFrame] = {}
+        results: dict[str, pd.DataFrame] = {}
         start = time.perf_counter()
 
         # Вибір контексту для прогрес‑бару
         if show_progress:
+            prog_ctx: Progress | DummyProgress
             prog_ctx = Progress(
                 SpinnerColumn(),  # ⠙ спінер
                 BarColumn(bar_width=30),  # ━╸━━━━
@@ -465,7 +470,7 @@ class OptimizedDataFetcher:
         *,
         read_cache: bool,
         write_cache: bool,
-    ) -> Tuple[str, Optional[pd.DataFrame]]:
+    ) -> tuple[str, pd.DataFrame | None]:
         async with _KLINE_SEM:
             df = await self.get_data(
                 symbol,
@@ -489,8 +494,8 @@ class OptimizedDataFetcher:
         write_cache: bool = True,
         use_snapshot: bool = True,
         snapshot_max_age_sec: int = 24 * 3600,
-        snapshot_max_store: Optional[int] = None,
-    ) -> Optional[pd.DataFrame]:
+        snapshot_max_store: int | None = None,
+    ) -> pd.DataFrame | None:
         """
         Основний метод отримання історії.
 
@@ -510,7 +515,7 @@ class OptimizedDataFetcher:
                 return df_cached.tail(limit) if len(df_cached) > limit else df_cached
 
         # 1.5) Snapshot (on-disk) — тільки якщо дозволено
-        snapshot_df: Optional[pd.DataFrame] = None
+        snapshot_df: pd.DataFrame | None = None
         if use_snapshot and read_cache:
             snapshot_df = self._load_snapshot(
                 symbol,
@@ -546,15 +551,15 @@ class OptimizedDataFetcher:
                 self._mem_cache[key] = (extended.copy(), now)
             return extended.tail(limit)
 
-        MAX_SINGLE = 1500  # хард-ліміт Binance (перестраховка)
-        if limit <= MAX_SINGLE:
+        max_single = 1500  # хард-ліміт Binance (перестраховка)
+        if limit <= max_single:
             df_full = await self._fetch_binance_data(symbol, interval, limit=limit)
         else:
             # Backward pagination: беремо останній блок, потім рухаємося у минуле через endTime
             remaining = limit
-            batch_limit = min(1000, MAX_SINGLE)
-            parts: List[pd.DataFrame] = []
-            end_time: Optional[int] = None
+            batch_limit = min(1000, max_single)
+            parts: list[pd.DataFrame] = []
+            end_time: int | None = None
             safety_iter = 0
             while remaining > 0:
                 safety_iter += 1
@@ -565,7 +570,7 @@ class OptimizedDataFetcher:
                     break
                 current_limit = min(batch_limit, remaining)
                 part = await self._fetch_binance_data(
-                    symbol, interval, limit=current_limit, endTime=end_time
+                    symbol, interval, limit=current_limit, end_time=end_time
                 )
                 if part.empty:
                     # немає старіших даних
@@ -618,8 +623,8 @@ class OptimizedDataFetcher:
         interval: str,
         *,
         limit: int,
-        startTime: Optional[int] = None,
-        endTime: Optional[int] = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
     ) -> pd.DataFrame:
         """
         Безпосередньо йде на /fapi/v1/klines.
@@ -647,15 +652,17 @@ class OptimizedDataFetcher:
             limit = max_limit
 
         # Формуємо запит до Binance із UPPER‑case
-        params: Dict[str, str | int] = {
+        params_raw: dict[str, object] = {
             "symbol": sym_api,
             "interval": interval,
             "limit": limit,
         }
-        if startTime is not None:
-            params["startTime"] = startTime
-        if endTime is not None:
-            params["endTime"] = endTime
+        if start_time is not None:
+            params_raw["startTime"] = start_time
+        if end_time is not None:
+            params_raw["endTime"] = end_time
+        # Перетворюємо у послідовність пар (str, str) для узгодженості з aiohttp
+        params: list[tuple[str, str]] = [(k, str(v)) for k, v in params_raw.items()]
         logger.debug("[FETCH] %s %s — запит %s", symbol, interval, params)
 
         async with GLOBAL_SEMAPHORE:
@@ -663,7 +670,7 @@ class OptimizedDataFetcher:
                 self.session, BINANCE_FUTURES_KLINES, params=params
             )
         try:
-            parsed: List[List] = json.loads(text)
+            parsed: list[list] = json.loads(text)
         except json.JSONDecodeError:
             logger.error("[FETCH] Помилка JSON для %s %s.", symbol, interval)
             return pd.DataFrame()
@@ -701,7 +708,7 @@ class OptimizedDataFetcher:
         Для '1d' після півночі UTC вимагає повного оновлення.
         Інакше max_age_sec.
         """
-        now = datetime.now(timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         last_ts = df["timestamp"].max()
         if interval == "1d" and OptimizedDataFetcher._after_midnight_utc():
             return False
@@ -715,16 +722,19 @@ class OptimizedDataFetcher:
             max_age_sec,
             status,
         )
-        return age < max_age_sec
+        try:
+            return bool(age < float(max_age_sec))
+        except Exception:
+            return False
 
     @staticmethod
     def _after_midnight_utc() -> bool:
         """True, якщо зараз 00:00–00:05 UTC (після півночі)."""
-        now = datetime.now(timezone.utc)
+        now = dt.datetime.now(dt.UTC)
         return now.hour == 0 and now.minute < 5
 
     # ───────────────────────── exchangeInfo ─────────────────────────────
-    async def get_futures_exchange_info(self) -> Dict[str, List[Dict[str, str]]]:
+    async def get_futures_exchange_info(self) -> dict[str, list[dict[str, str]]]:
         """
         Повертає справжню інформацію про ф’ючерсні контракти (USDT‑M) з кешу або REST.
         """
@@ -738,16 +748,16 @@ class OptimizedDataFetcher:
         symbol: str,
         interval: str,
         *,
-        startTime: Optional[int] = None,
-        endTime: Optional[int] = None,
+        start_time: int | None = None,
+        end_time: int | None = None,
         limit: int = 1000,
-    ) -> Optional[pd.DataFrame]:
+    ) -> pd.DataFrame | None:
         """Спеціалізований метод для калібрування з підтримкою часових діапазонів"""
         params = {"limit": limit}
-        if startTime:
-            params["startTime"] = startTime
-        if endTime:
-            params["endTime"] = endTime
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
 
         return await self._fetch_binance_data(symbol, interval, **params)
 

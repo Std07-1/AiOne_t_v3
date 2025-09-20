@@ -3,9 +3,9 @@
 Виявляє різкий стрибок волатильності через порівняння поточного True Range з історичним ATR.
 """
 
-import pandas as pd
 import logging
 
+import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 

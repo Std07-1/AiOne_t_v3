@@ -1,8 +1,7 @@
 # conftest.py
-import logging
-import os
-import sys
 import gc
+import logging
+
 import pytest
 
 

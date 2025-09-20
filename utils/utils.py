@@ -17,33 +17,30 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Iterable, Sequence
 from datetime import datetime, time
-from typing import Any, Iterable, Optional, Sequence, Tuple
+from typing import Any
 
 import pandas as pd
-
 from rich.console import Console
 from rich.logging import RichHandler
 
-_HAS_RICH = True
-
-# ── Конфіг/константи проєкту ──────────────────────────────────────────────────
-
+# ── Конфіг/константи проєкту ───────────────────────────────────────────────
 from config.config import (
+    ASSET_STATE,
     BUY_SET,
+    INTERVAL_TTL_MAP,
     SELL_SET,
-    TICK_SIZE_MAP,
+    STAGE2_STATUS,
     TICK_SIZE_BRACKETS,
     TICK_SIZE_DEFAULT,
+    TICK_SIZE_MAP,
+    TRIGGER_NAME_MAP,
     TRIGGER_TP_SL_SWAP_LONG,
     TRIGGER_TP_SL_SWAP_SHORT,
-    INTERVAL_TTL_MAP,
-    STAGE2_STATUS,
-    ASSET_STATE,
 )
 
-# TRIGGER_NAME_MAP переносимо у конфіг (централізація канонічних імен тригерів).
-from config.config import TRIGGER_NAME_MAP  # type: ignore
+_HAS_RICH = True
 
 # ── Локальний логер модуля ────────────────────────────────────────────────────
 _logger = logging.getLogger("app.utils")
@@ -57,7 +54,7 @@ if not _logger.handlers:  # захист від повторної ініціа�
 
 
 # ── Базові хелпери ───────────────────────────────────────────────────────────
-def safe_float(value: Any) -> Optional[float]:
+def safe_float(value: Any) -> float | None:
     """Безпечно перетворює значення у float.
 
     Повертає None, якщо значення не можна конвертувати або воно не є скінченним числом.
@@ -79,7 +76,7 @@ def safe_float(value: Any) -> Optional[float]:
         return None
 
 
-def first_not_none(seq: Optional[Sequence[Optional[Any]]]) -> Optional[Any]:
+def first_not_none(seq: Sequence[Any | None] | None) -> Any | None:
     """Повертає перший елемент, що не є None.
 
     Args:
@@ -103,7 +100,7 @@ def ensure_timestamp_column(
     as_index: bool = False,
     drop_duplicates: bool = True,
     sort: bool = True,
-    logger_obj: Optional[logging.Logger] = None,
+    logger_obj: logging.Logger | None = None,
     min_rows: int = 1,
     log_prefix: str = "",
 ) -> pd.DataFrame:
@@ -198,7 +195,7 @@ def ensure_timestamp_column(
 
 
 # ── Map / Normalize (рекомендації, TP/SL, тригери) ───────────────────────────
-def map_reco_to_signal(recommendation: Optional[str]) -> str:
+def map_reco_to_signal(recommendation: str | None) -> str:
     """Перетворює Stage2-рекомендацію у тип сигналу для UI.
 
     Args:
@@ -216,11 +213,11 @@ def map_reco_to_signal(recommendation: Optional[str]) -> str:
 
 
 def normalize_tp_sl(
-    tp: Optional[float],
-    sl: Optional[float],
-    recommendation: Optional[str],
-    current_price: Optional[float] = None,
-) -> Tuple[Optional[float], Optional[float], bool, Optional[str]]:
+    tp: float | None,
+    sl: float | None,
+    recommendation: str | None,
+    current_price: float | None = None,
+) -> tuple[float | None, float | None, bool, str | None]:
     """Гарантує логічний порядок TP/SL відповідно до напрямку угоди.
 
     Args:
@@ -237,7 +234,7 @@ def normalize_tp_sl(
             note_tag (Optional[str]): Тег примітки (наприклад, 'tp_sl_swapped_long').
     """
     swapped = False
-    note: Optional[str] = None
+    note: str | None = None
 
     if not isinstance(tp, (int, float)) or not isinstance(sl, (int, float)):
         return tp, sl, swapped, note
@@ -336,8 +333,8 @@ def format_open_interest(oi: float | str) -> str:
 
 def get_tick_size(
     symbol: str,
-    price_hint: Optional[float] = None,
-    overrides: Optional[dict[str, float]] = None,
+    price_hint: float | None = None,
+    overrides: dict[str, float] | None = None,
 ) -> float:
     """Єдина функція визначення tick_size.
 
@@ -404,6 +401,9 @@ def format_price(price: float, symbol: str) -> str:
     except (TypeError, ValueError):
         return "-"
     decimals = _infer_decimals_for_symbol(symbol, p)
+    # Гарантія точності при зворотному парсингу у тестах: принаймні 6 знаків
+    if decimals < 6:
+        decimals = 6
     if p < 1000:
         return f"{p:.{decimals}f}"
     return f"{p:,.{decimals}f}"
@@ -430,7 +430,7 @@ def get_ttl_for_interval(interval: str) -> int:
     iv = interval.strip().lower()
     ttl = INTERVAL_TTL_MAP.get(iv)
     if ttl is not None:
-        return ttl
+        return int(ttl)
     try:
         if iv.endswith("m"):
             mins = float(iv[:-1])

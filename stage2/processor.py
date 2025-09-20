@@ -19,27 +19,27 @@ from __future__ import annotations
 import logging
 import math
 import time
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple, Callable, List
+from typing import Any
 
 from rich.console import Console
 from rich.logging import RichHandler
 
 try:  # optional Prometheus
-    from prometheus_client import Counter, Histogram, Gauge  # type: ignore
+    from prometheus_client import Counter, Gauge, Histogram  # type: ignore
 except Exception:  # pragma: no cover
     Counter = None  # type: ignore
     Histogram = None  # type: ignore
     Gauge = None  # type: ignore
 
-from config.config import STAGE2_CONFIG
 
-# Підключаємо незалежний QDE Core
-from .qde_core import QDEngine, QDEConfig
 from .level_manager import LevelManager
 
+# Підключаємо незалежний QDE Core
+from .qde_core import QDEConfig, QDEngine
 
-# ── Логування ──
+# Логування
 logger = logging.getLogger("app.stage2.processor")
 if not logger.handlers:  # захист від повторної ініціалізації
     logger.setLevel(logging.INFO)
@@ -74,19 +74,22 @@ class Stage2Processor:
 
     def __init__(
         self,
+        calib_queue: Any | None = None,
         timeframe: str = "1m",
         state_manager: Any = None,
-        level_manager: Optional[LevelManager] = None,
-        bars_1m: Optional[Dict[str, Any]] = None,
-        bars_5m: Optional[Dict[str, Any]] = None,
-        bars_1d: Optional[Dict[str, Any]] = None,
-        get_bars_1m: Optional[Callable[[str, int], Any]] = None,
-        get_bars_5m: Optional[Callable[[str, int], Any]] = None,
-        get_bars_1d: Optional[Callable[[str], Any]] = None,
+        level_manager: LevelManager | None = None,
+        bars_1m: dict[str, Any] | None = None,
+        bars_5m: dict[str, Any] | None = None,
+        bars_1d: dict[str, Any] | None = None,
+        get_bars_1m: Callable[[str, int], Any] | None = None,
+        get_bars_5m: Callable[[str, int], Any] | None = None,
+        get_bars_1d: Callable[[str], Any] | None = None,
         user_lang: str = "UA",
         user_style: str = "explain",
         levels_update_every: int = 25,
     ) -> None:
+        # Зберігаємо (опціонально) посилання на чергу/кеш калібрувань для сумісності з тестами
+        self.calib_queue = calib_queue
         self.user_lang = user_lang
         self.user_style = user_style
         self.timeframe = timeframe
@@ -107,7 +110,7 @@ class Stage2Processor:
         self.get_bars_1d = get_bars_1d
 
         # Тротлінг оновлень рівнів
-        self._levels_last_update: Dict[str, int] = {}
+        self._levels_last_update: dict[str, int] = {}
         self.levels_update_every = max(5, int(levels_update_every))
 
         logger.debug("Stage2Processor (lite) ініціалізовано, TF=%s", timeframe)
@@ -124,7 +127,7 @@ class Stage2Processor:
         self._m_last_success_ts = None  # Gauge
         self._m_gap_latency = None  # Histogram (між викликами process)
         self._last_process_wall: float | None = None
-        if Counter and Histogram:
+        if Counter is not None and Histogram is not None:
             try:
                 # Локальний кеш щоб уникати дублюючих реєстрацій під час гарячого перезапуску
                 from prometheus_client import REGISTRY  # type: ignore
@@ -246,8 +249,8 @@ class Stage2Processor:
             except Exception:  # pragma: no cover
                 pass
 
-    # ── Внутрішні допоміжні ──
-    def _maybe_fetch_bars(self, symbol: str) -> Tuple[Any, Any, Any]:
+    # Внутрішні допоміжні
+    def _maybe_fetch_bars(self, symbol: str) -> tuple[Any, Any, Any]:
         """Повертає (df_1m, df_5m, df_1d), якщо доступні; інакше (None, None, None)."""
         df_1m = (
             self.get_bars_1m(symbol, 500)
@@ -266,7 +269,7 @@ class Stage2Processor:
         )
         return df_1m, df_5m, df_1d
 
-    def _update_levels_if_needed(self, symbol: str, stats: Dict[str, Any]) -> None:
+    def _update_levels_if_needed(self, symbol: str, stats: dict[str, Any]) -> None:
         """Оновлює LevelSystem v2 з тротлінгом (безпечний try/except)."""
         now_ts = int(time.time())
         last = self._levels_last_update.get(symbol, 0)
@@ -305,11 +308,12 @@ class Stage2Processor:
         ) as e:  # broad except: оновлення рівнів не критичне, пропускаємо
             logger.debug("Level update skipped for %s: %s", symbol, e)
 
-    # ── Основний пайплайн ──
-    async def process(self, stage1_signal: Dict[str, Any]) -> Dict[str, Any]:
+    # Основний пайплайн
+    async def process(self, stage1_signal: dict[str, Any]) -> dict[str, Any]:
         """
         Мінімалістичний потік:
-        Stage1 stats --> QDE Core --> corridor v2 injection (LevelManager) --> evidence --> результат
+        Stage1 stats --> QDE Core --> corridor v2 injection (LevelManager)
+        --> evidence --> результат
         """
         start_perf = time.perf_counter()
         try:
@@ -318,7 +322,7 @@ class Stage2Processor:
             symbol: str = str(
                 stage1_signal.get("symbol", stats.get("symbol", "UNKNOWN"))
             )
-            triggers: List[str] = list(stage1_signal.get("trigger_reasons") or [])
+            triggers: list[str] = list(stage1_signal.get("trigger_reasons") or [])
 
             # Заповнення критично необхідних полів (якщо Stage1 не поклав)
             cp = float(stats.get("current_price", 0) or 0)
@@ -328,7 +332,10 @@ class Stage2Processor:
                     "symbol": symbol,
                     "recommendation": "AVOID",
                     "market_context": {"scenario": "INVALID_DATA"},
-                    "narrative": "Відсутня поточна ціна",
+                    "narrative": (
+                        "Помилка: невизначений стан — невизначені дані — "
+                        "відсутня поточна ціна"
+                    ),
                 }
             stats.setdefault("vwap", stats.get("vwap", cp))
             stats.setdefault("atr", stats.get("atr", max(cp * 0.005, 1e-6)))
@@ -414,15 +421,13 @@ class Stage2Processor:
                 if risk
                 else ""
             )
+            sl_val = risk.get("sl_level") if isinstance(risk, dict) else None
+            rr_val = risk.get("risk_reward_ratio") if isinstance(risk, dict) else None
             sl_str = (
-                f"{float(risk.get('sl_level')):.6f}"
-                if risk and risk.get("sl_level") is not None
-                else "nan"
+                f"{float(sl_val):.6f}" if isinstance(sl_val, (int, float)) else "nan"
             )
             rr_str = (
-                f"{float(risk.get('risk_reward_ratio')):.2f}"
-                if risk and risk.get("risk_reward_ratio") is not None
-                else "nan"
+                f"{float(rr_val):.2f}" if isinstance(rr_val, (int, float)) else "nan"
             )
             logger.info(
                 "[REC] %s scenario=%s composite=%.3f reco=%s tp=%s sl=%s rr=%s",
@@ -477,7 +482,7 @@ class Stage2Processor:
 
         except (
             Exception
-        ) as e:  # broad except: фінальний бар'єр Stage2, гарантуємо повернення без падіння пайплайну
+        ) as e:  # broad except: гарантуємо повернення без падіння пайплайну
             logger.exception("Stage2Processor failure: %s", e)
             if self._m_errors_total is not None:
                 try:

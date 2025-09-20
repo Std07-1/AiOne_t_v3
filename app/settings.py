@@ -3,13 +3,22 @@
 Шлях: ``app/settings.py``
 
 Використовує pydantic для декларативних моделей та YAML-файл для DataStore частини.
+
+Уніфікація: базові константи (namespace, base_dir, admin channel) тягнемо з
+`config.config` як єдиного джерела правди.
 """
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator
-from typing import Dict, Optional
 import yaml
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from config.config import (
+    DATASTORE_BASE_DIR as CFG_DATASTORE_BASE_DIR,
+)
+from config.config import (
+    NAMESPACE as CFG_NAMESPACE,
+)
 
 load_dotenv()
 
@@ -23,32 +32,29 @@ class Settings(BaseSettings):
 
     redis_host: str = "localhost"
     redis_port: int = 6379
-    binance_api_key: Optional[str] = None
-    binance_secret_key: Optional[str] = None
-    telegram_token: Optional[str] = None
+    binance_api_key: str | None = None
+    binance_secret_key: str | None = None
+    telegram_token: str | None = None
     admin_id: int = 0
     # Додаткові (не критичні) змінні середовища для сумісності зі старою конфігурацією
-    log_level: Optional[str] = None
-    log_to_file: Optional[bool] = None
-    database_url: Optional[str] = None
-    db_host: Optional[str] = None
-    db_port: Optional[int] = None
-    db_user: Optional[str] = None
-    db_password: Optional[str] = None
-    db_name: Optional[str] = None
+    log_level: str | None = None
+    log_to_file: bool | None = None
+    database_url: str | None = None
+    db_host: str | None = None
+    db_port: int | None = None
+    db_user: str | None = None
+    db_password: str | None = None
+    db_name: str | None = None
 
-    @field_validator("redis_host", "redis_port")
-    @classmethod
-    def _required(cls, v, info):  # type: ignore[override]
-        if v in (None, "", 0):
-            raise ValueError(f"{info.field_name} is required")
-        return v
+    # Проста валідація полів перенесена на рівень запуску/конфігів; додаткові
+    # pydantic-валідатори не використовуємо тут для сумісності зі stubs mypy.
 
 
 settings = Settings()  # буде валідовано під час імпорту
 
-REDIS_NAMESPACE = "ai_one"
-DATASTORE_BASE_DIR = "./datastore"
+# Уніфіковані значення з config.config
+REDIS_NAMESPACE = CFG_NAMESPACE
+DATASTORE_BASE_DIR = CFG_DATASTORE_BASE_DIR
 RAM_BUFFER_MAX_BARS = (
     30000  # Максимальна кількість барів у RAMBuffer на symbol/timeframe
 )
@@ -119,16 +125,20 @@ class TradeUpdaterCfg(BaseModel):
 
 
 class AdminCfg(BaseModel):
-    commands_channel: str = "ai_one:admin:commands"
+    enabled: bool = True
+    # Уникаємо прямого імпорту константи під час імпорту модуля,
+    # щоб не створювати крихкі залежності; значення еквівалентне
+    # config.config.ADMIN_COMMANDS_CHANNEL
+    commands_channel: str = f"{CFG_NAMESPACE}:admin:commands"
     health_ping_sec: int = 30
 
 
 class DataStoreCfg(BaseModel):
-    namespace: str = "ai_one"
-    base_dir: str = "./datastore"
+    namespace: str = REDIS_NAMESPACE
+    base_dir: str = DATASTORE_BASE_DIR
     profile: Profile = Profile()
     trade_updater: TradeUpdaterCfg = TradeUpdaterCfg()
-    intervals_ttl: Dict[str, int] = Field(
+    intervals_ttl: dict[str, int] = Field(
         default_factory=lambda: {
             "1m": 21600,
             "5m": 43200,
@@ -148,6 +158,6 @@ class DataStoreCfg(BaseModel):
 
 
 def load_datastore_cfg(path: str = "config/datastore.yaml") -> DataStoreCfg:
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     return DataStoreCfg(**data)

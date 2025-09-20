@@ -25,15 +25,16 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Tuple
 from collections import OrderedDict, deque
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
+
 import pandas as pd
-
-from redis.asyncio import Redis  # type: ignore
-
+from redis.asyncio import Redis
 from rich.console import Console
 from rich.logging import RichHandler
+
+from config.config import DATASTORE_BASE_DIR, NAMESPACE
 
 # ── Логування ──
 logger = logging.getLogger("app.data.unified_store")
@@ -44,7 +45,7 @@ if not logger.handlers:  # guard проти повторної ініціалі�
 
 # ── Стандарти й константи ──
 
-DEFAULT_NAMESPACE = "ai_one"
+DEFAULT_NAMESPACE = NAMESPACE
 
 _HAS_PARQUET = (
     False  # підтримка pyarrow прибрана (раніше була опціональним плейсхолдером)
@@ -59,7 +60,7 @@ REQUIRED_OHLCV_COLS = (
     "volume",
     "close_time",
 )
-MIN_COLUMNS = set(REQUIRED_OHLCV_COLS)
+MIN_COLUMNS: set[str] = set(REQUIRED_OHLCV_COLS)
 
 
 # ── Допоміжні структури ──
@@ -82,7 +83,7 @@ class StoreConfig:
     """Базова конфігурація сховища."""
 
     namespace: str = DEFAULT_NAMESPACE
-    intervals_ttl: Dict[str, int] = field(
+    intervals_ttl: dict[str, int] = field(
         default_factory=lambda: {
             "1m": 6 * 3600,
             "5m": 12 * 3600,
@@ -94,7 +95,7 @@ class StoreConfig:
     )
     profile: StoreProfile = field(default_factory=StoreProfile)
     write_behind: bool = True
-    base_dir: str = "./datastore"
+    base_dir: str = DATASTORE_BASE_DIR
     validate_on_write: bool = True
     validate_on_read: bool = True
     # retry для Redis/диска
@@ -125,17 +126,41 @@ def file_name(symbol: str, context: str, event: str, ext: str = "parquet") -> st
 
 # ── Метрики ─────────────────────────────────────────────────────────────────
 class _Noop:
-    def inc(self, *_, **__):
-        pass
+    def inc(self, amount: float = 1.0) -> None:
+        return None
 
-    def set(self, *_, **__):
-        pass
+    def set(self, value: float) -> None:
+        return None
 
-    def observe(self, *_, **__):
-        pass
+    def observe(self, amount: float, exemplar: dict[str, str] | None = None) -> None:
+        return None
 
-    def labels(self, *_, **__):  # імітує chaining інтерфейсу prometheus-клієнта
+    # імітує chaining інтерфейс prometheus-клієнта
+    def labels(self, *labelvalues: str, **labelkw: str) -> _Noop:
         return self
+
+
+@runtime_checkable
+class CounterLike(Protocol):
+    def inc(self, amount: float = ...) -> None: ...
+
+    def labels(self, *labelvalues: str, **labelkw: str) -> CounterLike: ...
+
+
+@runtime_checkable
+class GaugeLike(Protocol):
+    def set(self, value: float) -> None: ...
+
+    def labels(self, *labelvalues: str, **labelkw: str) -> GaugeLike: ...
+
+
+@runtime_checkable
+class HistogramLike(Protocol):
+    def observe(
+        self, amount: float, exemplar: dict[str, str] | None = None
+    ) -> None: ...
+
+    def labels(self, *labelvalues: str, **labelkw: str) -> HistogramLike: ...
 
 
 class Metrics:
@@ -147,7 +172,7 @@ class Metrics:
 
     def __init__(self) -> None:
         try:
-            from prometheus_client import Counter, Gauge, Histogram  # type: ignore
+            from prometheus_client import Counter, Gauge, Histogram
 
             self._counter = Counter
             self._gauge = Gauge
@@ -155,6 +180,17 @@ class Metrics:
             self.enabled = True
         except Exception:  # pragma: no cover
             self.enabled = False
+
+        # Атрибути метрик типізовані через Protocol-інтерфейси, щоби підтримувати _Noop
+        self.get_latency: HistogramLike
+        self.put_latency: HistogramLike
+        self.ram_hit_ratio: GaugeLike
+        self.redis_hit_ratio: GaugeLike
+        self.bytes_in_ram: GaugeLike
+        self.flush_backlog: GaugeLike
+        self.evictions: CounterLike
+        self.errors: CounterLike
+        self.last_put_ts: GaugeLike
 
         if self.enabled:
             self.get_latency = self._hist(
@@ -196,9 +232,9 @@ class RamLayer:
     """RAM-кеш з TTL, LRU, квотами, пріоритетами й приблизною оцінкою пам'яті."""
 
     def __init__(self, profile: StoreProfile) -> None:
-        self._store: Dict[Tuple[str, str], Tuple[pd.DataFrame, float, int]] = {}
-        self._lru: "OrderedDict[Tuple[str, str], None]" = OrderedDict()
-        self._prio: Dict[str, int] = {}  # symbol -> Priority
+        self._store: dict[tuple[str, str], tuple[pd.DataFrame, float, int]] = {}
+        self._lru: OrderedDict[tuple[str, str], None] = OrderedDict()
+        self._prio: dict[str, int] = {}  # symbol -> Priority
         self._profile = profile
         self._bytes_in_ram: int = 0
 
@@ -225,7 +261,7 @@ class RamLayer:
     def get_priority(self, symbol: str) -> int:
         return self._prio.get(symbol, Priority.NORMAL)
 
-    def get(self, symbol: str, interval: str) -> Optional[pd.DataFrame]:
+    def get(self, symbol: str, interval: str) -> pd.DataFrame | None:
         key = (symbol, interval)
         item = self._store.get(key)
         if not item:
@@ -255,7 +291,7 @@ class RamLayer:
 
         self._enforce_quotas()
 
-    def delete(self, key: Tuple[str, str], *, reason: str = "evict") -> None:
+    def delete(self, key: tuple[str, str], *, reason: str = "evict") -> None:
         item = self._store.pop(key, None)
         if item:
             df, _, _ = item
@@ -266,13 +302,13 @@ class RamLayer:
     def sweep(self, metrics: Metrics) -> None:
         """Прибрати протухлі ключі/зайві записи."""
         now = time.time()
-        expired: List[Tuple[str, str]] = []
-        for key, (df, ts, ttl) in list(self._store.items()):
+        expired: list[tuple[str, str]] = []
+        for key, (_df, ts, ttl) in list(self._store.items()):
             if now - ts > ttl:
                 expired.append(key)
         for key in expired:
             self.delete(key, reason="ttl_expired")
-            metrics.evictions.inc(reason="ttl_expired")
+            metrics.evictions.labels(reason="ttl_expired").inc()
 
         self._enforce_quotas()
 
@@ -299,7 +335,7 @@ class RamLayer:
 
     def _evict_by_priority(self, count: int) -> None:
         # будуємо список (prio, age_index, key)
-        ranked: List[Tuple[int, int, Tuple[str, str]]] = []
+        ranked: list[tuple[int, int, tuple[str, str]]] = []
         for idx, key in enumerate(self._lru.keys()):
             sym, _ = key
             prio = self.get_priority(sym)
@@ -322,7 +358,7 @@ class RamLayer:
     # ── Інспектори ──────────────────────────────────────────────────────────
 
     @property
-    def stats(self) -> Dict[str, Any]:
+    def stats(self) -> dict[str, Any]:
         return {
             "entries": len(self._store),
             "bytes_in_ram": self._bytes_in_ram,
@@ -334,11 +370,11 @@ class RamLayer:
 class RedisAdapter:
     """Обгортка над redis.asyncio.Redis з JSON-нормалізацією та retry."""
 
-    def __init__(self, redis: Redis, cfg: StoreConfig) -> None:
+    def __init__(self, redis: Redis[Any], cfg: StoreConfig) -> None:
         self.r = redis
         self.cfg = cfg
 
-    async def jget(self, *parts: str, default: Any = None) -> Any:
+    async def jget(self, *parts: str, default: object | None = None) -> object | None:
         key = k(self.cfg.namespace, *parts)
         for attempt in range(self.cfg.io_retry_attempts):
             try:
@@ -349,8 +385,9 @@ class RedisAdapter:
                 if attempt == self.cfg.io_retry_attempts - 1:
                     logger.error(f"Redis GET failed for {key}: {e}")
                     return default
+        return default
 
-    async def jset(self, *parts: str, value: Any, ttl: Optional[int] = None) -> None:
+    async def jset(self, *parts: str, value: object, ttl: int | None = None) -> None:
         key = k(self.cfg.namespace, *parts)
         data = json.dumps(value, ensure_ascii=False)
         for attempt in range(self.cfg.io_retry_attempts):
@@ -395,7 +432,18 @@ class StorageAdapter:
             tmp.replace(p)
 
         def _write_jsonl(p: Path, frame: pd.DataFrame) -> None:
-            tmp = p.with_suffix(p.suffix + ".tmp")
+            # Унікальне ім'я tmp, щоб уникнути гонок між паралельними флушами
+            import os as _os
+            import threading as _thr
+            import time as _time
+
+            def _uniq_tmp(base: Path) -> Path:
+                return base.with_suffix(
+                    base.suffix
+                    + f".tmp.{_os.getpid()}.{_thr.get_ident()}.{int(_time.time()*1000)}"
+                )
+
+            tmp = _uniq_tmp(p)
             # Використовуємо keyword-only аргументи to_json (сумісно з pandas >=2.2/3.0)
             frame.to_json(
                 path_or_buf=tmp,
@@ -408,7 +456,62 @@ class StorageAdapter:
                 index=False,
                 indent=None,
             )
-            tmp.replace(p)
+            # Гарантуємо існування tmp (на випадок, якщо writer не створив файл)
+            try:
+                if not tmp.exists():
+                    tmp.touch()
+            except Exception:
+                pass
+
+            # На Windows os.replace може падати (WinError 32), якщо ціль тимчасово відкрита читачем.
+            # 1) Ретраїмо PermissionError з backoff;
+            # 2) Якщо FileNotFoundError (tmp зник) — створюємо новий tmp і пробуємо знову;
+            # 3) Інші помилки — віддаємо нагору.
+            last_exc: Exception | None = None
+            for attempt in range(10):  # ~0.05..0.5s → сумарно ~2.75s
+                try:
+                    tmp.replace(p)  # atomic move
+                    last_exc = None
+                    break
+                except PermissionError as e:
+                    last_exc = e
+                    _time.sleep(0.05 * (attempt + 1))
+                    continue
+                except FileNotFoundError as e:
+                    # Можливі причини: паралельний флуш вже замінив файл і видалив наш tmp,
+                    # або антивірус/cleanup. Якщо ціль існує і не порожня — вважаємо успіхом.
+                    last_exc = e
+                    try:
+                        if p.exists() and p.stat().st_size >= 0:
+                            last_exc = None
+                            break
+                    except Exception:
+                        pass
+                    # Інакше — відтворимо новий tmp і повторимо спробу
+                    tmp = _uniq_tmp(p)
+                    frame.to_json(
+                        path_or_buf=tmp,
+                        orient="records",
+                        lines=True,
+                        date_format="iso",
+                        date_unit="ms",
+                        force_ascii=False,
+                        compression=None,
+                        index=False,
+                        indent=None,
+                    )
+                    try:
+                        if not tmp.exists():
+                            tmp.touch()
+                    except Exception:
+                        pass
+                    _time.sleep(0.05 * (attempt + 1))
+                    continue
+                except Exception as e:
+                    last_exc = e
+                    break
+            if last_exc is not None:
+                raise last_exc
 
         try:
             if _HAS_PARQUET:
@@ -416,13 +519,13 @@ class StorageAdapter:
             else:
                 await loop.run_in_executor(None, _write_jsonl, path, df)
             return str(path)
-        except (
-            Exception
-        ):  # pragma: no cover  # broad-except: повний traceback для діагностики нестабільних I/O
+        except Exception:
+            # pragma: no cover
+            # broad-except: повний traceback для діагностики нестабільних I/O
             logger.exception("Disk flush failed for %s %s", symbol, interval)
             raise
 
-    async def load_bars(self, symbol: str, interval: str) -> Optional[pd.DataFrame]:
+    async def load_bars(self, symbol: str, interval: str) -> pd.DataFrame | None:
         """Завантажує історію барів, якщо файл існує."""
         context = f"bars_{interval}"
         parquet = os.path.join(
@@ -453,8 +556,10 @@ class UnifiedDataStore:
     """Єдине шарувате сховище даних для всієї системи.
 
     Основні методи:
-        get_df(symbol, interval, limit) — отримати DataFrame (read-through RAM→Redis→Disk).
-        put_bars(symbol, interval, bars) — запис нових барів (write-through RAM→Redis, write-behind Disk).
+    get_df(symbol, interval, limit) — отримати DataFrame
+    (read-through RAM→Redis→Disk).
+    put_bars(symbol, interval, bars) — запис нових барів
+    (write-through RAM→Redis, write-behind Disk).
         get_last(symbol, interval) — останній бар (RAM або Redis).
         warmup(symbols, interval, bars_needed) — прогрів RAM зі snapshot-ів.
         set_priority(symbol, level) — задати пріоритет активу.
@@ -466,7 +571,11 @@ class UnifiedDataStore:
         • На диск пишемо snapshot історії; агрегація/обчислення поза цим шаром.
     """
 
-    def __init__(self, *, redis: Redis, cfg: Optional[StoreConfig] = None) -> None:
+    # Публічні поля-атрибути з анотаціями типів
+    _flush_q: deque[tuple[str, str, pd.DataFrame]]
+    _maint_task: asyncio.Task[Any] | None
+
+    def __init__(self, *, redis: Redis[Any], cfg: StoreConfig | None = None) -> None:
         self.cfg = cfg or StoreConfig()
         self.ram = RamLayer(self.cfg.profile)
         self.redis = RedisAdapter(redis, self.cfg)
@@ -474,14 +583,14 @@ class UnifiedDataStore:
         self.metrics = Metrics()
 
         # write-behind черга для диска
-        self._flush_q: "Deque[Tuple[str, str, pd.DataFrame]]" = deque()
+        self._flush_q = deque()
         self._ram_hits = 0
         self._ram_miss = 0
         self._redis_hits = 0
         self._redis_miss = 0
 
         self._mtx = asyncio.Lock()
-        self._maint_task: Optional[asyncio.Task] = None
+        self._maint_task = None
 
     # ── Публічний API ───────────────────────────────────────────────────────
 
@@ -505,7 +614,7 @@ class UnifiedDataStore:
 
     # ── Symbol selection helpers (prefilter integration) ────────────────────
 
-    async def set_fast_symbols(self, symbols: List[str], ttl: int = 600) -> None:
+    async def set_fast_symbols(self, symbols: list[str], ttl: int = 600) -> None:
         """Зберігає список активних (prefiltered) символів у Redis.
 
         Args:
@@ -514,12 +623,12 @@ class UnifiedDataStore:
         """
         await self.redis.jset("selectors", "fast_symbols", value=symbols, ttl=ttl)
 
-    async def get_fast_symbols(self) -> List[str]:
+    async def get_fast_symbols(self) -> list[str]:
         """Повертає перелік символів із префільтра, або порожній список."""
         res = await self.redis.jget("selectors", "fast_symbols", default=[])
-        return res or []
+        return list(res) if isinstance(res, list) else []
 
-    async def get_last(self, symbol: str, interval: str) -> Optional[Dict[str, Any]]:
+    async def get_last(self, symbol: str, interval: str) -> dict[str, Any] | None:
         """
         Повертає останній бар (словник), якщо він є в RAM/Redis.
 
@@ -539,13 +648,14 @@ class UnifiedDataStore:
             self.metrics.get_latency.labels(layer="ram").observe(
                 time.perf_counter() - t0
             )
-            return df.iloc[-1].to_dict()
+            # pandas returns dict[str, Any]
+            return dict(df.iloc[-1].to_dict())
 
         self._ram_miss += 1
 
         # 2) Redis
         last = await self.redis.jget("candles", symbol, interval, default=None)
-        if last:
+        if isinstance(last, dict):
             self._redis_hits += 1
             self.metrics.get_latency.labels(layer="redis").observe(
                 time.perf_counter() - t0
@@ -557,7 +667,8 @@ class UnifiedDataStore:
         return None
 
     # ── Legacy cache compatibility (for raw_data & transitional code) ───────
-    # DEPRECATED: перехідний blob CacheHandler API. Видалити після міграції ws_worker.py та thresholds.py
+    # DEPRECATED: перехідний blob CacheHandler API. Видалити після міграції
+    # ws_worker.py та thresholds.py
     # на структуровані ключі (jget/jset) ai_one:candles:* та ai_one:selectors:*.
     # Blob ключі ізольовано під ai_one:blob:* щоби уникнути колізій.
 
@@ -567,8 +678,8 @@ class UnifiedDataStore:
         interval: str,
         *,
         prefix: str = "candles",
-        raw: bool = True,
-    ) -> Any:
+        raw: bool | None = None,
+    ) -> bytes | None:
         """Сумісний із застарілим cache_handler.fetch_from_cache (повертає сирі байти).
 
         Зберігаємо під ключем: <namespace>:blob:<prefix>:<symbol>:<interval>
@@ -576,10 +687,11 @@ class UnifiedDataStore:
         """
         key = k(self.cfg.namespace, "blob", prefix, symbol, interval)
         try:
-            return await self.redis.r.get(key)  # type: ignore[attr-defined]
-        except (
-            Exception
-        ) as e:  # pragma: no cover  # broad-except: legacy шлях не повинен зривати основний потік
+            raw_bytes: bytes | None = await self.redis.r.get(key)
+            return raw_bytes
+        except Exception as e:
+            # pragma: no cover
+            # broad-except: legacy шлях не повинен зривати основний потік
             logger.warning("fetch_from_cache failed %s: %s", key, e)
             return None
 
@@ -587,11 +699,11 @@ class UnifiedDataStore:
         self,
         symbol: str,
         interval: str,
-        payload: Any,
+        payload: bytes,
         *,
-        ttl: Optional[int] = None,
+        ttl: int | None = None,
         prefix: str = "candles",
-        raw: bool = True,
+        raw: bool | None = None,
     ) -> None:
         """Сумісність зі старим cache_handler.store_in_cache.
 
@@ -600,9 +712,9 @@ class UnifiedDataStore:
         key = k(self.cfg.namespace, "blob", prefix, symbol, interval)
         try:
             if ttl:
-                await self.redis.r.set(key, payload, ex=ttl)  # type: ignore[attr-defined]
+                await self.redis.r.set(key, payload, ex=ttl)
             else:
-                await self.redis.r.set(key, payload)  # type: ignore[attr-defined]
+                await self.redis.r.set(key, payload)
         except (
             Exception
         ) as e:  # pragma: no cover  # broad-except: збій запису blob не критичний
@@ -624,14 +736,14 @@ class UnifiedDataStore:
         """
         key = k(self.cfg.namespace, "blob", prefix, symbol, interval)
         try:
-            await self.redis.r.delete(key)  # type: ignore[attr-defined]
+            await self.redis.r.delete(key)
         except (
             Exception
         ) as e:  # pragma: no cover  # broad-except: видалення blob не критичне
             logger.warning("delete_from_cache failed %s: %s", key, e)
 
     async def get_df(
-        self, symbol: str, interval: str, *, limit: Optional[int] = None
+        self, symbol: str, interval: str, *, limit: int | None = None
     ) -> pd.DataFrame:
         """Повертає DataFrame барів (read-through RAM→Redis→Disk).
 
@@ -670,11 +782,18 @@ class UnifiedDataStore:
 
         # 3) Disk snapshot
         disk_df = await self.disk.load_bars(symbol, interval)
-        if disk_df is None or disk_df.empty:
-            out = last_df
-        else:
-            out = pd.concat([disk_df, last_df], ignore_index=True)
+        # Уникаємо FutureWarning: concat з порожніми або all‑NA DataFrame
+        frames: list[pd.DataFrame] = []
+        if disk_df is not None and not disk_df.empty:
+            frames.append(disk_df)
+        if not last_df.empty:
+            frames.append(last_df)
+
+        if frames:
+            out = pd.concat(frames, ignore_index=True)
             out = self._dedup_sort(out)
+        else:
+            out = last_df  # обидва порожні → повертаємо порожній каркас
 
         # кешуємо назад у RAM
         if len(out):
@@ -740,7 +859,7 @@ class UnifiedDataStore:
         ):  # broad-except: fast-path оптимізація, fallback до загального merge
             pass
 
-    async def warmup(self, symbols: List[str], interval: str, bars_needed: int) -> None:
+    async def warmup(self, symbols: list[str], interval: str, bars_needed: int) -> None:
         """
         Прогріває RAM із диска (якщо є snapshot-и), встановлює TTL/пріоритети.
         """
@@ -791,7 +910,12 @@ class UnifiedDataStore:
             # аварійний режим — агресивно ріжемо batch
             limit = 1
             logger.error(
-                f"[DataStore] Severe backpressure: backlog={size}, forcing batch_limit={limit}"
+                (
+                    "[DataStore] Severe backpressure: backlog=%s, forcing "
+                    "batch_limit=%s"
+                ),
+                size,
+                limit,
             )
 
         for _ in range(min(limit, size) if not force else size):
@@ -815,7 +939,7 @@ class UnifiedDataStore:
         return df.reset_index(drop=True)
 
     def _merge_bars(
-        self, current: Optional[pd.DataFrame], new: pd.DataFrame
+        self, current: pd.DataFrame | None, new: pd.DataFrame
     ) -> pd.DataFrame:
         # Приведення open_time в обох фреймах до однорідного int64 (ms)
         def _coerce(df: pd.DataFrame) -> pd.DataFrame:
@@ -830,9 +954,9 @@ class UnifiedDataStore:
                         ).astype("int64")
                         // 10**6
                     )
-                except (
-                    Exception
-                ):  # broad-except: best-effort коерція (пропускаємо пошкоджені значення)
+                except Exception:
+                    # broad-except: best-effort коерція
+                    # (пропускаємо пошкоджені значення)
                     pass
             return df
 
@@ -875,22 +999,22 @@ class UnifiedDataStore:
         if missing:
             logger.error(f"[validate:{stage}] Відсутні стовпці: {missing}")
             try:
-                self.metrics.errors.labels(stage=f"validate_{stage}").inc()  # type: ignore
+                self.metrics.errors.labels(stage=f"validate_{stage}").inc()
             except Exception:
                 try:
-                    self.metrics.errors.inc()  # type: ignore
+                    self.metrics.errors.inc()
                 except Exception:
                     pass
         # простий детектор гепів (по open_time)
         if "open_time" in cols:
-            s = pd.to_datetime(df["open_time"], unit="ms", errors="coerce")
-            gaps = s.isna().sum()
+            s_dt = pd.to_datetime(df["open_time"], unit="ms", errors="coerce")
+            gaps = s_dt.isna().sum()
             if gaps:
                 logger.warning(f"[validate:{stage}] NaT у open_time: {gaps}")
         # монотонність часу
         if "open_time" in cols and len(df) > 1:
-            s = pd.to_numeric(df["open_time"], errors="coerce")
-            if not pd.Series(s).is_monotonic_increasing:
+            s_num = pd.to_numeric(df["open_time"], errors="coerce")
+            if not pd.Series(s_num).is_monotonic_increasing:
                 logger.warning(f"[validate:{stage}] Виявлено немонотонний open_time")
 
     def _publish_hit_ratios(self) -> None:
@@ -903,7 +1027,7 @@ class UnifiedDataStore:
 
     # ── Інспектори ──────────────────────────────────────────────────────────
 
-    def debug_stats(self) -> Dict[str, Any]:
+    def debug_stats(self) -> dict[str, Any]:
         st = self.ram.stats
         st.update(
             {
@@ -917,7 +1041,7 @@ class UnifiedDataStore:
         return st
 
     # ── Зріз метрик для UI / публікації ───────────────────────────────────
-    def metrics_snapshot(self) -> Dict[str, Any]:
+    def metrics_snapshot(self) -> dict[str, Any]:
         """Легкий зріз ключових метрик для UI публікації.
 
         Prometheus вже зберігає часові ряди; це допоміжний формат для

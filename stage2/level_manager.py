@@ -12,18 +12,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import logging
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-
-from stage1.indicators.levels import calculate_global_levels  # type: ignore
 from rich.console import Console
 from rich.logging import RichHandler
 
-# ───────────────────────────── Логування ─────────────────────────────
+from stage1.indicators.levels import calculate_global_levels
+
+# Логування
 logger = logging.getLogger("app.stage2.level_manager")
 if not logger.handlers:  # захист від повторної ініціалізації
     logger.setLevel(logging.INFO)
@@ -50,7 +49,7 @@ class Level:
     source: str = "unknown"
     tf: str = "NA"
     touches: int = 0
-    last_touch_ts: Optional[float] = None
+    last_touch_ts: float | None = None
     band_pct: float = 0.0
 
 
@@ -61,19 +60,17 @@ class LevelManager:
     """
 
     def __init__(self) -> None:
-        self.daily_levels: Dict[str, List[float]] = {}
-        self.intraday_levels: Dict[str, List[float]] = {}
+        self.daily_levels: dict[str, list[float]] = {}
+        self.intraday_levels: dict[str, list[float]] = {}
         # Нова книга рівнів
-        self.level_book: Dict[str, List[Level]] = {}
+        self.level_book: dict[str, list[Level]] = {}
         # Кеш мета-параметрів символу (напр., ATR%, tick_size)
-        self.symbol_meta: Dict[str, Dict[str, float]] = {}
+        self.symbol_meta: dict[str, dict[str, float]] = {}
         self.logger = logger
 
-    # ──────────────────────────────────────────
-    # Старі методи (бек-сумісність) + синхронізація в книгу рівнів
-    # ──────────────────────────────────────────
+    # Старі методи: бек-сумісність і синхронізація в книгу рівнів
 
-    def set_daily_levels(self, symbol: str, levels: List[float]) -> None:
+    def set_daily_levels(self, symbol: str, levels: list[float]) -> None:
         """Зберігає глобальні денні рівні для символу й синхронізує в книгу рівнів.
 
         Args:
@@ -111,7 +108,7 @@ class LevelManager:
                 )
             )
 
-    def get_all_levels(self, symbol: str) -> List[float]:
+    def get_all_levels(self, symbol: str) -> list[float]:
         """Повертає всі доступні рівні (legacy + книга рівнів) для символу.
 
         Args:
@@ -121,7 +118,7 @@ class LevelManager:
             Відсортований масив рівнів (унікальні значення).
         """
         sym = symbol.lower()
-        all_levels: List[float] = []
+        all_levels: list[float] = []
         if sym in self.daily_levels:
             all_levels.extend(self.daily_levels[sym])
         if sym in self.intraday_levels:
@@ -133,7 +130,7 @@ class LevelManager:
 
     def get_nearest_levels(
         self, symbol: str, price: float
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         """Повертає найближчі рівні підтримки/опору.
 
         Використовує нову книгу рівнів, якщо вона є; інакше — legacy-списки.
@@ -151,7 +148,7 @@ class LevelManager:
             return self._nearest_by_score(sym, price)
 
         # Legacy шлях (бек-сумісність)
-        all_levels: List[float] = []
+        all_levels: list[float] = []
         if sym in self.daily_levels:
             all_levels.extend(self.daily_levels[sym])
         if sym in self.intraday_levels:
@@ -161,8 +158,8 @@ class LevelManager:
             return None, None
 
         all_levels = sorted(set(all_levels))
-        supports = [l for l in all_levels if l < price]
-        resistances = [l for l in all_levels if l > price]
+        supports = [lvl for lvl in all_levels if lvl < price]
+        resistances = [lvl for lvl in all_levels if lvl > price]
         support = max(supports) if supports else None
         resistance = min(resistances) if resistances else None
         return support, resistance
@@ -171,9 +168,9 @@ class LevelManager:
         self,
         symbol: str,
         price: float,
-        daily_low: Optional[float],
-        daily_high: Optional[float],
-    ) -> Tuple[Optional[float], Optional[float]]:
+        daily_low: float | None,
+        daily_high: float | None,
+    ) -> tuple[float | None, float | None]:
         """Повертає nearest; якщо пусто — підсідає денними рівнями, тоді повторює запит.
 
         Args:
@@ -196,15 +193,13 @@ class LevelManager:
                 return self.get_nearest_levels(symbol, price)
         return s, r
 
-    # ──────────────────────────────────────────
-    # V2: мета, інкрементальне оновлення, допоміжні алгоритми
-    # ──────────────────────────────────────────
+    # V2: мета, інкрементальне оновлення та допоміжні алгоритми
 
     def update_meta(
         self,
         symbol: str,
-        atr_pct: Optional[float] = None,
-        tick_size: Optional[float] = None,
+        atr_pct: float | None = None,
+        tick_size: float | None = None,
     ) -> None:
         """Оновлює мета-параметри символу (для контролю ε і band).
 
@@ -223,9 +218,9 @@ class LevelManager:
     def update_from_bars(
         self,
         symbol: str,
-        df_1m: Optional[pd.DataFrame] = None,
-        df_5m: Optional[pd.DataFrame] = None,
-        df_1d: Optional[pd.DataFrame] = None,
+        df_1m: pd.DataFrame | None = None,
+        df_5m: pd.DataFrame | None = None,
+        df_1d: pd.DataFrame | None = None,
     ) -> None:
         """Інкрементальне оновлення «книги» рівнів із різних джерел.
 
@@ -253,7 +248,7 @@ class LevelManager:
         eps_rel = max(1e-12, atr_pct / 2.0 / 100.0)
 
         def _add_levels(
-            vals: List[float], src: str, tf: str, base_score: float, band: float
+            vals: list[float], src: str, tf: str, base_score: float, band: float
         ) -> None:
             for v in vals or []:
                 try:
@@ -320,13 +315,11 @@ class LevelManager:
         self._merge_close(sym, eps_rel=eps_rel)
         self._rescale_scores(sym)
 
-    # ──────────────────────────────────────────
     # Допоміжні алгоритми
-    # ──────────────────────────────────────────
 
     def _extract_pivots(
         self, highs: np.ndarray, lows: np.ndarray, win: int = 3
-    ) -> List[float]:
+    ) -> list[float]:
         """Витягує прості свінг-екстремуми.
 
         Args:
@@ -337,7 +330,7 @@ class LevelManager:
         Returns:
             Масив значень рівнів (float).
         """
-        piv: List[float] = []
+        piv: list[float] = []
         n = int(len(highs))
         if n <= (2 * win + 1):
             return piv
@@ -345,16 +338,16 @@ class LevelManager:
         for i in range(win, n - win):
             loc = slice(i - win, i + win + 1)
             h = highs[loc]
-            l = lows[loc]
+            l_arr = lows[loc]
             mid_h = highs[i]
             mid_l = lows[i]
             if mid_h == np.max(h):
                 piv.append(float(mid_h))
-            if mid_l == np.min(l):
+            if mid_l == np.min(l_arr):
                 piv.append(float(mid_l))
         return piv
 
-    def _volume_nodes(self, df: pd.DataFrame, bins: int = 50) -> List[float]:
+    def _volume_nodes(self, df: pd.DataFrame, bins: int = 50) -> list[float]:
         """Оцінює HVN за зваженою гістограмою ціни (вага = volume).
 
         Args:
@@ -379,7 +372,7 @@ class LevelManager:
         top_idx = np.argsort(hist)[-3:]
         return [float(centers[i]) for i in sorted(top_idx)]
 
-    def _anchored_vwap(self, df: pd.DataFrame) -> Tuple[float, float]:
+    def _anchored_vwap(self, df: pd.DataFrame) -> tuple[float, float]:
         """Обчислює Anchored VWAP і σ навколо нього (простий якор на вікні df)."""
         p = df["close"].to_numpy(dtype=float, copy=False)
         v = df["volume"].to_numpy(dtype=float, copy=False)
@@ -404,7 +397,7 @@ class LevelManager:
 
         # Сортуємо за значенням
         book.sort(key=lambda x: x.value)
-        merged: List[Level] = []
+        merged: list[Level] = []
         cur = book[0]
 
         for nxt in book[1:]:
@@ -445,7 +438,7 @@ class LevelManager:
 
     def _nearest_level_objs(
         self, symbol: str, price: float
-    ) -> Tuple[Optional[Level], Optional[Level]]:
+    ) -> tuple[Level | None, Level | None]:
         """Повертає найближчі об’єкти рівнів (з урахуванням ваг).
 
         Ефективна відстань: |Δ| / (1 + score).
@@ -467,22 +460,20 @@ class LevelManager:
 
     def _nearest_by_score(
         self, symbol: str, price: float
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> tuple[float | None, float | None]:
         """Адаптер: повертає значення рівнів (без об’єктів) із урахуванням ваг."""
         s_obj, r_obj = self._nearest_level_objs(symbol, price)
         return (s_obj.value if s_obj else None, r_obj.value if r_obj else None)
 
-    # ──────────────────────────────────────────
     # Додатково: коридор рівнів для контексту/ризику
-    # ──────────────────────────────────────────
 
     def get_corridor(
         self,
         symbol: str,
         price: float,
-        daily_low: Optional[float] = None,
-        daily_high: Optional[float] = None,
-    ) -> Dict[str, Optional[float]]:
+        daily_low: float | None = None,
+        daily_high: float | None = None,
+    ) -> dict[str, float | None]:
         """Формує «коридор» рівнів і базову довіру.
 
         Args:
@@ -579,7 +570,7 @@ class LevelManager:
 
     def evidence_around(
         self, symbol: str, price_level: float, pct_window: float = 0.12
-    ) -> Dict[str, int]:
+    ) -> dict[str, int]:
         """
         Повертає кількість рівнів кожного типу в діапазоні ±pct_window% від price_level.
         Використовується для наративу (чи є HVN/VWAP «кластери» поруч).
@@ -588,7 +579,7 @@ class LevelManager:
         book = self.level_book.get(sym, [])
         if not book or not isinstance(price_level, (int, float)):
             return {}
-        res: Dict[str, int] = {}
+        res: dict[str, int] = {}
         for lv in book:
             if lv.value <= 0:
                 continue

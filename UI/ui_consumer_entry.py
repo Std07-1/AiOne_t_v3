@@ -1,12 +1,12 @@
-# UI/ui_consumer_entry.py
-
 import asyncio
 import logging
 import os
+
 from rich.console import Console
 from rich.logging import RichHandler
 
-from UI.ui_consumer import UI_Consumer
+from config.config import REDIS_CHANNEL_ASSET_STATE
+from UI.ui_consumer import UIConsumer
 
 # ── Налаштування логування ─────────────────────────────────────────────────
 logger = logging.getLogger("ui_consumer_entry")
@@ -18,7 +18,7 @@ logger.propagate = False
 
 async def main():
     # Додаємо low_atr_threshold як у конструкторі UI_Consumer
-    ui = UI_Consumer(
+    ui = UIConsumer(
         vol_z_threshold=2.5, low_atr_threshold=0.005  # Додано новий параметр
     )
 
@@ -31,7 +31,7 @@ async def main():
             os.getenv("REDIS_URL")
             or f"redis://{os.getenv('REDIS_HOST','localhost')}:{os.getenv('REDIS_PORT','6379')}/0"
         ),
-        channel="asset_state_update",
+        channel=REDIS_CHANNEL_ASSET_STATE,
         refresh_rate=0.8,  # Оптимальна частота оновлення
         loading_delay=1.5,  # Скорочений час завантаження
         smooth_delay=0.05,  # Мінімальна затримка для плавності

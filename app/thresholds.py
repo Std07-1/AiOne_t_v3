@@ -9,17 +9,23 @@
 """
 
 from __future__ import annotations
+
 import json
 import logging
-import pandas as pd
 from datetime import timedelta
-from typing import Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any
 
+import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 
-from stage1.indicators.atr_indicator import ATRManager  # залишено для сумісності типів
 from config.config import CACHE_TTL_DAYS
+from config.TOP100_THRESHOLDS import get_top100_threshold
+
+if (
+    TYPE_CHECKING
+):  # pragma: no cover - лише для типів, щоб уникати імпорту під час рантайму
+    from stage1.indicators.atr_indicator import ATRManager  # noqa: F401
 
 # ───────────────────────────── Логування ─────────────────────────────
 log = logging.getLogger("app.thresholds")
@@ -36,9 +42,9 @@ class Thresholds:
         self,
         symbol: str,
         config: dict,  # Конфігурація передається ззовні
-        data: Optional[pd.DataFrame] = None,  # ігнорується (калібрування вимкнено)
-        atr_manager: Optional[ATRManager] = None,  # ігнорується
-        calibrated_params: Optional[Dict] = None,  # legacy (ігнорується)
+        data: pd.DataFrame | None = None,  # ігнорується (калібрування вимкнено)
+        atr_manager: ATRManager | None = None,  # ігнорується
+        calibrated_params: dict | None = None,  # legacy (ігнорується)
     ):
         """
         symbol: Біржовий символ (наприклад "BTCUSDT")
@@ -57,6 +63,13 @@ class Thresholds:
         )
         self.rsi_oversold = config.get("rsi_oversold", 30.0)
         self.rsi_overbought = config.get("rsi_overbought", 70.0)
+        # Додаткові параметри точності
+        self.min_atr_percent = config.get(
+            "min_atr_percent", config.get("atr_pct_min", 0.002)
+        )  # 0.2% за замовчуванням
+        self.vwap_deviation = config.get(
+            "vwap_deviation", config.get("vwap_deviation_threshold", 0.02)
+        )  # 2% за замовчуванням
 
         # Калібрування відключено – просто пост-обробка
         self._post_init()
@@ -71,13 +84,15 @@ class Thresholds:
         self.vol_z_threshold = round(self.vol_z_threshold, 1)
         self.rsi_oversold = round(self.rsi_oversold, 1)
         self.rsi_overbought = round(self.rsi_overbought, 1)
+        self.min_atr_percent = round(self.min_atr_percent, 4)
+        self.vwap_deviation = round(self.vwap_deviation, 4)
 
         # Гарантоване співвідношення high_gate > low_gate
         if self.high_gate <= self.low_gate:
             self.high_gate = self.low_gate * 1.5
 
     @classmethod
-    def from_mapping(cls, data: Dict) -> "Thresholds":
+    def from_mapping(cls, data: dict) -> Thresholds:
         """Створює Thresholds зі словника (symbol не передається у calibrated_params)"""
         symbol = data.get("symbol")
         # Перевірка наявності символу
@@ -87,7 +102,7 @@ class Thresholds:
             )
 
         # Видаляємо symbol із calibrated_params, щоб уникнути float('btcusdt')
-        params = {k: v for k, v in data.items() if k != "symbol"}
+        # (залишено як коментар: {k: v for k, v in data.items() if k != "symbol"})
 
         return cls(
             symbol=symbol,
@@ -111,12 +126,17 @@ class Thresholds:
                     "rsi_overbought", 74.0
                 ),  # Рівень перекупленості RSI (74%)
                 "atr_period": 14,  # Період ATR (14)
-                "min_atr_percent": 0.002,  # Мінімальний ATR у відсотках (0.002)
+                "min_atr_percent": data.get(
+                    "min_atr_percent", data.get("atr_pct_min", 0.002)
+                ),  # Мінімальний ATR у відсотках
+                "vwap_deviation": data.get(
+                    "vwap_deviation", data.get("vwap_deviation_threshold", 0.02)
+                ),  # Поріг відхилення від VWAP
             },
             calibrated_params=None,  # калібрування вимкнено
         )
 
-    def to_dict(self) -> Dict[str, Union[float, str]]:
+    def to_dict(self) -> dict[str, float | str]:
         """Повертає словник з каліброваними значеннями (symbol не повертається)"""
         return {
             "low_gate": self.low_gate,
@@ -125,6 +145,8 @@ class Thresholds:
             "vol_z_threshold": self.vol_z_threshold,
             "rsi_oversold": self.rsi_oversold,
             "rsi_overbought": self.rsi_overbought,
+            "min_atr_percent": self.min_atr_percent,
+            "vwap_deviation": self.vwap_deviation,
         }
 
 
@@ -149,6 +171,8 @@ async def save_thresholds(
             "vol_z_threshold": thr.vol_z_threshold,
             "rsi_oversold": thr.rsi_oversold,
             "rsi_overbought": thr.rsi_overbought,
+            "min_atr_percent": thr.min_atr_percent,
+            "vwap_deviation": thr.vwap_deviation,
             "symbol": symbol,
         },
         ensure_ascii=False,
@@ -176,9 +200,9 @@ async def save_thresholds(
 async def load_thresholds(
     symbol: str,
     cache_or_store: Any,
-    data: pd.DataFrame = pd.DataFrame(),
-    config: dict = {},
-    atr_manager: ATRManager = None,
+    data: pd.DataFrame | None = None,
+    config: dict | None = None,
+    atr_manager: ATRManager | None = None,
 ) -> Thresholds:
     if not symbol or not isinstance(symbol, str):
         raise ValueError("load_thresholds: Некоректний символ")
@@ -200,8 +224,21 @@ async def load_thresholds(
         except Exception as e:
             log.warning(f"[{symbol}] Помилка декодування thresholds: {e}")
 
-    # 2. Калібрування та calib-кеш видалені – перехід одразу до дефолтів
-    log.info(f"[{symbol}] Використання дефолтних порогів")
+    # 2. Калібрування та calib-кеш видалені – підтягуємо дефолти для Top100
+    top100_cfg = None
+    try:
+        top100_cfg = get_top100_threshold(symbol)
+    except Exception as e:
+        log.debug("TOP100 defaults fetch failed for %s: %s", symbol, e)
+
+    if top100_cfg:
+        log.info(f"[{symbol}] Використання TOP100 дефолтів порогів")
+        return Thresholds.from_mapping(top100_cfg)
+
+    # 3. Фолбек на загальні дефолти
+    log.info(f"[{symbol}] Використання загальних дефолтів порогів")
+    if config is None:
+        config = {}
     return Thresholds.from_mapping(
         {
             "symbol": symbol,
@@ -211,5 +248,7 @@ async def load_thresholds(
             "vol_z_threshold": config.get("vol_z_threshold", 1.2),
             "rsi_oversold": config.get("rsi_oversold", 30.0),
             "rsi_overbought": config.get("rsi_overbought", 70.0),
+            "min_atr_percent": config.get("min_atr_percent", 0.002),
+            "vwap_deviation": config.get("vwap_deviation", 0.02),
         }
     )

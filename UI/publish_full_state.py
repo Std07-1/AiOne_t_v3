@@ -6,9 +6,9 @@
     • збір та нормалізація стану (producer)
     • публікація / форматування для UI (цей модуль)
 
-Формат payload:
+Формат payload (type = REDIS_CHANNEL_ASSET_STATE):
     {
-        "type": "asset_state_update",
+        "type": REDIS_CHANNEL_ASSET_STATE,
         "meta": {"ts": ISO8601UTC},
         "counters": {"assets": N, "alerts": A},
         "assets": [ { ... нормалізовані поля ... } ]
@@ -23,42 +23,68 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Protocol
 
-from config.config import REDIS_SNAPSHOT_KEY
-from utils.utils import format_volume_usd, format_price as fmt_price_stage1
-
-# Ліниве імпортування лише для типів (уникаємо циклів)
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:  # pragma: no cover
-    from app.asset_state_manager import AssetStateManager
 from rich.console import Console
 from rich.logging import RichHandler
+
+from config.config import REDIS_CHANNEL_ASSET_STATE, REDIS_SNAPSHOT_KEY
+from utils.utils import format_price as fmt_price_stage1
+from utils.utils import format_volume_usd
 
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("ui.publish_full_state")
 if not logger.handlers:  # guard від повторної ініціалізації
+    logger.setLevel(logging.INFO)
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
-    logger.addHandler(logging.StreamHandler())
     logger.propagate = False
 
 
+class RedisLike(Protocol):
+    async def publish(
+        self, channel: str, message: str
+    ) -> int:  # pragma: no cover - типізація
+        ...
+
+    async def set(self, key: str, value: str) -> object:  # pragma: no cover - типізація
+        ...
+
+
+class AssetStateManagerProto(Protocol):
+    def get_all_assets(self) -> list[dict[str, Any]]:  # pragma: no cover - типізація
+        ...
+
+
 async def publish_full_state(
-    state_manager: "AssetStateManager", cache_handler: Any, redis_conn: Any
+    state_manager: AssetStateManagerProto, cache_handler: object, redis_conn: RedisLike
 ) -> None:
-    """
-        Публікує у Redis ОДНИМ повідомленням:
-            {
-                "meta": {...},
-                "counters": {"assets": N, "alerts": A},
-                "assets": [ ... рядки таблиці ... ]
-            }
-    UI може брати заголовок зі counters, а таблицю — з assets.
+    """Публікує агрегований стан активів у Redis одним повідомленням.
+
+    Формат payload (type = REDIS_CHANNEL_ASSET_STATE):
+        {
+            "type": REDIS_CHANNEL_ASSET_STATE,
+            "meta": {"ts": ISO8601UTC},
+            "counters": {"assets": N, "alerts": A},
+            "assets": [ ... нормалізовані поля ... ]
+        }
+
+    UI може брати заголовок зі ``counters``, а таблицю — з ``assets``.
+
+    Args:
+        state_manager: Постачальник станів активів (має метод ``get_all_assets()``).
+        cache_handler: Резервний параметр для майбутнього кешу (не використовується).
+        redis_conn: Підключення до Redis із методами ``publish`` та ``set``.
+
+    Returns:
+        None: Побічно публікує повідомлення у канал і зберігає снапшот у Redis.
+
+    Raises:
+        Винятки драйвера Redis або серіалізації зазвичай перехоплюються та логуються,
+        оскільки виконання обгорнуто у блок ``try`` (best‑effort).
     """
     try:
         all_assets = state_manager.get_all_assets()  # список dict
-        serialized_assets: List[Dict[str, Any]] = []
+        serialized_assets: list[dict[str, Any]] = []
 
         for asset in all_assets:
             # Захист: stats має бути dict
@@ -78,7 +104,7 @@ async def publish_full_state(
 
             # ціна для UI: форматування виконується нижче через fmt_price_stage1
 
-            # нормалізуємо базові статс
+            # нормалізуємо базові статс (лише якщо ключ існує; не вводимо штучні 0.0)
             if "stats" in asset:
                 for stat_key in [
                     "current_price",
@@ -91,28 +117,35 @@ async def publish_full_state(
                 ]:
                     if stat_key in asset["stats"]:
                         try:
+                            val = asset["stats"][stat_key]
                             asset["stats"][stat_key] = (
-                                float(asset["stats"][stat_key])
-                                if asset["stats"][stat_key] not in [None, "", "NaN"]
-                                else 0.0
+                                float(val) if val not in [None, "", "NaN"] else None
                             )
                         except (TypeError, ValueError):  # narrow: очікувана валідація
-                            asset["stats"][stat_key] = 0.0
+                            asset["stats"][stat_key] = None
 
             # ── UI flattening layer ────────────────────────────────────────
             stats = asset.get("stats") or {}
             # Уніфіковані кореневі ключі, щоб UI не мав додаткових мапперів
+            # Ціну виставляємо ТІЛЬКИ якщо вона валідна (>0); інакше не створюємо поля
             if "price" not in asset:
                 cp = stats.get("current_price")
-                if isinstance(cp, (int, float)):
-                    asset["price"] = float(cp)
-            # Форматовані рядкові версії (для UI без повторного форматування)
-            if "price_str" not in asset:
                 try:
-                    if isinstance(asset.get("price"), (int, float)):
-                        asset["price_str"] = fmt_price_stage1(
-                            float(asset["price"]), str(asset.get("symbol", "")).lower()
-                        )
+                    cp_f = float(cp) if cp is not None else None
+                except Exception:
+                    cp_f = None
+                if cp_f is not None and cp_f > 0:
+                    asset["price"] = cp_f
+            # Форматовані рядкові версії (для UI без повторного форматування)
+            if (
+                "price_str" not in asset
+                and isinstance(asset.get("price"), (int, float))
+                and asset.get("price", 0) > 0
+            ):
+                try:
+                    asset["price_str"] = fmt_price_stage1(
+                        float(asset["price"]), str(asset.get("symbol", "")).lower()
+                    )
                 except Exception:  # broad except: форматування ціни не критичне
                     pass
             # Raw volume_mean (кількість контрактів/штук) → зберігаємо як raw_volume
@@ -123,12 +156,20 @@ async def publish_full_state(
             # Обчислюємо оборот у USD (notional) = raw_volume * current_price
             if "volume" not in asset:
                 cp_val = stats.get("current_price")
-                if isinstance(asset.get("raw_volume"), (int, float)) and isinstance(
-                    cp_val, (int, float)
+                try:
+                    cp_f = float(cp_val) if cp_val is not None else None
+                except Exception:
+                    cp_f = None
+                if (
+                    isinstance(asset.get("raw_volume"), (int, float))
+                    and cp_f is not None
+                    and cp_f > 0
                 ):
-                    asset["volume"] = float(asset["raw_volume"]) * float(cp_val)
-            if "volume_str" not in asset and isinstance(
-                asset.get("volume"), (int, float)
+                    asset["volume"] = float(asset["raw_volume"]) * float(cp_f)
+            if (
+                "volume_str" not in asset
+                and isinstance(asset.get("volume"), (int, float))
+                and float(asset.get("volume") or 0) > 0
             ):
                 try:
                     asset["volume_str"] = format_volume_usd(float(asset["volume"]))
@@ -138,14 +179,25 @@ async def publish_full_state(
             if "atr_pct" not in asset:
                 atr_v = stats.get("atr")
                 cp = stats.get("current_price")
-                if (
-                    isinstance(atr_v, (int, float))
-                    and isinstance(cp, (int, float))
-                    and cp
-                ):
-                    asset["atr_pct"] = float(atr_v) / float(cp) * 100.0
-            if "rsi" not in asset and isinstance(stats.get("rsi"), (int, float)):
-                asset["rsi"] = float(stats.get("rsi"))
+                try:
+                    atr_f = float(atr_v) if atr_v is not None else None
+                except Exception:
+                    atr_f = None
+                try:
+                    cp_f = float(cp) if cp is not None else None
+                except Exception:
+                    cp_f = None
+                if atr_f is not None and cp_f is not None and cp_f > 0:
+                    asset["atr_pct"] = float(atr_f) / float(cp_f) * 100.0
+            # rsi додаємо лише якщо воно дійсно присутнє у stats і це число
+            if "rsi" not in asset:
+                rsi_v = stats.get("rsi")
+                try:
+                    rsi_f = float(rsi_v) if rsi_v is not None else None
+                except Exception:
+                    rsi_f = None
+                if rsi_f is not None:
+                    asset["rsi"] = rsi_f
             # status: перераховуємо щоразу, щоб не застрягав у 'init'
             status_val = asset.get("state")
             if isinstance(status_val, dict):  # захист
@@ -164,8 +216,8 @@ async def publish_full_state(
             sl_ok = isinstance(sl, (int, float)) and sl not in [None, 0]
             try:
                 sym = str(asset.get("symbol", "")).lower()
-                fmt_tp = fmt_price_stage1(float(tp), sym) if tp_ok else None
-                fmt_sl = fmt_price_stage1(float(sl), sym) if sl_ok else None
+                fmt_tp = fmt_price_stage1(float(tp or 0.0), sym) if tp_ok else None
+                fmt_sl = fmt_price_stage1(float(sl or 0.0), sym) if sl_ok else None
             except Exception:
                 fmt_tp = str(tp) if tp_ok else None
                 fmt_sl = str(sl) if sl_ok else None
@@ -209,7 +261,7 @@ async def publish_full_state(
                     pass
 
         payload = {
-            "type": "asset_state_update",
+            "type": REDIS_CHANNEL_ASSET_STATE,
             "meta": {"ts": datetime.utcnow().isoformat() + "Z"},
             "counters": counters,
             "assets": serialized_assets,
@@ -230,12 +282,14 @@ async def publish_full_state(
             pass
 
         payload_json = json.dumps(payload, default=str)
-        await redis_conn.publish("asset_state_update", payload_json)
+        await redis_conn.publish(REDIS_CHANNEL_ASSET_STATE, payload_json)
         # Зберігаємо снапшот останнього повного стану (для швидкого старту UI)
         try:
             await redis_conn.set(REDIS_SNAPSHOT_KEY, payload_json)
         except Exception:  # broad except: snapshot optional
-            logger.debug("Не вдалося записати asset_state_snapshot", exc_info=True)
+            logger.debug(
+                "Не вдалося записати snapshot key=%s", REDIS_SNAPSHOT_KEY, exc_info=True
+            )
         logger.info(f"✅ Опубліковано стан {len(serialized_assets)} активів")
 
     except Exception as e:  # broad except: публікація best-effort
@@ -243,3 +297,4 @@ async def publish_full_state(
 
 
 __all__ = ["publish_full_state"]
+# -*- coding: utf-8 -*-

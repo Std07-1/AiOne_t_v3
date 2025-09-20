@@ -9,12 +9,12 @@
     • flush_now        — примусовий дренаж write-behind черги
 """
 
-import json
 import asyncio
+import json
 import logging
 import os
 import time
-from typing import Any, Dict
+from typing import Any
 
 import psutil
 from rich.console import Console
@@ -34,7 +34,7 @@ class DataStoreAdmin:
         self.redis = redis
         self.cfg = cfg
 
-    async def dump_status(self) -> Dict[str, Any]:
+    async def dump_status(self) -> dict[str, Any]:
         p = psutil.Process(os.getpid())
         rss = p.memory_info().rss
         cpu = p.cpu_percent(interval=0.1)
@@ -93,7 +93,11 @@ async def admin_command_loop(admin: DataStoreAdmin):
                 logger.warning("[ADMIN] set_profile → %s", prof)
             elif op == "set_priority":
                 sym = cmd.get("symbol")
-                lvl = int(cmd.get("level", 1))
+                lvl_raw = cmd.get("level", 1)
+                try:
+                    lvl = int(lvl_raw)
+                except Exception:
+                    lvl = 1
                 admin.store.set_priority(sym, lvl)
                 logger.info("[ADMIN] set_priority %s → %s", sym, lvl)
             elif op == "flush_now":

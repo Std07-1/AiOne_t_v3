@@ -14,10 +14,11 @@
 """
 
 import logging
+from typing import Any
+
+import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
-import pandas as pd
-from typing import Any
 
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.utils.helper")
@@ -27,8 +28,8 @@ if not logger.handlers:
     logger.propagate = False
 
 
-def buffer_to_dataframe(RAMBuffer, symbol: str, limit: int = 500) -> pd.DataFrame:
-    rows = RAMBuffer.get(symbol, "1m", limit)  # ← ПРАВИЛЬНО: RAMBuffer.get(...)
+def buffer_to_dataframe(ram_buffer, symbol: str, limit: int = 500) -> pd.DataFrame:
+    rows = ram_buffer.get(symbol, "1m", limit)  # ← ПРАВИЛЬНО: RAMBuffer.get(...)
     if not rows:
         return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
     df = pd.DataFrame(rows)[["timestamp", "open", "high", "low", "close", "volume"]]
@@ -40,9 +41,12 @@ def buffer_to_dataframe(RAMBuffer, symbol: str, limit: int = 500) -> pd.DataFram
 async def store_to_dataframe(
     store, symbol: str, interval: str = "1m", limit: int = 500
 ) -> pd.DataFrame:
-    """Отримує бари з UnifiedDataStore і повертає DataFrame у форматі time,open,high,low,close,volume.
+    """
+    Отримує бари з UnifiedDataStore і повертає DataFrame у форматі
+    time,open,high,low,close,volume.
 
-    store.get_df повертає DataFrame з колонками open_time,...; конвертуємо у старий формат для сумісності.
+    store.get_df повертає DataFrame з колонками open_time,...;
+    конвертуємо у старий формат для сумісності.
     """
     try:
         df = await store.get_df(symbol, interval, limit=limit)
@@ -61,7 +65,8 @@ async def store_to_dataframe(
             df[c] = 0.0
     out = df[needed].tail(limit).copy()
     out = out.dropna().reset_index(drop=True)
-    return out
+    # mypy: ensure return type is DataFrame
+    return pd.DataFrame(out)
 
 
 def resample_5m(df_1m: pd.DataFrame) -> pd.DataFrame:
@@ -79,15 +84,16 @@ def resample_5m(df_1m: pd.DataFrame) -> pd.DataFrame:
 
     o = df["open"].resample("5min").first()
     h = df["high"].resample("5min").max()
-    l = df["low"].resample("5min").min()
+    low_5m = df["low"].resample("5min").min()
     c = df["close"].resample("5min").last()
     v = df["volume"].resample("5min").sum()
 
-    out = pd.concat([o, h, l, c, v], axis=1).dropna()
+    out = pd.concat([o, h, low_5m, c, v], axis=1).dropna()
     out = out.reset_index()
     # повертаємо time знову у мілісекундах
     out["time"] = out["time"].astype("int64") // 10**6
-    out.columns = ["time", "open", "high", "low", "close", "volume"]
+    # Використовуємо pd.Index для сумісності з типізацією pandas
+    out.columns = pd.Index(["time", "open", "high", "low", "close", "volume"])
     return out
 
 

@@ -2,12 +2,16 @@
 
 Призначення:
     * Єдина точка доступу до історичних барів для модуля `episodes` (та тестів).
-    * Обгортає асинхронний `OptimizedDataFetcher` у синхронні функції (`fetch_bars`, `load_bars_auto`).
-    * Забезпечує правильний DatetimeIndex, обрізання до `limit` та стабільний порядок колонок.
+    * Обгортає асинхронний `OptimizedDataFetcher` у синхронні функції
+      (`fetch_bars`, `load_bars_auto`).
+    * Забезпечує правильний DatetimeIndex, обрізання до `limit` та стабільний
+      порядок колонок.
 
 Особливості:
-    * Лінива ініціалізація singleton fetcher + aiohttp.ClientSession з atexit teardown.
-    * Використання локального snapshot/кешу (через raw_data fetcher) з параметрами read_cache/write_cache.
+    * Лінива ініціалізація singleton fetcher + aiohttp.ClientSession з atexit
+      teardown.
+    * Використання локального snapshot/кешу (через raw_data fetcher) з параметрами
+      read_cache/write_cache.
     * Без логіки повторних спроб тут – retry/бекоф реалізуються всередині fetcher.
 
 Функції:
@@ -21,17 +25,18 @@ Contracts / Postconditions:
 """
 
 from __future__ import annotations
-import asyncio
-from typing import Optional
-import pandas as pd
-import aiohttp  # type: ignore
 
-from data.raw_data import OptimizedDataFetcher  # type: ignore
+import asyncio
 import logging
 
+import aiohttp
+import pandas as pd
+
+from data.raw_data import OptimizedDataFetcher
+
 try:
-    from rich.console import Console  # type: ignore
-    from rich.logging import RichHandler  # type: ignore
+    from rich.console import Console
+    from rich.logging import RichHandler
 
     _HAS_RICH = True
 except ImportError:  # pragma: no cover
@@ -41,7 +46,7 @@ logger = logging.getLogger("ep2.data_loader")
 if not logger.handlers:
     logger.setLevel(logging.INFO)
     if _HAS_RICH:
-        h = RichHandler(console=Console(stderr=True), show_path=False)  # type: ignore[arg-type]
+        h = RichHandler(console=Console(stderr=True), show_path=False)
     else:
         h = logging.StreamHandler()
         h.setFormatter(
@@ -50,8 +55,8 @@ if not logger.handlers:
     logger.addHandler(h)
     logger.propagate = False
 
-_FETCHER_SINGLETON: Optional[OptimizedDataFetcher] = None
-_FETCH_LOOP: Optional[asyncio.AbstractEventLoop] = None
+_FETCHER_SINGLETON: OptimizedDataFetcher | None = None
+_FETCH_LOOP: asyncio.AbstractEventLoop | None = None
 
 
 def _get_fetch_loop() -> asyncio.AbstractEventLoop:

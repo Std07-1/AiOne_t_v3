@@ -34,8 +34,6 @@
 # - Додавайте короткий опис (докстрінг) до кожного тесту: що саме тестує, який edge-case ловить
 # - Оновлюйте цей docstring і коментарі при зміні шаблонів/логіки!
 
-import math
-import pytest
 from QDE.quantum_decision_engine import QuantumDecisionEngine
 
 

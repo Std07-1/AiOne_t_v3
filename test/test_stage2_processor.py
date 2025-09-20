@@ -1,4 +1,4 @@
-"""
+r"""
 Модуль тестування Stage2Processor для трейдингової системи AiOne_t
 
 Містить сценарні тести, де явно задаються:
@@ -35,12 +35,14 @@ pytest test_stage2_processor.py -v
 4. Додаткове рандомізоване тестування для виявлення несподіваних помилок
 """
 
-import pytest
-import random
 import logging
+import random
 from unittest.mock import MagicMock
-from stage2.processor import Stage2Processor
+
+import pytest
+
 from stage2.level_manager import LevelManager
+from stage2.processor import Stage2Processor
 
 # Налаштування логування для тестів
 logging.basicConfig(level=logging.ERROR)
@@ -262,7 +264,7 @@ async def test_controlled_scenarios(processor, test_case):
     result = await processor.process(test_case["input_signal"])
 
     # Перевіряємо сценарій
-    if test_case["expected_scenario"] != "ERROR":
+    if test_case.get("expected_scenario", "ERROR") != "ERROR":
         assert "market_context" in result
         assert result["market_context"]["scenario"] == test_case["expected_scenario"]
 

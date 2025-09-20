@@ -1,8 +1,7 @@
 import asyncio
-import time
 import sys
+import time
 from pathlib import Path
-from typing import List
 
 import aiohttp
 import pandas as pd
@@ -12,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from data.raw_data import OptimizedDataFetcher
+from data.raw_data import OptimizedDataFetcher  # noqa: E402
 
 # Simple helper to run async in sync context for tests
 
@@ -37,12 +36,13 @@ async def fetch_and_check(symbol: str, interval: str, limit: int):
     async with aiohttp.ClientSession() as sess:
         fetcher = OptimizedDataFetcher(session=sess)
         df = await fetcher.get_data(symbol, interval, limit=limit)
+        assert df is not None
         _validate_df(df, symbol, interval, limit)
         return len(df)
 
 
 async def main():
-    symbols: List[str] = ["BTCUSDT", "ETHUSDT"]
+    symbols: list[str] = ["BTCUSDT", "ETHUSDT"]
     intervals = ["1m", "5m"]
     limits = [
         1200,

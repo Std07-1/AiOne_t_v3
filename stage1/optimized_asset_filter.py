@@ -17,16 +17,14 @@
 
 from __future__ import annotations
 
-from typing import List
+import logging
 
 import aiohttp
+from rich.console import Console
+from rich.logging import RichHandler
 
 from config.config import FilterParams
 from stage1.binance_future_asset_filter import BinanceFutureAssetFilter
-import logging
-
-from rich.console import Console
-from rich.logging import RichHandler
 
 # ── Налаштування логування ─────────────────────────────────────────────────
 logger = logging.getLogger("optimized_asset_filter")
@@ -47,7 +45,7 @@ async def get_filtered_assets(
     min_atr: float = 0.5,
     max_symbols: int = 30,
     dynamic: bool = False,
-) -> List[str]:
+) -> list[str]:
     """
     Публічний інтерфейс для отримання відфільтрованих активів Binance USDT-M Futures.
     Виконує всі етапи фільтрації через BinanceFutureAssetFilter.
@@ -91,14 +89,20 @@ async def get_filtered_assets(
     return result
 
 
-async def get_filter_metrics() -> dict:
+async def get_filter_metrics() -> dict[str, object]:
     """
     Отримання метрик останнього запуску фільтрації для налагодження.
     :return: dict з метриками, якщо доступні
     """
     logger.debug("[STEP] Запит метрик фільтрації")
-    if hasattr(BinanceFutureAssetFilter, "last_metrics"):
+    if getattr(BinanceFutureAssetFilter, "last_metrics", None) is not None:
         logger.debug("[EVENT] Метрики знайдено у класі BinanceFutureAssetFilter")
-        return BinanceFutureAssetFilter.last_metrics
+        lm = BinanceFutureAssetFilter.last_metrics
+        if isinstance(lm, dict):
+            return lm
+        try:
+            return lm.dict()  # type: ignore[union-attr]
+        except Exception:
+            return {}
     logger.debug("[EVENT] Метрики не знайдено")
     return {}

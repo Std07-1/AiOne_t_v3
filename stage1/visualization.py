@@ -11,24 +11,20 @@
 - `print_stages`: виводить етапи фільтрації
 """
 
+from typing import Any  # noqa: F401
 
-from utils.utils import format_open_interest, format_volume_usd
-
-from rich.table import Table
 from rich.box import SIMPLE
-
-from typing import List
+from rich.console import Console
+from rich.table import Table
 
 from config.config import FilterParams, MetricResults
-
-from rich.console import Console
-
+from utils.utils import format_open_interest, format_volume_usd
 
 # Глобальний консоль для зручності
 console = Console()
 
 
-def print_results(result: List[str], metrics: MetricResults):
+def print_results(result: list[str], metrics: MetricResults):
     """
     Виводить результати фільтрації у зручному форматі.
     :param results: список відфільтрованих символів

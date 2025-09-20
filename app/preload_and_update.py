@@ -10,18 +10,19 @@
 
 import asyncio
 import logging
-import pandas as pd
-import aiohttp
-from stage1.optimized_asset_filter import get_filtered_assets
-from config.config import (
-    PRELOAD_1M_LOOKBACK_INIT,
-    SCREENING_LOOKBACK,
-    PRELOAD_DAILY_DAYS,
-    PREFILTER_INTERVAL_SEC,
-)
 
+import aiohttp
+import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
+
+from config.config import (
+    PREFILTER_INTERVAL_SEC,
+    PRELOAD_1M_LOOKBACK_INIT,
+    PRELOAD_DAILY_DAYS,
+    SCREENING_LOOKBACK,
+)
+from stage1.optimized_asset_filter import get_filtered_assets
 
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.preload")
@@ -114,8 +115,14 @@ async def _fetch_klines(
     symbol: str, interval: str, limit: int, session: aiohttp.ClientSession
 ):
     url = "https://fapi.binance.com/fapi/v1/klines"
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-    async with session.get(url, params=params, timeout=15) as resp:
+    params: dict[str, str | int] = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "limit": int(limit),
+    }
+    async with session.get(
+        url, params=params, timeout=aiohttp.ClientTimeout(total=15)
+    ) as resp:
         resp.raise_for_status()
         data = await resp.json()
     cols = [
@@ -132,9 +139,7 @@ async def _fetch_klines(
         "taker_buy_quote",
         "ignore",
     ]
-    import pandas as _pd
-
-    df = _pd.DataFrame(data, columns=cols)
+    df = pd.DataFrame(data, columns=cols)
     for c in [
         "open",
         "high",
@@ -228,7 +233,8 @@ async def preload_1m_history(
     stats["_aggregate"] = {
         "symbols": len(stats),
         "total_loaded": total_loaded,
-        "avg_loaded": total_loaded / max(1, len(stats)),
+        # округлюємо до найближчого int для відповідності типу
+        "avg_loaded": int(round(total_loaded / max(1, len(stats)))),
     }
     return stats
 

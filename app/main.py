@@ -15,62 +15,63 @@
 """
 
 import asyncio
+import json
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
-from redis.asyncio import Redis
-import subprocess
 import aiohttp
 from dotenv import load_dotenv
-
-# ─────────────────────────── Імпорти бізнес-логіки ───────────────────────────
-from data.ws_worker import WSWorker
-
-# UnifiedDataStore now the single source of truth
-from data.unified_store import UnifiedDataStore, StoreConfig, StoreProfile
-from app.settings import load_datastore_cfg, DataStoreCfg
-
-from stage1.asset_monitoring import AssetMonitorStage1
-from app.screening_producer import screening_producer
-from UI.publish_full_state import publish_full_state
-from .preload_and_update import (
-    preload_1m_history,
-    preload_daily_levels,
-    periodic_prefilter_and_update,
-)
-from UI.ui_consumer import UI_Consumer
-from stage1.optimized_asset_filter import get_filtered_assets
-from stage3.trade_manager import TradeLifecycleManager
-from stage3.trade_manager_updater import trade_manager_updater
-from app.settings import settings
+from redis.asyncio import Redis
 from rich.console import Console
 from rich.logging import RichHandler
-from app.screening_producer import AssetStateManager
+
+from app.screening_producer import AssetStateManager, screening_producer
+from app.settings import DataStoreCfg, load_datastore_cfg, settings
+from app.utils.helper import (
+    estimate_atr_pct,
+    resample_5m,
+    store_to_dataframe,
+)
 from config.config import (
-    STAGE2_CONFIG,  # (залишаємо якщо ще потрібні switch'і Stage2)
-    STAGE1_PREFILTER_THRESHOLDS,
+    FAST_SYMBOLS_TTL_AUTO,
+    FAST_SYMBOLS_TTL_MANUAL,
     MANUAL_FAST_SYMBOLS_SEED,
-    USER_SETTINGS_DEFAULT,
+    PREFILTER_BASE_PARAMS,
+    PREFILTER_INTERVAL_SEC,
     PRELOAD_1M_LOOKBACK_INIT,
     PRELOAD_DAILY_DAYS,
     SCREENING_LOOKBACK,
-    FAST_SYMBOLS_TTL_MANUAL,
-    FAST_SYMBOLS_TTL_AUTO,
-    PREFILTER_INTERVAL_SEC,
     STAGE1_MONITOR_PARAMS,
-    PREFILTER_BASE_PARAMS,
+    STAGE1_PREFILTER_THRESHOLDS,
+    STAGE2_CONFIG,  # (залишаємо якщо ще потрібні switch'і Stage2)
+    USER_SETTINGS_DEFAULT,
 )
-from stage2.level_manager import LevelManager
+
+# UnifiedDataStore now the single source of truth
+from data.unified_store import StoreConfig, StoreProfile, UnifiedDataStore
+
+# ─────────────────────────── Імпорти бізнес-логіки ───────────────────────────
+from data.ws_worker import WSWorker
+from monitoring.transcript_recorder import TranscriptConfig, TranscriptRecorder
+from stage1.asset_monitoring import AssetMonitorStage1
 from stage1.indicators import calculate_global_levels
-from app.utils.helper import (
-    resample_5m,
-    estimate_atr_pct,
-    store_to_dataframe,
-)
+from stage1.optimized_asset_filter import get_filtered_assets
+from stage2.level_manager import LevelManager
+from stage3.trade_manager import TradeLifecycleManager
+from stage3.trade_manager_updater import trade_manager_updater
+from UI.publish_full_state import publish_full_state
+from UI.ui_consumer import UIConsumer
 from utils.utils import get_tick_size
+
 from .admin import DataStoreAdmin, admin_command_loop
+from .preload_and_update import (
+    periodic_prefilter_and_update,
+    preload_1m_history,
+    preload_daily_levels,
+)
 
 # Завантажуємо налаштування з .env
 load_dotenv()
@@ -83,7 +84,8 @@ if not logger.handlers:  # захист від повторної ініціал
     logger.propagate = False
 
 
-# (FastAPI вилучено) — якщо потрібен REST інтерфейс у майбутньому, повернемо створення app/router
+# (FastAPI вилучено) — якщо потрібен REST інтерфейс у майбутньому,
+# повернемо створення app/router
 
 # ───────────────────────────── Глобальні змінні модуля ─────────────────────────────
 # Єдиний інстанс UnifiedDataStore (створюється в bootstrap)
@@ -142,13 +144,42 @@ async def bootstrap() -> UnifiedDataStore:
     store = UnifiedDataStore(redis=redis, cfg=store_cfg)
     await store.start_maintenance()
     logger.info("[Launch] UnifiedDataStore maintenance loop started")
+    # Опційний запуск TranscriptRecorder (стенограми) через змінну середовища
+    if os.getenv("MONITOR_TRANSCRIPT", "0") in ("1", "true", "True"):
+        try:
+            raw = os.getenv("MONITOR_SYMBOLS", "").lower()
+            allowed = [s.strip() for s in raw.split(",") if s.strip()]
+            allowed_set = set(allowed)
+            tr_cfg = TranscriptConfig(
+                base_dir=cfg.base_dir, allowed_symbols=allowed_set or None
+            )
+            store.transcript = TranscriptRecorder(tr_cfg)  # type: ignore[attr-defined]
+            await store.transcript.start()  # type: ignore[attr-defined]
+            try:
+                # Діагностика: зафіксувати старт і whitelist символів у стенограмі
+                store.transcript.log_meta(  # type: ignore[attr-defined]
+                    started=True,
+                    allowed_symbols=list(allowed_set) if allowed_set else None,
+                )
+            except Exception:
+                pass
+            logger.info("[Launch] Transcript recorder enabled")
+        except Exception:
+            logger.warning("Transcript recorder initialization failed", exc_info=True)
     # adapters removed – use store directly
 
     prom_started = start_prometheus_if_enabled(cfg)
     if prom_started:
         logger.info("[Launch] Prometheus metrics server on :%s", cfg.prometheus.port)
-    admin = DataStoreAdmin(store, store.redis, cfg)
-    asyncio.create_task(admin_command_loop(admin))
+    if getattr(cfg.admin, "enabled", True):
+        admin = DataStoreAdmin(store, store.redis, cfg)
+        asyncio.create_task(admin_command_loop(admin))
+        logger.info(
+            "[Launch] Admin command loop started (channel=%s)",
+            cfg.admin.commands_channel,
+        )
+    else:
+        logger.info("[Launch] Admin command loop disabled via settings")
     asyncio.create_task(health_pinger(store.metrics, cfg))
     asyncio.create_task(event_loop_lag_sampler())
     logger.info("[Launch] Admin command loop + health pinger started")
@@ -173,7 +204,7 @@ def start_prometheus_if_enabled(cfg: DataStoreCfg) -> bool:
         return False
 
 
-async def health_pinger(metrics, cfg) -> None:
+async def health_pinger(metrics: object, cfg: DataStoreCfg) -> None:
     """Проста періодична інкрементація лічильника для моніторингу життєздатності."""
     while True:
         try:
@@ -189,10 +220,12 @@ async def health_pinger(metrics, cfg) -> None:
 
 
 async def event_loop_lag_sampler(interval: float = 0.5) -> None:
-    """Періодично вимірює лаг планування event loop та експортує histogram event_loop_lag_seconds.
+    """Періодично вимірює лаг планування event loop та експортує
+    histogram event_loop_lag_seconds.
 
-    Лаг = (фактичний інтервал між циклами) - interval якщо позитивний. Негативні/нульові ігноруємо.
-    Використовується кастомний набір бакетів для коротких затримок.
+    Лаг = (фактичний інтервал між циклами) - interval якщо позитивний.
+    Негативні/нульові ігноруємо. Використовується кастомний набір бакетів
+    для коротких затримок.
     """
     try:
         from prometheus_client import Histogram  # type: ignore
@@ -286,7 +319,7 @@ def validate_settings() -> None:
 # Legacy init_system removed (UnifiedDataStore handles Redis connection)
 
 
-async def noop_healthcheck():
+async def noop_healthcheck() -> None:
     """Легкий healthcheck-плейсхолдер (RAMBuffer видалено)."""
     while True:
         await asyncio.sleep(120)
@@ -321,7 +354,8 @@ async def run_pipeline() -> None:
     # 2. Створюємо довгоживу ClientSession
     session = aiohttp.ClientSession()
     try:
-        # Preload функції тепер працюють без окремого fetcher — прямі HTTP виклики через session
+        # Preload функції тепер працюють без окремого fetcher —
+        # прямі HTTP виклики через session
 
         # ===== НОВА ЛОГІКА ВИБОРУ РЕЖИМУ =====
         use_manual_list = (
@@ -344,10 +378,10 @@ async def run_pipeline() -> None:
                 min_quote_vol=thresholds["MIN_QUOTE_VOLUME"],
                 min_price_change=thresholds["MIN_PRICE_CHANGE"],
                 min_oi=thresholds["MIN_OPEN_INTEREST"],
-                min_depth=PREFILTER_BASE_PARAMS["min_depth"],
-                min_atr=PREFILTER_BASE_PARAMS["min_atr"],
-                max_symbols=thresholds["MAX_SYMBOLS"],
-                dynamic=PREFILTER_BASE_PARAMS["dynamic"],
+                min_depth=float(PREFILTER_BASE_PARAMS["min_depth"]),
+                min_atr=float(PREFILTER_BASE_PARAMS["min_atr"]),
+                max_symbols=int(thresholds["MAX_SYMBOLS"]),
+                dynamic=bool(PREFILTER_BASE_PARAMS["dynamic"]),
             )
 
             fast_symbols = [s.lower() for s in fast_symbols]
@@ -362,7 +396,9 @@ async def run_pipeline() -> None:
             return
 
         logger.info(
-            f"[Main] Початковий список символів: {fast_symbols} (кількість: {len(fast_symbols)})"
+            "[Main] Початковий список символів: %s (кількість: %s)",
+            fast_symbols,
+            len(fast_symbols),
         )
 
         # Preload історії
@@ -402,27 +438,61 @@ async def run_pipeline() -> None:
 
         # Ініціалізація AssetMonitorStage1
         logger.info("[Main] Ініціалізуємо AssetMonitorStage1...")
+
+        async def on_alert_stage2(signal: dict) -> None:
+            try:
+                from stage2.level_manager import LevelManager
+                from stage2.processor import Stage2Processor
+
+                proc = Stage2Processor(
+                    timeframe="1m",
+                    state_manager=state_manager,
+                    level_manager=level_manager or LevelManager(),
+                    user_lang=user_settings["lang"],
+                    user_style=user_settings["style"],
+                )
+                result = await proc.process(signal)
+                # Merge back key fields to state
+                update = {
+                    "stage2": True,
+                    "stage2_status": "COMPLETED",
+                    "last_updated": result.get("processing_time"),
+                    "recommendation": result.get("recommendation"),
+                    "market_context": result.get("market_context"),
+                    "risk_parameters": result.get("risk_parameters"),
+                    "confidence_metrics": result.get("confidence_metrics"),
+                    "narrative": result.get("narrative"),
+                }
+                state_manager.update_asset(signal["symbol"], update)
+            except Exception as _e:
+                logger.debug("Stage2 on_alert callback failed: %s", _e)
+
         monitor = AssetMonitorStage1(
             cache_handler=ds,
             state_manager=state_manager,
             feature_switches=stage2_config.get("switches"),
-            **{
-                k: v
-                for k, v in STAGE1_MONITOR_PARAMS.items()
-                if k
-                in {
-                    "vol_z_threshold",
-                    "rsi_overbought",
-                    "rsi_oversold",
-                    "min_reasons_for_alert",
-                    "dynamic_rsi_multiplier",
-                }
-            },
+            vol_z_threshold=float(STAGE1_MONITOR_PARAMS.get("vol_z_threshold", 2.0)),
+            rsi_overbought=STAGE1_MONITOR_PARAMS.get("rsi_overbought"),
+            rsi_oversold=STAGE1_MONITOR_PARAMS.get("rsi_oversold"),
+            min_reasons_for_alert=int(
+                STAGE1_MONITOR_PARAMS.get("min_reasons_for_alert", 2)
+            ),
+            dynamic_rsi_multiplier=float(
+                STAGE1_MONITOR_PARAMS.get("dynamic_rsi_multiplier", 1.1)
+            ),
+            on_alert=on_alert_stage2,
         )
+        # Надаємо доступ до монітора через store для WSWorker reactive hook
+        try:
+            # безпечніше пряме присвоєння, аніж setattr (ruff B010)
+            ds.stage1_monitor = monitor  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
         # ── Виконуємо фон-воркери ──────────────────────────────────────────
         # WSWorker still legacy; will be refactored to use store (task 5)
-        # WSWorker v2 (selectors_key configurable, intervals_ttl for legacy blob TTL overrides)
+        # WSWorker v2 (selectors_key configurable,
+        # intervals_ttl for legacy blob TTL overrides)
         ws_worker = WSWorker(
             fast_symbols,
             store=ds,
@@ -433,7 +503,7 @@ async def run_pipeline() -> None:
         health_task = asyncio.create_task(noop_healthcheck())
 
         # UI metrics publisher (Redis pub/sub) — lightweight snapshot every 5s
-        async def ui_metrics_publisher():
+        async def ui_metrics_publisher() -> None:
             channel = "ui.metrics"
             while True:
                 snap = ds.metrics_snapshot()
@@ -453,27 +523,31 @@ async def run_pipeline() -> None:
 
         # Ініціалізуємо UI-споживача
         logger.info("[Main] Ініціалізуємо UI-споживача...")
-        ui = UI_Consumer()
+        UIConsumer()
 
-        # Запускаємо Screening Producer
-        logger.info("[Main] Запускаємо Screening Producer...")
-        prod = asyncio.create_task(
-            screening_producer(
-                monitor=monitor,
-                store=ds,
-                store_fast_symbols=ds,
-                assets=fast_symbols,
-                redis_conn=redis_conn,
-                trade_manager=trade_manager,
-                timeframe="1m",
-                lookback=SCREENING_LOOKBACK,
-                interval_sec=30,
-                state_manager=state_manager,
-                level_manager=level_manager,
-                user_lang=user_settings["lang"],
-                user_style=user_settings["style"],
+        # ── Reactive Stage1 (optional): rely on WS hook only ──
+        reactive_enabled = os.getenv("REACTIVE_STAGE1", "0") in ("1", "true", "True")
+        prod = None
+        if not reactive_enabled:
+            # Запускаємо Screening Producer (batch mode)
+            logger.info("[Main] Запускаємо Screening Producer...")
+            prod = asyncio.create_task(
+                screening_producer(
+                    monitor=monitor,
+                    store=ds,
+                    store_fast_symbols=ds,
+                    assets=fast_symbols,
+                    redis_conn=redis_conn,
+                    trade_manager=trade_manager,
+                    timeframe="1m",
+                    lookback=SCREENING_LOOKBACK,
+                    interval_sec=30,
+                    state_manager=state_manager,
+                    level_manager=level_manager,
+                    user_lang=user_settings["lang"],
+                    user_style=user_settings["style"],
+                )
             )
-        )
 
         # Публікуємо початковий стан в Redis
         logger.info("[Main] Публікуємо початковий стан в Redis...")
@@ -503,13 +577,24 @@ async def run_pipeline() -> None:
             )
 
         # Завдання для збору
-        tasks_to_run = [ws_task, health_task, prod, trade_update_task, metrics_task]
+        tasks_to_run = [ws_task, health_task, trade_update_task, metrics_task]
+        if prod is not None:
+            tasks_to_run.append(prod)
 
         if prefilter_task:
             tasks_to_run.append(prefilter_task)
 
         await asyncio.gather(*tasks_to_run)
+    except Exception as e:
+        logger.error("[Main] run_pipeline error: %s", e)
     finally:
+        # Акуратне завершення стенографа (якщо увімкнено)
+        try:
+            tr = getattr(ds, "transcript", None)
+            if tr is not None:
+                await tr.stop()  # type: ignore[attr-defined]
+        except Exception:
+            pass
         await session.close()
 
 

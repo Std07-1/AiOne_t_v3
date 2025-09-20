@@ -5,10 +5,10 @@
     • Близькість до локальних та денних рівнів (support/resistance)
 """
 
-import pandas as pd
 import logging
-from typing import Dict, Any
+from typing import Any
 
+import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 
@@ -22,18 +22,18 @@ if not logger.handlers:
 
 def breakout_level_trigger(
     df: pd.DataFrame,
-    stats: Dict[str, Any],
+    stats: dict[str, Any],
     window: int = 20,
     near_threshold: float = 0.005,
     near_daily_threshold: float = 0.5,
     symbol: str = "",
-) -> Dict[str, bool]:
+) -> dict[str, bool]:
     """Виявляє пробій локальних екстремумів і близькість до них та денних рівнів.
 
     Returns:
         Dict[str, bool]: breakouts / near-level flags
     """
-    triggers: Dict[str, bool] = {
+    triggers: dict[str, bool] = {
         "breakout_up": False,
         "breakout_down": False,
         "near_high": False,

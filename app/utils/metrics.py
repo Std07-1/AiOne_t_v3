@@ -12,20 +12,19 @@ import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, Optional
 
 
 # ──────────────────── Класи для метрик ────────────────────────
 @dataclass
 class CounterMetric:
     value: int = 0
-    labels: Dict[str, str] = None
+    labels: dict[str, str] | None = None
 
 
 @dataclass
 class HistogramMetric:
-    buckets: List[float] = None
-    values: List[float] = None
+    buckets: list[float] | None = None
+    values: list[float] | None = None
     count: int = 0
     sum: float = 0.0
 
@@ -33,7 +32,7 @@ class HistogramMetric:
 @dataclass
 class GaugeMetric:
     value: float = 0.0
-    labels: Dict[str, str] = None
+    labels: dict[str, str] | None = None
 
 
 class MetricsCollector:
@@ -56,16 +55,17 @@ class MetricsCollector:
         self._start_time = time.time()
 
     # ──────────────── Публічний API ────────────────────────────
-    def inc(self, name: str, value: int = 1, labels: Optional[Dict] = None) -> None:
+    def inc(self, name: str, value: int = 1, labels: dict | None = None) -> None:
         """Збільшує лічильник метрики."""
         key = self._get_key(name, labels)
         self._counters[key].value += value
 
-    def observe(self, name: str, value: float, labels: Optional[Dict] = None) -> None:
+    def observe(self, name: str, value: float, labels: dict | None = None) -> None:
         """Додає значення до гістограми."""
         key = self._get_key(name, labels)
         metric = self._histograms[key]
-
+        if metric.values is None:
+            metric.values = []
         metric.values.append(value)
         metric.count += 1
         metric.sum += value
@@ -74,20 +74,20 @@ class MetricsCollector:
         if len(metric.values) > 1000:
             metric.values = metric.values[-500:]
 
-    def gauge(self, name: str, value: float, labels: Optional[Dict] = None) -> None:
+    def gauge(self, name: str, value: float, labels: dict | None = None) -> None:
         """Встановлює значення датчика."""
         key = self._get_key(name, labels)
         self._gauges[key].value = value
 
-    def timer(self, name: str, labels: Optional[Dict] = None):
+    def timer(self, name: str, labels: dict | None = None):
         """Контекстний менеджер для вимірювання часу виконання."""
         return TimerContext(self, name, labels)
 
-    async def async_timer(self, name: str, labels: Optional[Dict] = None):
+    async def async_timer(self, name: str, labels: dict | None = None):
         """Асинхронний контекстний менеджер для вимірювання часу."""
         return AsyncTimerContext(self, name, labels)
 
-    def collect(self) -> Dict[str, Dict]:
+    def collect(self) -> dict[str, object]:
         """Повертає всі метрики у форматі, придатному для експорту."""
         return {
             "counters": self._serialize_counters(),
@@ -98,17 +98,17 @@ class MetricsCollector:
 
     # ──────────────── Внутрішня логіка ────────────────────────
     @staticmethod
-    def _get_key(name: str, labels: Optional[Dict]) -> str:
+    def _get_key(name: str, labels: dict | None) -> str:
         """Створює унікальний ключ для метрики з мітками."""
         if not labels:
             return name
         return f"{name}:{','.join(f'{k}={v}' for k, v in sorted(labels.items()))}"
 
-    def _serialize_counters(self) -> Dict[str, int]:
+    def _serialize_counters(self) -> dict[str, int]:
         """Серіалізує лічильники у простий словник."""
         return {key: metric.value for key, metric in self._counters.items()}
 
-    def _serialize_histograms(self) -> Dict[str, Dict]:
+    def _serialize_histograms(self) -> dict[str, dict]:
         """Серіалізує гістограми з розрахунком квантилів."""
         result = {}
         for key, metric in self._histograms.items():
@@ -128,7 +128,7 @@ class MetricsCollector:
             }
         return result
 
-    def _serialize_gauges(self) -> Dict[str, float]:
+    def _serialize_gauges(self) -> dict[str, float]:
         """Серіалізує значення датчиків."""
         return {key: metric.value for key, metric in self._gauges.items()}
 
@@ -136,34 +136,34 @@ class MetricsCollector:
 class TimerContext:
     """Синхронний контекстний менеджер для вимірювання часу."""
 
-    def __init__(self, collector: MetricsCollector, name: str, labels: Optional[Dict]):
+    def __init__(self, collector: MetricsCollector, name: str, labels: dict | None):
         self.collector = collector
         self.name = name
         self.labels = labels
-        self.start_time = None
+        self.start_time: float | None = None
 
     def __enter__(self):
         self.start_time = time.perf_counter()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        duration = time.perf_counter() - self.start_time
+        duration = time.perf_counter() - float(self.start_time or 0.0)
         self.collector.observe(self.name, duration, self.labels)
 
 
 class AsyncTimerContext:
     """Асинхронний контекстний менеджер для вимірювання часу."""
 
-    def __init__(self, collector: MetricsCollector, name: str, labels: Optional[Dict]):
+    def __init__(self, collector: MetricsCollector, name: str, labels: dict | None):
         self.collector = collector
         self.name = name
         self.labels = labels
-        self.start_time = None
+        self.start_time: float | None = None
 
     async def __aenter__(self):
         self.start_time = time.perf_counter()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        duration = time.perf_counter() - self.start_time
+        duration = time.perf_counter() - float(self.start_time or 0.0)
         self.collector.observe(self.name, duration, self.labels)

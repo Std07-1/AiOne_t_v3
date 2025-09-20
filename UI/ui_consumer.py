@@ -1,19 +1,24 @@
-# UI/ui_consumer.py
-# -*- coding: utf-8 -*-
-import os
-import redis.asyncio as redis
+import asyncio
 import json
 import logging
-import asyncio
+import os
 import time
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Literal, cast
 
-from rich.console import Console
-from rich.logging import RichHandler
-from rich.live import Live
-from rich.table import Table
+import redis.asyncio as redis
 from rich.box import ROUNDED
+from rich.console import Console
+from rich.live import Live
+from rich.logging import RichHandler
+from rich.table import Table
+
+from config.config import (
+    REDIS_CHANNEL_ASSET_STATE,
+    REDIS_SNAPSHOT_KEY,
+    STATS_CORE_KEY,
+)
+from utils.utils import format_price
 
 ui_console = Console(stderr=False)
 
@@ -26,7 +31,7 @@ ui_logger.propagate = False
 
 class AlertAnimator:
     def __init__(self) -> None:
-        self.active_alerts: Dict[str, float] = {}
+        self.active_alerts: dict[str, float] = {}
 
     def add_alert(self, symbol: str) -> None:
         self.active_alerts[symbol] = time.time()
@@ -41,23 +46,34 @@ class AlertAnimator:
         return False
 
 
-class UI_Consumer:
+class UIConsumer:
     def __init__(self, vol_z_threshold: float = 2.5, low_atr_threshold: float = 0.005):
         self.vol_z_threshold = vol_z_threshold
         self.low_atr_threshold = low_atr_threshold
         self.alert_animator = AlertAnimator()
         self.last_update_time: float = time.time()
-        self._last_counters: Dict[str, Any] = {}
-        self._display_results: List[Dict[str, Any]] = (
+        self._last_counters: dict[str, Any] = {}
+        self._display_results: list[dict[str, Any]] = (
             []
         )  # кеш останнього непорожнього списку
         self._blink_state = False  # для миготіння pressure
         self._pressure_alert_active = False
 
-    def _format_price(self, price: float) -> str:
-        if price >= 1000:
-            return f"{price:,.2f}"
-        return f"{price:.4f}"
+    def _format_price(self, price: float | None, symbol: str) -> str:
+        """Форматує ціну для відображення у таблиці.
+
+        Якщо значення відсутнє або непозитивне — повертає "-";
+        інакше використовує utils.format_price.
+        """
+        try:
+            if price is None:
+                return "-"
+            p = float(price)
+            if p <= 0:
+                return "-"
+            return format_price(p, symbol)
+        except Exception:
+            return "-"
 
     def _get_rsi_color(self, rsi: float) -> str:
         if rsi < 30:
@@ -99,14 +115,15 @@ class UI_Consumer:
 
     async def redis_consumer(
         self,
-        redis_url: str = None,
-        channel: str = "asset_state_update",
+        redis_url: str | None = None,
+        channel: str = REDIS_CHANNEL_ASSET_STATE,
         refresh_rate: float = 0.8,
         loading_delay: float = 1.5,
         smooth_delay: float = 0.05,
     ) -> None:
         """
-        Слухає канал Redis Pub/Sub, приймає payload {"meta","counters","assets"} і рендерить таблицю.
+        Слухає канал Redis Pub/Sub, приймає payload {"meta","counters","assets"}
+        і рендерить таблицю.
         """
         # Підтримка конфігів з ENV, щоб не промахнутись по інстансу Redis
         redis_url = (
@@ -115,9 +132,9 @@ class UI_Consumer:
             or f"redis://{os.getenv('REDIS_HOST','localhost')}:{os.getenv('REDIS_PORT','6379')}/0"
         )
 
-        # Ініціалізація збереженого списку результатів (instance-level)
+        # Ініціалізація збереженого списку результатів (instance-level) з типом
         if not hasattr(self, "_last_results"):
-            self._last_results = []  # type: ignore[attr-defined]
+            self._last_results: list[dict[str, Any]] = []
 
         redis_client = redis.from_url(
             redis_url, decode_responses=True, encoding="utf-8"
@@ -126,7 +143,7 @@ class UI_Consumer:
 
         # Спроба початкового снапшоту перед підпискою + нові core-статистики
         try:
-            snapshot_raw = await redis_client.get("asset_state_snapshot")
+            snapshot_raw = await redis_client.get(REDIS_SNAPSHOT_KEY)
             if snapshot_raw:
                 snap = json.loads(snapshot_raw)
                 if isinstance(snap, dict) and isinstance(snap.get("assets"), list):
@@ -148,12 +165,12 @@ class UI_Consumer:
                     )
             # Нові агреговані трейд-метрики (stats:core)
             try:
-                core_raw = await redis_client.get("ai_one:stats:core")
+                core_raw = await redis_client.get(STATS_CORE_KEY)
                 if core_raw:
                     core = json.loads(core_raw)
-                    trades_part = (
-                        core.get("trades", {}) if isinstance(core, dict) else {}
-                    )
+                    if not isinstance(core, dict):
+                        core = {}
+                    trades_part = core.get("trades", {})
                     # кешуємо як counters.* для заголовку
                     if trades_part:
                         self._last_counters.update(
@@ -215,16 +232,15 @@ class UI_Consumer:
         ) as live:
             while True:
                 try:
-                    # Періодичний fallback: якщо >7s без оновлень і маємо порожній live список, пробуємо перезчитати снапшот
+                    # Періодичний fallback: якщо >7s без оновлень і маємо порожній
+                    # live список, пробуємо перезчитати снапшот
                     if (
                         (time.time() - self.last_update_time) > 7
                         and not self._last_results
                         and self._display_results
                     ):
                         try:
-                            snapshot_raw = await redis_client.get(
-                                "asset_state_snapshot"
-                            )
+                            snapshot_raw = await redis_client.get(REDIS_SNAPSHOT_KEY)
                             if snapshot_raw:
                                 snap = json.loads(snapshot_raw)
                                 assets_snap = (
@@ -255,26 +271,34 @@ class UI_Consumer:
                         # ✅ Новий коректний парсинг продюсера: очікуємо dict з 'assets'
                         if isinstance(data, dict) and "assets" in data:
                             try:
+                                assets_field = data.get("assets")
+                                assets_len = (
+                                    len(assets_field)
+                                    if isinstance(assets_field, list)
+                                    else None
+                                )
                                 ui_logger.debug(
                                     "UI recv keys=%s counters=%s assets_len=%s type=%s",
                                     list(data.keys()),
                                     data.get("counters"),
-                                    (
-                                        None
-                                        if data.get("assets") is None
-                                        else len(data.get("assets"))
-                                    ),
+                                    assets_len,
                                     data.get("type"),
                                 )
-                                if data.get("assets"):
+                                assets_dbg = data.get("assets")
+                                if (
+                                    isinstance(assets_dbg, list)
+                                    and assets_dbg
+                                    and isinstance(assets_dbg[0], dict)
+                                ):
                                     ui_logger.debug(
                                         "UI first asset keys=%s",
-                                        list(data.get("assets")[0].keys()),
+                                        list(assets_dbg[0].keys()),
                                     )
                             except Exception:
                                 pass
                             parsed_assets = data.get("assets") or []
-                            # Якщо прийшов порожній список, але ми вже маємо попередні дані – ігноруємо очищення
+                            # Якщо прийшов порожній список, але вже маємо попередні
+                            # дані — ігноруємо очищення
                             if not parsed_assets and self._display_results:
                                 ui_logger.debug(
                                     "Ignore empty assets update; keeping %d cached rows",
@@ -297,7 +321,8 @@ class UI_Consumer:
                                 except Exception:
                                     pass
                             else:
-                                # Heartbeat без meta.ts – оновлюємо час лише якщо давно не оновлювалось (>5s)
+                                # Heartbeat без meta.ts — оновлюємо час лише якщо
+                                # давно не оновлювалось (>5s)
                                 if time.time() - self.last_update_time > 5:
                                     self.last_update_time = time.time()
                             # counters → для заголовку
@@ -340,7 +365,8 @@ class UI_Consumer:
                         and self._display_results
                     ):
                         ui_logger.warning(
-                            "Using cached results_for_render len=%d (last empty, counters.assets=%s)",
+                            "Using cached results_for_render len=%d (last empty, "
+                            "counters.assets=%s)",
                             len(self._display_results),
                             self._last_counters.get("assets"),
                         )
@@ -373,7 +399,7 @@ class UI_Consumer:
                     ui_logger.error(f"Невідома помилка: {e}")
                     await asyncio.sleep(1)
 
-    def _build_signal_table(self, results: List[dict], loading: bool = False) -> Table:
+    def _build_signal_table(self, results: list[dict[str, Any]], loading: bool = False) -> Table:
         """Побудова таблиці з сигналами та метриками системи."""
         # counters з payloadу, якщо є
         # Спершу беремо фактичну кількість рядків (що реально відображаються)
@@ -559,7 +585,15 @@ class UI_Consumer:
             ("TP/SL", "right"),
         ]
         for header, justify in columns:
-            table.add_column(header, justify=justify)
+            j = (
+                "left"
+                if justify == "left"
+                else "right" if justify == "right" else "center"
+            )
+            table.add_column(
+                header,
+                justify=cast(Literal["default", "left", "center", "right", "full"], j),
+            )
 
         if loading or not results:
             # Маркап Rich має відповідати: відкрили [cyan] — закрили [/cyan]
@@ -599,15 +633,24 @@ class UI_Consumer:
             # Перевага плоских ключів якщо вони вже розраховані продюсером
             if "price_str" in asset and isinstance(asset.get("price_str"), str):
                 price_str = asset["price_str"]
-                current_price = float(
-                    asset.get("price", stats.get("current_price", 0.0)) or 0.0
-                )
+                try:
+                    cp_raw = asset.get("price", stats.get("current_price"))
+                    current_price = float(cp_raw) if cp_raw is not None else None
+                except Exception:
+                    current_price = None
             else:
-                if "price" in asset and isinstance(asset.get("price"), (int, float)):
-                    current_price = float(asset.get("price") or 0.0)
-                else:
-                    current_price = stats.get("current_price", 0.0) or 0.0
-                price_str = self._format_price(float(current_price))
+                try:
+                    if "price" in asset and isinstance(
+                        asset.get("price"), (int, float)
+                    ):
+                        price_val = asset.get("price")
+                        current_price = float(price_val) if price_val is not None else None
+                    else:
+                        cp_raw = stats.get("current_price")
+                        current_price = float(cp_raw) if cp_raw is not None else None
+                except Exception:
+                    current_price = None
+                price_str = self._format_price(current_price, symbol)
 
             volume = asset.get("volume")
             if not isinstance(volume, (int, float)):
@@ -623,10 +666,18 @@ class UI_Consumer:
             if "atr_pct" in asset and isinstance(asset.get("atr_pct"), (int, float)):
                 atr_pct = float(asset.get("atr_pct") or 0.0)
             else:
-                atr = stats.get("atr", 0.0) or 0.0
+                atr_raw = stats.get("atr")
+                try:
+                    atr = float(atr_raw) if atr_raw is not None else None
+                except Exception:
+                    atr = None
                 atr_pct = (
                     (float(atr) / float(current_price) * 100.0)
-                    if current_price
+                    if (
+                        atr is not None
+                        and current_price is not None
+                        and current_price > 0
+                    )
                     else 0.0
                 )
             atr_color = self._get_atr_color(atr_pct)
@@ -637,12 +688,19 @@ class UI_Consumer:
 
             rsi_val = asset.get("rsi")
             if not isinstance(rsi_val, (int, float)):
-                rsi_val = stats.get("rsi", 0.0) or 0.0
-            rsi_color = self._get_rsi_color(float(rsi_val))
-            if rsi_color:
-                rsi_str = f"[{rsi_color}]{float(rsi_val):.1f}[/]"
+                rsi_val = stats.get("rsi")
+            try:
+                rsi_f = float(rsi_val) if rsi_val is not None else None
+            except Exception:
+                rsi_f = None
+            if rsi_f is None:
+                rsi_str = "-"
             else:
-                rsi_str = f"{float(rsi_val):.1f}"
+                rsi_color = self._get_rsi_color(float(rsi_f))
+                if rsi_color:
+                    rsi_str = f"[{rsi_color}]{float(rsi_f):.1f}[/]"
+                else:
+                    rsi_str = f"{float(rsi_f):.1f}"
 
             status = asset.get("status") or asset.get("state", "normal")
             if status == "normal":
@@ -674,7 +732,7 @@ class UI_Consumer:
                 tp = asset.get("tp")
                 sl = asset.get("sl")
                 tp_sl_str = (
-                    f"TP: {self._format_price(tp)}\nSL: {self._format_price(sl)}"
+                    f"TP: {self._format_price(tp, symbol)}\nSL: {self._format_price(sl, symbol)}"
                     if tp and sl
                     else "-"
                 )
@@ -715,7 +773,7 @@ class UI_Consumer:
 
 
 async def main() -> None:
-    consumer = UI_Consumer()
+    consumer = UIConsumer()
     await consumer.redis_consumer()
 
 

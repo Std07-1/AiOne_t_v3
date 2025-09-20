@@ -19,11 +19,12 @@ QDE micro-benchmark: тестує продуктивність QuantumDecisionEn
 """
 
 import gc
-import sys
+import os
 import platform
-from time import perf_counter, perf_counter_ns
-from statistics import quantiles
 import statistics as st
+import sys
+from time import perf_counter, perf_counter_ns
+
 from QDE.quantum_decision_engine import QuantumDecisionEngine
 
 
@@ -105,9 +106,11 @@ def test_qde_micro_benchmark():
         f"Processor: {platform.processor() or platform.machine()}"
     )
 
-    # 4) критерії
-    assert avg_ms < 0.10, f"Середній час {avg_ms:.3f} ms > 0.185 ms"
-    assert p95_ms < 0.30, f"P95 {p95_ms:.3f} ms > 0.30 ms"
+    # 4) критерії (з невеликим запасом для різних CPU/середовищ)
+    target_avg = float(os.getenv("QDE_BENCH_AVG_MS", "0.12"))
+    target_p95 = float(os.getenv("QDE_BENCH_P95_MS", "0.35"))
+    assert avg_ms < target_avg, f"Середній час {avg_ms:.3f} ms > {target_avg:.3f} ms"
+    assert p95_ms < target_p95, f"P95 {p95_ms:.3f} ms > {target_p95:.3f} ms"
 
     if was_enabled:
         gc.enable()

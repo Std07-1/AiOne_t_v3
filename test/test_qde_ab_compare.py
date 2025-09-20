@@ -1,5 +1,4 @@
 # test_qde_ab_compare.py
-# -*- coding: utf-8 -*-
 #
 # Додавання нового тест-кейсу:
 # 1. Створіть context зі всіма потрібними полями (див. інші приклади)
@@ -37,10 +36,9 @@ Edge‑кейс тести зосереджені на стабільності:
 розрив ліквідності, вплив історії та шуму — саме ті місця, де системи зазвичай «пливуть».
 """
 import os
-import time
-import math
 import random
-import statistics as stats
+import time
+
 import pytest
 
 # Імпорт QDE з основного шляху проекту

@@ -6,10 +6,11 @@
 
 from __future__ import annotations
 
+import json
+
 # ── Imports ──────────────────────────────────────────────────────────────────
 import logging
-import json
-from typing import Any, Dict, List
+from typing import Any
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -31,7 +32,7 @@ MIN_CONFIDENCE_TRADE = 0.6  # Мінімальна впевненість для
 
 
 async def open_trades(
-    signals: List[Dict[str, Any]],
+    signals: list[dict[str, Any]],
     trade_manager: TradeLifecycleManager,
     max_parallel: int,
 ) -> None:
@@ -55,11 +56,14 @@ async def open_trades(
     for signal in sorted_signals:
         symbol = signal["symbol"]
         confidence = safe_float(signal.get("confidence", 0))
+        if confidence is None:
+            confidence = 0.0
 
         # Детальне логування причин, чому угода не відкривається
         if confidence < MIN_CONFIDENCE_TRADE:
             logger.info(
-                f"⛔️ Не відкриваємо угоду для {symbol}: впевненість {confidence:.3f} < поріг {MIN_CONFIDENCE_TRADE}"
+                f"⛔️ Не відкриваємо угоду для {symbol}: впевненість {confidence:.3f} "
+                f"< поріг {MIN_CONFIDENCE_TRADE}"
             )
             logger.debug(
                 f"Деталі сигналу: {json.dumps(signal, ensure_ascii=False, default=str)}"
@@ -73,7 +77,8 @@ async def open_trades(
             "ALERT_SELL",
         ]:
             logger.info(
-                f"⛔️ Не відкриваємо угоду для {symbol}: тип сигналу {signal.get('signal')} не є ALERT"
+                f"⛔️ Не відкриваємо угоду для {symbol}: тип сигналу {signal.get('signal')} "
+                "не є ALERT"
             )
             logger.debug(
                 f"Деталі сигналу: {json.dumps(signal, ensure_ascii=False, default=str)}"

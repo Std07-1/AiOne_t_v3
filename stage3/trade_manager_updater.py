@@ -7,19 +7,19 @@
 
 from __future__ import annotations
 
+import asyncio
+
 # ── Imports ──────────────────────────────────────────────────────────────────
 import logging
-import asyncio
 import math
-from typing import Any, Optional
+from typing import Any
 
-import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 
-from stage3.trade_manager import TradeLifecycleManager
-from stage1.asset_monitoring import AssetMonitorStage1
 from app.settings import load_datastore_cfg
+from stage1.asset_monitoring import AssetMonitorStage1
+from stage3.trade_manager import TradeLifecycleManager
 
 try:  # optional Prometheus
     from prometheus_client import Gauge, Histogram  # type: ignore
@@ -80,18 +80,18 @@ async def trade_manager_updater(
     max_backoff_sec = getattr(tu_cfg, "max_backoff_sec", max_backoff_sec)
 
     # Prometheus gauges (optional) with safe registrar to avoid duplicate registration
-    active_g: Optional[Any] = None
-    closed_g: Optional[Any] = None
-    cycle_time_g: Optional[Any] = None
-    cycle_time_h: Optional[Any] = None  # Histogram
-    drift_ratio_g: Optional[Any] = None
-    dynamic_interval_g: Optional[Any] = None
-    last_update_ts_g: Optional[Any] = None
-    skipped_ewma_g: Optional[Any] = None
-    pressure_g: Optional[Any] = None
-    pressure_norm_g: Optional[Any] = None
-    consecutive_drift_high_g: Optional[Any] = None
-    consecutive_pressure_high_g: Optional[Any] = None
+    active_g: Any | None = None
+    closed_g: Any | None = None
+    cycle_time_g: Any | None = None
+    cycle_time_h: Any | None = None  # Histogram
+    drift_ratio_g: Any | None = None
+    dynamic_interval_g: Any | None = None
+    last_update_ts_g: Any | None = None
+    skipped_ewma_g: Any | None = None
+    pressure_g: Any | None = None
+    pressure_norm_g: Any | None = None
+    consecutive_drift_high_g: Any | None = None
+    consecutive_pressure_high_g: Any | None = None
     skipped_ewma: float = 0.0
     # smoothing factor (конфігурований): або параметр, або ENV TRADE_UPDATER_SKIPPED_ALPHA, дефолт 0.3
     if skipped_ewma_alpha is None:
@@ -112,7 +112,7 @@ async def trade_manager_updater(
     # локальний кеш створених Gauge щоб уникнути повторної реєстрації
     _gauge_cache: dict[str, Any] = {}
 
-    def _register_gauge(name: str, description: str) -> Optional[Any]:
+    def _register_gauge(name: str, description: str) -> Any | None:
         """Idempotent gauge creator.
 
         Avoids ValueError on module reload / multi-start by caching locally.
@@ -193,7 +193,7 @@ async def trade_manager_updater(
     consecutive_high_drift = 0
     consecutive_high_pressure = 0
     drift_normal_counter = 0  # cycles below high threshold to trigger reset
-    DRIFT_RESET_CYCLES = 3  # configurable if needed later
+    drift_reset_cycles = 3  # configurable if needed later
 
     while True:
         loop_time = asyncio.get_event_loop().time()
@@ -221,11 +221,14 @@ async def trade_manager_updater(
                     skip_reason_counts.get("insufficient_bars", 0) + 1
                 )
                 continue
-            stats = (
-                await monitor.get_current_stats(sym, df)
-                if hasattr(monitor, "get_current_stats")
-                else {}
-            )
+            # Try to obtain current stats from monitor if such API exists
+            try:
+                if hasattr(monitor, "get_current_stats"):
+                    stats = await monitor.get_current_stats(sym)  # type: ignore[attr-defined]
+                else:
+                    stats = {}
+            except Exception:
+                stats = {}
             market_data = {
                 "price": stats.get("current_price", 0),
                 "atr": stats.get("atr", 0),
@@ -341,7 +344,7 @@ async def trade_manager_updater(
                     if not idle_mode:
                         drift_normal_counter += 1
                         if (
-                            drift_normal_counter >= DRIFT_RESET_CYCLES
+                            drift_normal_counter >= drift_reset_cycles
                             and consecutive_high_drift
                         ):
                             logger.info(
@@ -481,7 +484,7 @@ async def trade_manager_updater(
                             key=lambda kv: kv[1],
                             reverse=True,
                         )[:top_n]
-                        core_payload["skip_reasons"] = {k: v for k, v in sorted_reasons}
+                        core_payload["skip_reasons"] = dict(sorted_reasons)
                 except Exception:
                     pass
             try:
@@ -501,7 +504,7 @@ async def trade_manager_updater(
                 hb_payload = {
                     "ts": last_success_ts,
                     "active_trades": counts[0],
-                    "drift_ratio": round(core_payload["drift_ratio"], 4),
+                    "drift_ratio": round(drift_ratio_value, 4),
                     "pressure": round(pressure_ratio, 4),
                 }
                 hb_ttl = max(5, int(interval_sec * 0.9))
@@ -545,14 +548,14 @@ async def trade_manager_updater(
         skipped_symbols = 0
         skip_reason_counts.clear()
         if elapsed > dynamic_interval:
-            dynamic_interval = min(
-                dynamic_interval * backoff_multiplier, max_backoff_sec
-            )
+            mul = float(backoff_multiplier) if backoff_multiplier is not None else 1.5
+            dynamic_interval = min(dynamic_interval * mul, float(max_backoff_sec))
         else:
             if dynamic_interval > interval_sec:
-                dynamic_interval = max(
-                    interval_sec, dynamic_interval / backoff_multiplier
+                div = (
+                    float(backoff_multiplier) if backoff_multiplier is not None else 1.5
                 )
+                dynamic_interval = max(float(interval_sec), dynamic_interval / div)
 
         sleep_for = max(0.0, dynamic_interval - elapsed)
         await asyncio.sleep(sleep_for)

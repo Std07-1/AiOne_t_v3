@@ -33,6 +33,7 @@ python-dateutil==2.9.0.post0
 python-dotenv==1.1.0
 pytz==2025.2
 PyYAML==6.0.2
+types-PyYAML==6.0.12.20241221
 redis==4.5.5
 rich==14.0.0
 scipy==1.15.3

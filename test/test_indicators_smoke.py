@@ -3,17 +3,17 @@
 Focus: basic seed/update/compute flows without external dependencies.
 """
 
-from stage1.indicators import (
-    VWAPManager,
-    vwap_deviation_trigger,
-    VolumeZManager,
-    compute_volume_z,
-    ATRManager,
-    compute_atr,
-)
-
-import pandas as pd
 import numpy as np
+import pandas as pd
+
+from stage1.indicators import (
+    ATRManager,
+    VolumeZManager,
+    VWAPManager,
+    compute_atr,
+    compute_volume_z,
+    vwap_deviation_trigger,
+)
 
 
 def _sample_df(n=30):
@@ -47,7 +47,7 @@ def test_volume_z_manager_basic():
     df = _sample_df()
     vm = VolumeZManager(window=10)
     vm.ensure_buffer("BBB", df)
-    z_prev = vm.get_last("BBB")
+    _ = vm.get_last("BBB")
     vm.update("BBB", volume=1500)
     z_new = vm.get_last("BBB")
     # When std>0 new z should be float
@@ -61,7 +61,7 @@ def test_atr_manager_basic():
     df = _sample_df()
     am = ATRManager(period=14)
     am.ensure_state("CCC", df)
-    atr_state = am.get_state("CCC")
+    _ = am.get_state("CCC")
     # May still be nan if insufficient rows
     # Update a few synthetic bars
     for i in range(5):

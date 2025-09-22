@@ -234,6 +234,43 @@ class Stage2Processor:
                 "dist_to_support_pct": corr.get("dist_to_support_pct"),
                 "dist_to_resistance_pct": corr.get("dist_to_resistance_pct"),
             }
+            # 2.1) Обчислюємо atr_pct і low_gate (якщо передані пороги) для прозорості/гейтів
+            try:
+                price_v = float(stats.get("current_price") or 0.0)
+                atr_v = float(stats.get("atr") or 0.0)
+                atr_pct = (atr_v / price_v) if price_v > 0 else 0.0
+            except Exception:
+                atr_pct = 0.0
+            thresholds = (
+                stage1_signal.get("thresholds")
+                if isinstance(stage1_signal, dict)
+                else None
+            )
+            low_gate = None
+            try:
+                if isinstance(thresholds, dict):
+                    lg = thresholds.get("low_gate")
+                    if isinstance(lg, (int, float)):
+                        low_gate = float(lg)
+            except Exception:
+                low_gate = None
+            # Прапор підтвердження HTF: витягуємо з meso.htf_alignment як [0..1]
+            meso = ctx.get("meso") or result.get(K_MARKET_CONTEXT, {}).get("meso") or {}
+            htf_align = meso.get("htf_alignment") if isinstance(meso, dict) else None
+            try:
+                htf_ok = bool(htf_align is not None and float(htf_align) >= 0.5)
+            except Exception:
+                htf_ok = None  # невідомо
+            # Прив’язуємо у context.meta для подальших етапів / UI
+            ctx.setdefault("meta", {})
+            ctx["meta"].update(
+                {
+                    "atr_pct": atr_pct,
+                    "low_gate": low_gate,
+                    "htf_alignment": htf_align,
+                    "htf_ok": htf_ok,
+                }
+            )
             result[K_MARKET_CONTEXT] = ctx  # поклали назад
 
             # 3) Evidence біля рівнів (як і раніше)
@@ -281,6 +318,24 @@ class Stage2Processor:
                 sl_str,
                 rr_str,
             )
+
+            # 4.1) Action-gate (обережний): застосовуємо тільки якщо low_gate відомий
+            try:
+                conf = float(
+                    (result.get(K_CONFIDENCE_METRICS) or {}).get(
+                        "composite_confidence", 0.0
+                    )
+                )
+            except Exception:
+                conf = 0.0
+            if isinstance(low_gate, float):
+                if (
+                    (atr_pct < low_gate)
+                    or (isinstance(htf_ok, bool) and not htf_ok)
+                    or (conf < 0.75)
+                ):
+                    # помʼякшуємо до WAIT_FOR_CONFIRMATION, не ламаючи структуру результату
+                    result[K_RECOMMENDATION] = "WAIT_FOR_CONFIRMATION"
 
             # 5) Додаткові технічні поля як і раніше
             result.update(

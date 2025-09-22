@@ -338,6 +338,21 @@ async def screening_producer(
                 min_ready,
                 interval_sec,
             )
+            # Встановлюємо явний стан NO_DATA для неготових активів,
+            # щоб UI не зависав у стані 'init'.
+            try:
+                not_ready = [s for s in assets_current if s not in ready_assets]
+                for symbol in not_ready:
+                    state_manager.update_asset(symbol, create_no_data_signal(symbol))
+                if not_ready:
+                    logger.info(
+                        "📭 NO_DATA для неготових активів: %d (публікація проміжного стану)",
+                        len(not_ready),
+                    )
+                # Публікуємо частковий стан, щоб UI одразу побачив NO_DATA
+                await publish_full_state(state_manager, store, redis_conn)
+            except Exception as e:
+                logger.error("Помилка під час оновлення NO_DATA: %s", str(e))
             await asyncio.sleep(interval_sec)
             # Переходимо до наступної ітерації while True
             continue

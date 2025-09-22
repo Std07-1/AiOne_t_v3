@@ -128,7 +128,7 @@ async def bootstrap() -> UnifiedDataStore:
     )
     # Pydantic v2: use model_dump(); fallback to dict() for backward compat
     try:
-        profile_data = cfg.profile.model_dump()  # type: ignore[attr-defined]
+        profile_data = cfg.profile.model_dump()
     except Exception:
         profile_data = cfg.profile.dict()
     store_cfg = StoreConfig(
@@ -440,12 +440,18 @@ async def run_pipeline() -> None:
                 snap = ds.metrics_snapshot()
                 # add hot symbols count (unique symbols in RAM layer)
                 try:
-                    hot_symbols = list({s for (s, _i) in ds.ram._lru.keys()})  # type: ignore[attr-defined]
-                    snap["hot_symbols"] = len(hot_symbols)
+                    lru = getattr(getattr(ds, "ram", None), "_lru", None)
+                    if lru is not None:
+                        hot_symbols = list({s for (s, _i) in lru.keys()})
+                        snap["hot_symbols"] = len(hot_symbols)
+                    else:
+                        snap["hot_symbols"] = None
                 except Exception:
                     snap["hot_symbols"] = None
                 try:
-                    await ds.redis.r.publish(channel, json.dumps(snap))  # type: ignore[attr-defined]
+                    redis_pub = getattr(getattr(ds, "redis", None), "r", None)
+                    if redis_pub is not None:
+                        await redis_pub.publish(channel, json.dumps(snap))
                 except Exception as e:
                     logger.debug("ui_metrics publish failed: %s", e)
                 await asyncio.sleep(5)

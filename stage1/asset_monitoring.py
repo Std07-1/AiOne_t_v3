@@ -440,7 +440,7 @@ class AssetMonitorStage1:
         over = stats.get("dynamic_overbought", 70)
         under = stats.get("dynamic_oversold", 30)
 
-        # ————— Якщо ATR занадто низький — просто позначаємо low_atr, але не перериваємо логіку
+        # ————— Якщо ATR занадто низький — позначаємо low_atr і готуємо gate
         if atr_pct < thr.low_gate:
             logger.debug(
                 f"[{symbol}] ATR={atr_pct:.4f} < поріг low_gate — ринок спокійний, але продовжуємо аналіз.."
@@ -457,7 +457,7 @@ class AssetMonitorStage1:
         )
 
         # ————— ІНТЕГРАЦІЯ ВСІХ СУЧАСНИХ ТРИГЕРІВ —————
-        # 1. Сплеск обсягу
+        # 1. Сплеск обсягу (використовуємо виключно Z‑score, vol/atr шлях опційний)
         if self._sw_triggers.get("volume_spike", True):
             volz = float(
                 effective.get("vol_z_threshold", getattr(thr, "vol_z_threshold", 2.0))
@@ -469,17 +469,33 @@ class AssetMonitorStage1:
                 symbol=symbol,
                 use_vol_atr=self.use_vol_atr,
             ):
+                # Upward-only: враховуємо сплеск обсягу лише для «зеленого» бару
+                try:
+                    last_open = float(df["open"].iloc[-1])
+                    last_close = float(df["close"].iloc[-1])
+                    upward = last_close > last_open
+                except Exception:
+                    upward = True  # якщо неможливо визначити — не блокуємо
                 # Визначимо, яка саме умова спрацювала, щоб лог не вводив в оману
                 try:
                     z_val = float(stats.get("volume_z", 0.0))
                 except Exception:
                     z_val = 0.0
                 # (VOL/ATR гілка вимкнена за замовчуванням)
-                reason_txt = f"📈 Сплеск обсягу (Z>{volz:.2f})"
-                _add("volume_spike", reason_txt)
-                logger.debug(
-                    f"[{symbol}] Volume spike detected by Z | Z={z_val:.2f} thr={volz:.2f}"
-                )
+                if upward:
+                    reason_txt = (
+                        f"📈 Сплеск обсягу (Z>{volz:.2f})"
+                        if z_val >= volz
+                        else "📈 Сплеск обсягу (VOL/ATR)"
+                    )
+                    _add("volume_spike", reason_txt)
+                    logger.debug(
+                        f"[{symbol}] Volume spike detected (upward) | Z={z_val:.2f} thr={volz:.2f} use_vol_atr={self.use_vol_atr}"
+                    )
+                else:
+                    logger.debug(
+                        f"[{symbol}] Volume spike suppressed (downward bar): open={last_open:.6f} close={last_close:.6f}"
+                    )
 
         # 2. Пробій рівнів (локальний breakout, підхід до рівня)
         if self._sw_triggers.get("breakout", True):
@@ -637,10 +653,18 @@ class AssetMonitorStage1:
         # Нормалізуємо причини тригерів
         trigger_reasons = normalize_trigger_reasons(raw_reasons)
 
-        # Мінімум 2 причини — це "ALERT"
-        signal = (
-            "ALERT" if len(trigger_reasons) >= self.min_reasons_for_alert else "NORMAL"
-        )
+        # Gate: якщо ринок спокійний (low ATR) і немає сильних тригерів — не ескалюємо до ALERT
+        strong_trigs = {"breakout_up", "breakout_down", "vwap_deviation"}
+        has_strong = any(t in strong_trigs for t in trigger_reasons)
+        if low_atr_flag and not has_strong:
+            signal = "NORMAL"
+        else:
+            # Мінімум 2 причини — це "ALERT"
+            signal = (
+                "ALERT"
+                if len(trigger_reasons) >= self.min_reasons_for_alert
+                else "NORMAL"
+            )
 
         logger.debug(
             f"[{symbol}] SIGNAL={signal}, тригери={trigger_reasons}, ціна={price:.4f}"

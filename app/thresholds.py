@@ -273,13 +273,13 @@ class Thresholds:
                         node = effective
                         # Якщо це відомий тригер без префіксу, застосуємо до signal_thresholds
                         try:
-                            st = effective.setdefault("signal_thresholds", {})  # type: ignore[assignment]
+                            st = effective.setdefault("signal_thresholds", {})
                             if parts[0] not in node and parts[0] in (st or {}):
                                 node = st  # direct into signal_thresholds namespace
                         except Exception:
                             pass
                         for p in parts[:-1]:
-                            node = node.setdefault(p, {})  # type: ignore[assignment]
+                            node = node.setdefault(p, {})
                         leaf = parts[-1]
                         base_val = node.get(leaf)
                         if isinstance(base_val, (int, float)) and isinstance(

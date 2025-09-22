@@ -29,6 +29,7 @@ recommendation, narrative, risk_parameters.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,6 +74,8 @@ class QDEConfig:
     base_rr: float = 1.8
     tp_steps: tuple[float, float, float] = (0.6, 1.0, 1.6)  # у ATR
     sl_step: float = 0.8  # у ATR
+    # вага підтвердження старшим ТФ у трендовому скорі (0..1)
+    htf_weight: float = 0.15
 
 
 # ── Утиліти ──
@@ -224,11 +227,57 @@ def analyze_meso(stats: dict[str, Any], cfg: QDEConfig) -> dict[str, float]:
         beta = float(np.dot(x, y) / (np.dot(x, x) + 1e-9))
         trend_slope = max(0.0, min(1.0, 0.5 + beta / 2.0))
 
+    # HTF (1h+) узгодження, якщо передане у stats
+    htf_raw = None
+    htf = stats.get("htf")
+    if isinstance(htf, dict):
+        for k in ("alignment_score", "trend_1h", "trend_score"):
+            if k in htf:
+                htf_raw = _safe(htf.get(k))
+                break
+    if htf_raw is None:
+        # інколи подають плоско, без вкладеного htf
+        htf_raw = _safe(stats.get("trend_1h"), None)  # type: ignore[arg-type]
+
+    def _normalize_htf(v: float | None) -> float:
+        if v is None:
+            return 0.5
+        try:
+            fv = float(v)
+        except Exception:
+            return 0.5
+        # якщо -1..1 → мапимо у 0..1; якщо 0..1 — лишаємо; якщо 0..100 — у 0..1
+        if -1.0 <= fv <= 1.0:
+            return _clamp01((fv + 1.0) / 2.0)
+        if 0.0 <= fv <= 1.0:
+            return _clamp01(fv)
+        if 0.0 <= fv <= 100.0:
+            return _clamp01(fv / 100.0)
+        return 0.5
+
+    htf_alignment = _normalize_htf(htf_raw)
+
+    # Перерозподіляємо ваги так, щоб сумарно ≈ 1.0 з урахуванням cfg.htf_weight
+    base_weights = {
+        "rsi": 0.30,
+        "adx": 0.20,
+        "volume": 0.20,
+        "slope": 0.15,
+    }
+    base_sum = sum(base_weights.values())  # 0.85
+    rem = max(0.0, 1.0 - max(0.0, min(1.0, cfg.htf_weight)))
+    scale = (rem / base_sum) if base_sum > 0 else 0.0
+    w_rsi = base_weights["rsi"] * scale
+    w_adx = base_weights["adx"] * scale
+    w_vol = base_weights["volume"] * scale
+    w_slo = base_weights["slope"] * scale
+    w_htf = min(1.0, max(0.0, cfg.htf_weight))
     trend_strength = (
-        0.35 * rsi_strength
-        + 0.25 * adx_strength
-        + 0.25 * volume_strength
-        + 0.15 * trend_slope
+        w_rsi * rsi_strength
+        + w_adx * adx_strength
+        + w_vol * volume_strength
+        + w_slo * trend_slope
+        + w_htf * htf_alignment
     )
 
     # якість рівнів (щільність у діапазоні + обсяги)
@@ -248,6 +297,7 @@ def analyze_meso(stats: dict[str, Any], cfg: QDEConfig) -> dict[str, float]:
         "trend_strength": max(0.0, min(1.0, trend_strength)),
         "levels_quality": levels_quality,
         "market_breadth": market_breadth,
+        "htf_alignment": htf_alignment,
     }
 
 
@@ -381,6 +431,14 @@ def compute_confidence(ctx: dict[str, Any]) -> dict[str, float]:
         else:
             bp, pp = 0.30, 0.30
     comp = 0.55 * _clamp01(ctx.get("confidence", 0.5)) + 0.45 * _clamp01(max(bp, pp))
+    # Легка корекція композиту від ширини діапазону: дуже широкий/дуже вузький коридор
+    band = (ctx.get("key_levels_meta") or {}).get("band_pct")
+    if isinstance(band, (int, float)):
+        if band > 1.5:
+            comp += 0.03  # широкий діапазон, вища невизначеність напрямку → легкий буст до впевненості руху
+        elif band < 0.15:
+            comp -= 0.03  # дуже вузько — більше обережності
+    comp = _clamp01(comp)
     return {
         "breakout_probability": _clamp01(bp),
         "pullback_probability": _clamp01(pp),
@@ -397,10 +455,13 @@ def make_recommendation(ctx: dict[str, Any], conf: dict[str, float]) -> str:
     d_r = km.get("dist_to_resistance_pct", None)
     band = km.get("band_pct", None)
 
+    # Спершу сценарій-специфічні рекомендації (вони мають пріоритет над раннім гейтом)
     if scn == Scenario.MANIPULATED:
         return "AVOID"
     if scn == Scenario.HIGH_VOLATILITY:
         return "AVOID_HIGH_RISK"
+    if scn == Scenario.BEARISH_REVERSAL:
+        return "SELL_ON_RALLIES"
     if scn == Scenario.BULLISH_CONTROL:
         return "BUY_IN_DIPS" if isinstance(d_s, (int, float)) and d_s < 2.0 else "HOLD"
     if scn == Scenario.BEARISH_CONTROL:
@@ -420,6 +481,14 @@ def make_recommendation(ctx: dict[str, Any], conf: dict[str, float]) -> str:
         if isinstance(band, (int, float)) and band < 5.0:
             return "RANGE_TRADE"
         # Фолбек — чекаємо
+        return "WAIT_FOR_CONFIRMATION"
+
+    # Ранній gate для всіх інших/невизначених сценаріїв: уникаємо активних рішень при низькій впевненості
+    try:
+        band_val = float(band) if isinstance(band, (int, float)) else None
+    except Exception:
+        band_val = None
+    if composite < 0.75 or (band_val is not None and band_val < 0.25):
         return "WAIT_FOR_CONFIRMATION"
 
     if composite > 0.8:
@@ -534,6 +603,23 @@ def make_narrative(
                 "Спокійний боковик: ймовірна торгівля в діапазоні або очікування."
             )
 
+    # Підказка щодо старшого таймфрейму, якщо доступно
+    meso = ctx.get("meso") or {}
+    htf = meso.get("htf_alignment")
+    if isinstance(htf, (int, float)):
+        if htf > 0.65:
+            parts.append(
+                {"UA": "Підтримка тренду 1h.", "EN": "1h trend alignment supportive."}[
+                    lang
+                ]
+            )
+        elif htf < 0.35:
+            parts.append(
+                {"UA": "1h не підтверджує сигнал.", "EN": "1h lacks confirmation."}[
+                    lang
+                ]
+            )
+
     return " ".join(parts)
 
 
@@ -554,6 +640,25 @@ def make_risk(
         price + k * atr if "BULLISH" in ctx["scenario"] else price - k * atr
         for k in cfg.tp_steps
     ]
+
+    # Округлення до tick_size, якщо доступно
+    tick = _safe(stats.get("tick_size"))
+    if isinstance(tick, (int, float)) and tick > 0:
+
+        def _to_tick(val: float, mode: str) -> float:
+            q = val / tick
+            if mode == "floor":
+                return math.floor(q) * tick
+            if mode == "ceil":
+                return math.ceil(q) * tick
+            return round(q) * tick
+
+        if "BULLISH" in ctx["scenario"]:
+            sl = _to_tick(sl, "floor")
+            tps = [_to_tick(tp, "ceil") for tp in tps]
+        else:
+            sl = _to_tick(sl, "ceil")
+            tps = [_to_tick(tp, "floor") for tp in tps]
     rr = (abs(tps[0] - price) / max(1e-9, abs(price - sl))) if tps else None
     return {"sl_level": sl, "tp_targets": tps, "risk_reward_ratio": rr}
 

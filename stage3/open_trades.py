@@ -28,7 +28,7 @@ if not logger.handlers:  # guard від повторної ініціаліза�
         logger.addHandler(logging.StreamHandler())
     logger.propagate = False
 
-MIN_CONFIDENCE_TRADE = 0.6  # Мінімальна впевненість для відкриття угоди
+MIN_CONFIDENCE_TRADE = 0.75  # Мінімальна впевненість для відкриття угоди (підвищено)
 
 
 async def open_trades(
@@ -86,6 +86,31 @@ async def open_trades(
             continue
 
         try:
+            # Фінальний guard: перевірка HTF та ATR проти low_gate (якщо доступні метадані)
+            try:
+                ctx_meta = signal.get("context_metadata") or {}
+                # допускаємо джерела: context_metadata або market_context.meta
+                if not ctx_meta and isinstance(signal.get("market_context"), dict):
+                    ctx_meta = (signal.get("market_context", {}) or {}).get("meta", {})
+                htf_ok = ctx_meta.get("htf_ok")
+                atr_pct = ctx_meta.get("atr_pct")
+                low_gate = ctx_meta.get("low_gate")
+                if isinstance(htf_ok, bool) and not htf_ok:
+                    logger.info(
+                        f"⛔️ Пропуск відкриття {symbol}: 1h не підтверджує (htf_ok=False)"
+                    )
+                    continue
+                if isinstance(atr_pct, (int, float)) and isinstance(
+                    low_gate, (int, float)
+                ):
+                    if float(atr_pct) < float(low_gate):
+                        logger.info(
+                            f"⛔️ Пропуск відкриття {symbol}: ATR%% {float(atr_pct)*100:.2f}% нижче порогу {float(low_gate)*100:.2f}%"
+                        )
+                        continue
+            except Exception:
+                pass
+
             # Захист від нульових значень ATR
             atr = safe_float(signal.get("atr"))
             if atr is None or atr < 0.0001:

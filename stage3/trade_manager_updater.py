@@ -131,8 +131,9 @@ async def trade_manager_updater(
                 continue
             # Try to obtain current stats from monitor if such API exists
             try:
-                if hasattr(monitor, "get_current_stats"):
-                    stats = await monitor.get_current_stats(sym)  # type: ignore[attr-defined]
+                get_stats = getattr(monitor, "get_current_stats", None)
+                if callable(get_stats):
+                    stats = await get_stats(sym)
                 else:
                     stats = {}
             except Exception:
@@ -296,9 +297,9 @@ async def trade_manager_updater(
                         )
                         # maintain calm counter across cycles
                         if "calm_counter" not in locals():
-                            calm_counter = 0  # type: ignore
+                            calm_counter = 0
                         if turbulent:
-                            calm_counter = 0  # type: ignore
+                            calm_counter = 0
                             # increase alpha (shorter memory)
                             new_alpha = min(
                                 getattr(tu_cfg, "alpha_max", 0.6),
@@ -310,7 +311,7 @@ async def trade_manager_updater(
                                 )
                                 skipped_alpha = new_alpha
                         elif calm:
-                            calm_counter += 1  # type: ignore
+                            calm_counter += 1
                             if calm_counter >= getattr(tu_cfg, "alpha_calm_cycles", 5):
                                 new_alpha = max(
                                     getattr(tu_cfg, "alpha_min", 0.05),
@@ -321,7 +322,7 @@ async def trade_manager_updater(
                                         f"Adaptive α decrease: {skipped_alpha:.3f} -> {new_alpha:.3f} (calm)"
                                     )
                                     skipped_alpha = new_alpha
-                                calm_counter = 0  # type: ignore
+                                calm_counter = 0
                         else:
                             # neither calm nor turbulent resets calm counter
                             pass

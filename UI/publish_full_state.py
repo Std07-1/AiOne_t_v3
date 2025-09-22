@@ -238,6 +238,22 @@ async def publish_full_state(
             else:
                 asset.setdefault("visible", True)
 
+            # Проксі метаданих HTF для UI: витягуємо з market_context.meta
+            try:
+                mc = asset.get("market_context") or {}
+                meta = mc.get("meta") if isinstance(mc, dict) else {}
+                if isinstance(meta, dict):
+                    if "htf_alignment" in meta and "htf_alignment" not in asset:
+                        val = meta.get("htf_alignment")
+                        if isinstance(val, (int, float)):
+                            asset["htf_alignment"] = float(val)
+                    if "htf_ok" in meta and "htf_ok" not in asset:
+                        hov = meta.get("htf_ok")
+                        if isinstance(hov, bool):
+                            asset["htf_ok"] = hov
+            except Exception:
+                pass
+
             serialized_assets.append(asset)
 
         # counters для хедера

@@ -27,6 +27,21 @@ TICK_SIZE_DEFAULT: float
 STAGE2_STATUS: dict[str, str]
 ASSET_STATE: dict[str, str]
 
+# Canonical keys across pipeline (Stage1 → Stage2 → UI)
+K_SYMBOL: str
+K_SIGNAL: str
+K_TRIGGER_REASONS: str
+K_RAW_TRIGGER_REASONS: str
+K_STATS: str
+K_THRESHOLDS: str
+
+# Stage2 output keys
+K_MARKET_CONTEXT: str
+K_RECOMMENDATION: str
+K_CONFIDENCE_METRICS: str
+K_ANOMALY_DETECTION: str
+K_RISK_PARAMETERS: str
+
 TRIGGER_TP_SL_SWAP_LONG: str
 TRIGGER_TP_SL_SWAP_SHORT: str
 TRIGGER_SIGNAL_GENERATED: str
@@ -122,5 +137,10 @@ OPTUNA_SQLITE_URI: str
 MIN_CONFIDENCE_TRADE_PLACEHOLDER: float
 STAGE1_MONITOR_PARAMS: dict[str, float | int]
 PREFILTER_BASE_PARAMS: dict[str, float | int | bool]
+
+# Feature flags for Stage1 logic
+USE_VOL_ATR: bool
+USE_RSI_DIV: bool
+USE_VWAP_DEVIATION: bool
 
 __all__: list[str]

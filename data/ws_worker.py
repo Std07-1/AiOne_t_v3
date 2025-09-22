@@ -385,16 +385,15 @@ class WSWorker:
         async with aiohttp.ClientSession() as sess:
             while remaining > 0 and start <= end_open_time:
                 limit = min(1000, remaining)
-                params: dict[str, str | int] = {
+                params: dict[str, str | int | float] = {
                     "symbol": sym.upper(),
                     "interval": interval,
                     "startTime": int(start),
                     # endTime інколи корисний, але можна не ставити, щоб брати limit від start
                     "limit": int(limit),
                 }
-                async with sess.get(
-                    url, params=params, timeout=aiohttp.ClientTimeout(total=5.0)
-                ) as resp:
+                timeout = aiohttp.ClientTimeout(total=5.0)
+                async with sess.get(url, params=params, timeout=timeout) as resp:
                     if resp.status != 200:
                         txt = await resp.text()
                         raise RuntimeError(

@@ -256,16 +256,45 @@ async def publish_full_state(
 
             serialized_assets.append(asset)
 
-        # counters для хедера
+        # counters для хедера (+ базові агрегати Stage3‑гейтів)
+        alerts_list = [
+            a
+            for a in serialized_assets
+            if str(a.get("signal", "")).upper().startswith("ALERT")
+        ]
+        htf_blocks = 0
+        lowatr_blocks = 0
+        alerts_buy = 0
+        alerts_sell = 0
+        for a in alerts_list:
+            sig = str(a.get("signal", "")).upper()
+            if sig == "ALERT_BUY":
+                alerts_buy += 1
+            elif sig == "ALERT_SELL":
+                alerts_sell += 1
+            # Оцінка потенційних блоків Stage3: якщо meta доступна
+            try:
+                meta = (a.get("market_context") or {}).get("meta", {})
+                if isinstance(meta, dict):
+                    if meta.get("htf_ok") is False:
+                        htf_blocks += 1
+                    atr_pct = meta.get("atr_pct")
+                    low_gate = meta.get("low_gate")
+                    if (
+                        isinstance(atr_pct, (int, float))
+                        and isinstance(low_gate, (int, float))
+                        and float(atr_pct) < float(low_gate)
+                    ):
+                        lowatr_blocks += 1
+            except Exception:
+                pass
         counters = {
             "assets": len(serialized_assets),
-            "alerts": len(
-                [
-                    a
-                    for a in serialized_assets
-                    if str(a.get("signal", "")).upper().startswith("ALERT")
-                ]
-            ),
+            "alerts": len(alerts_list),
+            "alerts_buy": alerts_buy,
+            "alerts_sell": alerts_sell,
+            "htf_blocked": htf_blocks,
+            "lowatr_blocked": lowatr_blocks,
         }
 
         # Нормалізуємо символи для UI (єдиний формат UPPER)

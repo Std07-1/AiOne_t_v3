@@ -614,7 +614,13 @@ class UIConsumer:
             is_alert = str(r.get(K_SIGNAL, "")).upper().startswith("ALERT")
             anomaly = (stats.get("volume_z", 0.0) or 0.0) >= self.vol_z_threshold
             warning = (not is_alert) and bool(reasons)
-            if is_alert and "volume_spike" in reasons:
+            # Враховуємо нові канонічні теги bull/bear volume spike як volume_spike
+            has_vol_spike = (
+                "volume_spike" in reasons
+                or "bull_vol_spike" in reasons
+                or "bear_vol_spike" in reasons
+            )
+            if is_alert and has_vol_spike:
                 cat = 0
             elif is_alert:
                 cat = 1
@@ -717,7 +723,13 @@ class UIConsumer:
                 status_icon = "🟨"
             else:
                 status_icon = "🔴"
-            status_str = f"{status_icon} {status}"
+            # Додаємо бейдж HTF якщо доступно
+            htf_ok_val = asset.get("htf_ok")
+            if isinstance(htf_ok_val, bool):
+                htf_badge = " [dim](HTF✔)[/]" if htf_ok_val else " [red](HTF×)[/]"
+            else:
+                htf_badge = ""
+            status_str = f"{status_icon} {status}{htf_badge}"
 
             signal = str(asset.get(K_SIGNAL, "NONE")).upper()
             signal_str = f"{self._get_signal_icon(signal)} {signal}"
@@ -730,9 +742,15 @@ class UIConsumer:
 
             # ✅ Рекомендація береться з кореня, а не з stage2_result
             recommendation = str(asset.get("recommendation", "-"))
-            rec_str = (
-                f"{self._get_recommendation_icon(recommendation)} {recommendation}"
-            )
+            rec_icon = self._get_recommendation_icon(recommendation)
+            # Якщо рекомендація BUY*, але htf_ok=False — приглушуємо
+            if (
+                recommendation in ("STRONG_BUY", "BUY_IN_DIPS")
+                and asset.get("htf_ok") is False
+            ):
+                rec_str = f"[dim]{rec_icon} {recommendation}[/]"
+            else:
+                rec_str = f"{rec_icon} {recommendation}"
 
             if "tp_sl" in asset:
                 tp_sl_str = asset.get("tp_sl") or "-"
@@ -755,11 +773,16 @@ class UIConsumer:
 
             tags = []
             for reason in asset.get(K_TRIGGER_REASONS, []) or []:
-                tags.append(
-                    "[magenta]Сплеск обсягу[/]"
-                    if reason == "volume_spike"
-                    else f"[yellow]{reason}[/]"
-                )
+                # Людинозрозумілі ярлики для нових тегів
+                if reason in ("volume_spike", "bull_vol_spike", "bear_vol_spike"):
+                    if reason == "bull_vol_spike":
+                        tags.append("[magenta]Бичий сплеск обсягу[/]")
+                    elif reason == "bear_vol_spike":
+                        tags.append("[magenta]Ведмежий сплеск обсягу[/]")
+                    else:
+                        tags.append("[magenta]Сплеск обсягу[/]")
+                else:
+                    tags.append(f"[yellow]{reason}[/]")
             reasons = "  ".join(tags) or "-"
 
             table.add_row(

@@ -216,6 +216,9 @@ TRIGGER_NAME_MAP: dict[str, str] = {
     # volume / volatility
     "volume_spike_trigger": "volume_spike",
     "volume_spike": "volume_spike",
+    # нові розділені варіанти сплеску обсягу
+    "bull_volume_spike": "bull_vol_spike",
+    "bear_volume_spike": "bear_vol_spike",
     "volatility_spike_trigger": "volatility_burst",
     "volatility_spike": "volatility_burst",
     "volatility_burst": "volatility_burst",
@@ -528,6 +531,26 @@ STAGE2_CONFIG: dict[str, Any] = {
     },
 }
 
+# Параметри RANGE‑логіки Stage2 (єдине джерело правди)
+STAGE2_RANGE_PARAMS: dict[str, float] = {
+    # межа «близькості до краю» (у відсотках, для dist_to_support/resistance_pct)
+    "near_edge_pct": 1.0,
+    # мінімальна ширина діапазону (у відсотках), нижче якої торгівлю в діапазоні не дозволяємо
+    "band_min_pct": 1.5,
+    # мінімальна композитна впевненість (0..1) для дозволу RANGE_TRADE у ядрі
+    "comp_min": 0.55,
+    # спец‑випадок у Stage2Processor: дуже низька волатильність (частка від ціни, а не %)
+    "upgrade_low_vol_ratio": 0.005,  # 0.5%
+    # композит для апґрейду WAIT_FOR_CONFIRMATION → RANGE_TRADE у дуже низькій волатильності
+    "upgrade_comp_min": 0.65,
+}
+
+# Параметри Stage3 відкриття угод
+STAGE3_TRADE_PARAMS: dict[str, float] = {
+    # Мінімальна впевненість для відкриття угоди (0..1)
+    "min_confidence_trade": 0.75,
+}
+
 OPTUNA_PARAM_RANGES: dict[str, tuple] = {
     "volume_z_threshold": (0.5, 3.0),
     "rsi_oversold": (15.0, 40.0),
@@ -711,6 +734,8 @@ __all__ = [
     # Stage2/QDE
     "ASSET_CLASS_MAPPING",
     "STAGE2_CONFIG",
+    "STAGE2_RANGE_PARAMS",
+    "STAGE3_TRADE_PARAMS",
     "OPTUNA_PARAM_RANGES",
     # App defaults / seeds
     "STAGE1_PREFILTER_THRESHOLDS",

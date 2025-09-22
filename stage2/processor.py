@@ -33,6 +33,7 @@ from config.config import (
     K_STATS,
     K_SYMBOL,
     K_TRIGGER_REASONS,
+    STAGE2_RANGE_PARAMS,
 )
 from utils.utils import safe_number
 
@@ -254,13 +255,39 @@ class Stage2Processor:
                         low_gate = float(lg)
             except Exception:
                 low_gate = None
-            # Прапор підтвердження HTF: витягуємо з meso.htf_alignment як [0..1]
+            # Прапор підтвердження HTF з гістерезисом: on>=0.55; off<=0.45, інакше тримаємо попередній
             meso = ctx.get("meso") or result.get(K_MARKET_CONTEXT, {}).get("meso") or {}
             htf_align = meso.get("htf_alignment") if isinstance(meso, dict) else None
+            prev_htf_ok = None
             try:
-                htf_ok = bool(htf_align is not None and float(htf_align) >= 0.5)
+                if hasattr(self._state_manager, "state") and symbol in getattr(
+                    self._state_manager, "state", {}
+                ):
+                    prev_ctx = (self._state_manager.state.get(symbol) or {}).get(
+                        "market_context"
+                    ) or {}
+                    prev_meta = (
+                        prev_ctx.get("meta") if isinstance(prev_ctx, dict) else {}
+                    )
+                    if isinstance(prev_meta, dict):
+                        pv = prev_meta.get("htf_ok")
+                        if isinstance(pv, bool):
+                            prev_htf_ok = pv
             except Exception:
-                htf_ok = None  # невідомо
+                prev_htf_ok = None
+            try:
+                ha = float(htf_align) if htf_align is not None else None
+            except Exception:
+                ha = None
+            if ha is None:
+                htf_ok = prev_htf_ok  # невідомо — залишаємо попередній стан
+            else:
+                if ha >= 0.55:
+                    htf_ok = True
+                elif ha <= 0.45:
+                    htf_ok = False
+                else:
+                    htf_ok = prev_htf_ok if isinstance(prev_htf_ok, bool) else None
             # Прив’язуємо у context.meta для подальших етапів / UI
             ctx.setdefault("meta", {})
             ctx["meta"].update(
@@ -291,6 +318,43 @@ class Stage2Processor:
             except Exception:  # broad except: evidence необов'язкова, тихо фолбек
                 ctx["level_evidence"] = {"support": {}, "resistance": {}}
             # метрики вимкнено
+
+            # 3.1) Спеціальний випадок для флету з дуже низькою волатильністю:
+            # якщо ядро порадила WAIT_FOR_CONFIRMATION, але:
+            #  • сценарій RANGE_BOUND
+            #  • atr_pct дуже малий (< upgrade_low_vol_ratio)
+            #  • композитна впевненість ≥ upgrade_comp_min
+            # тоді дозволяємо обережну торгівлю в діапазоні (RANGE_TRADE).
+            try:
+                try:
+                    upgrade_low_vol_ratio = float(
+                        STAGE2_RANGE_PARAMS.get("upgrade_low_vol_ratio", 0.005)
+                    )
+                except Exception:
+                    upgrade_low_vol_ratio = 0.005
+                try:
+                    upgrade_comp_min = float(
+                        STAGE2_RANGE_PARAMS.get("upgrade_comp_min", 0.65)
+                    )
+                except Exception:
+                    upgrade_comp_min = 0.65
+                reco0 = result.get(K_RECOMMENDATION)
+                scen0 = ctx.get("scenario")
+                comp0 = float(
+                    (result.get(K_CONFIDENCE_METRICS) or {}).get(
+                        "composite_confidence", 0.0
+                    )
+                )
+                if (
+                    reco0 == "WAIT_FOR_CONFIRMATION"
+                    and scen0 == "RANGE_BOUND"
+                    and isinstance(atr_pct, float)
+                    and atr_pct < upgrade_low_vol_ratio
+                    and comp0 >= upgrade_comp_min
+                ):
+                    result[K_RECOMMENDATION] = "RANGE_TRADE"
+            except Exception:
+                pass
 
             # 4) Лог короткого підсумку (сумісний)
             conf = result.get(K_CONFIDENCE_METRICS, {}) or {}

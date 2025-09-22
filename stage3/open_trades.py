@@ -7,14 +7,13 @@
 from __future__ import annotations
 
 import json
-
-# ── Imports ──────────────────────────────────────────────────────────────────
 import logging
 from typing import Any
 
 from rich.console import Console
 from rich.logging import RichHandler
 
+from config.config import STAGE3_TRADE_PARAMS
 from stage3.trade_manager import TradeLifecycleManager
 from utils.utils import safe_float
 
@@ -28,7 +27,11 @@ if not logger.handlers:  # guard від повторної ініціаліза�
         logger.addHandler(logging.StreamHandler())
     logger.propagate = False
 
-MIN_CONFIDENCE_TRADE = 0.75  # Мінімальна впевненість для відкриття угоди (підвищено)
+# Мінімальна впевненість для відкриття угоди (централізована в config)
+try:
+    MIN_CONFIDENCE_TRADE = float(STAGE3_TRADE_PARAMS.get("min_confidence_trade", 0.75))
+except Exception:
+    MIN_CONFIDENCE_TRADE = 0.75
 
 
 async def open_trades(
@@ -52,6 +55,9 @@ async def open_trades(
         reverse=True,
     )[:max_parallel]
 
+    # Лічильники причин пропусків (для агрегованих логів)
+    skipped_by_reason: dict[str, int] = {}
+
     # ── Iterate sorted signals ───────────────────────────────────────────────
     for signal in sorted_signals:
         symbol = signal["symbol"]
@@ -68,20 +74,32 @@ async def open_trades(
             logger.debug(
                 f"Деталі сигналу: {json.dumps(signal, ensure_ascii=False, default=str)}"
             )
+            skipped_by_reason["low_confidence"] = (
+                skipped_by_reason.get("low_confidence", 0) + 1
+            )
             continue
 
         # Додаткові перевірки (можна розширити)
-        if signal.get("signal", "NONE").upper() not in [
-            "ALERT",
-            "ALERT_BUY",
-            "ALERT_SELL",
-        ]:
+        sig_type = str(signal.get("signal", "NONE")).upper()
+        if sig_type not in ["ALERT_BUY", "ALERT_SELL"]:
             logger.info(
                 f"⛔️ Не відкриваємо угоду для {symbol}: тип сигналу {signal.get('signal')} "
-                "не є ALERT"
+                "не є ALERT_BUY/ALERT_SELL"
             )
             logger.debug(
                 f"Деталі сигналу: {json.dumps(signal, ensure_ascii=False, default=str)}"
+            )
+            skipped_by_reason["not_alert"] = skipped_by_reason.get("not_alert", 0) + 1
+            continue
+
+        # Вимагаємо явний стан 'alert' якщо передається
+        state_val = signal.get("state") or signal.get("status")
+        if isinstance(state_val, dict):
+            state_val = state_val.get("status") or state_val.get("state")
+        if isinstance(state_val, str) and state_val.lower() != "alert":
+            logger.info(f"⛔️ Пропуск відкриття {symbol}: state='{state_val}' ≠ 'alert'")
+            skipped_by_reason["not_state_alert"] = (
+                skipped_by_reason.get("not_state_alert", 0) + 1
             )
             continue
 
@@ -99,6 +117,9 @@ async def open_trades(
                     logger.info(
                         f"⛔️ Пропуск відкриття {symbol}: 1h не підтверджує (htf_ok=False)"
                     )
+                    skipped_by_reason["htf_block"] = (
+                        skipped_by_reason.get("htf_block", 0) + 1
+                    )
                     continue
                 if isinstance(atr_pct, (int, float)) and isinstance(
                     low_gate, (int, float)
@@ -106,6 +127,9 @@ async def open_trades(
                     if float(atr_pct) < float(low_gate):
                         logger.info(
                             f"⛔️ Пропуск відкриття {symbol}: ATR%% {float(atr_pct)*100:.2f}% нижче порогу {float(low_gate)*100:.2f}%"
+                        )
+                        skipped_by_reason["low_atr"] = (
+                            skipped_by_reason.get("low_atr", 0) + 1
                         )
                         continue
             except Exception:
@@ -142,6 +166,15 @@ async def open_trades(
             )
         except Exception as e:  # broad except: відкриття угоди не критичне
             logger.error(f"Помилка відкриття угоди для {symbol}: {str(e)}")
+
+    # Зведений лог причин пропусків (корисно для моніторингу)
+    if skipped_by_reason:
+        try:
+            logger.info(
+                "Stage3 пропуски: %s", json.dumps(skipped_by_reason, ensure_ascii=False)
+            )
+        except Exception:
+            logger.info("Stage3 пропуски: %s", skipped_by_reason)
 
 
 __all__ = ["open_trades"]

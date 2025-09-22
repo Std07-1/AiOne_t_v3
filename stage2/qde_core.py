@@ -38,6 +38,7 @@ import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
 
+from config.config import STAGE2_RANGE_PARAMS
 from utils.utils import safe_number as _safe
 
 # ── Logger ──
@@ -135,7 +136,12 @@ def detect_anomalies(
         "vwap_whipsaw": vwap_dev > 3.0 * cfg.vwap_threshold,
     }
     # підсилюємо з урахуванням зовнішніх trigger_reasons
-    if "volume_spike" in triggers:
+    trigs = set(triggers or [])
+    if (
+        "volume_spike" in trigs
+        or "bull_vol_spike" in trigs
+        or "bear_vol_spike" in trigs
+    ):
         anomalies["volume_spike"] = True
     return anomalies
 
@@ -196,7 +202,12 @@ def analyze_micro(
     vwap_pressure = min(vwap_dev / max(1e-6, cfg.vwap_threshold), 2.0)
 
     # якщо є явний тригер, легенько підсилюємо
-    if "volume_spike" in triggers:
+    trigs = set(triggers or [])
+    if (
+        "volume_spike" in trigs
+        or "bull_vol_spike" in trigs
+        or "bear_vol_spike" in trigs
+    ):
         volume_anomaly = min(1.0, volume_anomaly + 0.15)
     if "volatility_burst" in triggers:
         # Форсуємо шок ціни для виділення HIGH_VOLATILITY у матриці
@@ -454,6 +465,13 @@ def make_recommendation(ctx: dict[str, Any], conf: dict[str, float]) -> str:
     d_s = km.get("dist_to_support_pct", None)
     d_r = km.get("dist_to_resistance_pct", None)
     band = km.get("band_pct", None)
+    # локальний htf_ok: вважаємо True лише якщо meso.htf_alignment>=0.5
+    htf_ok_local = None
+    try:
+        htf = (ctx.get("meso") or {}).get("htf_alignment")
+        htf_ok_local = bool(htf is not None and float(htf) >= 0.5)
+    except Exception:
+        htf_ok_local = None
 
     # Спершу сценарій-специфічні рекомендації (вони мають пріоритет над раннім гейтом)
     if scn == Scenario.MANIPULATED:
@@ -469,18 +487,37 @@ def make_recommendation(ctx: dict[str, Any], conf: dict[str, float]) -> str:
             "SELL_ON_RALLIES" if isinstance(d_r, (int, float)) and d_r < 2.0 else "HOLD"
         )
     if scn == Scenario.RANGE_BOUND:
-        # Торгівля від меж лише коли дуже близько до рівня (<0.5%)
-        if isinstance(d_s, (int, float)) and d_s < 0.5:
-            return "BUY_IN_DIPS"
-        if isinstance(d_r, (int, float)) and d_r < 0.5:
-            return "SELL_ON_RALLIES"
-        # Якщо немає зовнішніх тригерів і діапазон досить вузький (<2%), краще дочекатися підтвердження
-        if (not ctx.get("triggers")) and isinstance(band, (int, float)) and band < 2.0:
-            return "WAIT_FOR_CONFIRMATION"
-        # Інакше допускаємо торгівлю в діапазоні для помірного діапазону (<5%)
-        if isinstance(band, (int, float)) and band < 5.0:
+        # За замовчуванням — очікування підтвердження в діапазоні
+        # Параметри з конфігурації
+        try:
+            near_edge_pct = float(STAGE2_RANGE_PARAMS.get("near_edge_pct", 1.0))
+        except Exception:
+            near_edge_pct = 1.0
+        try:
+            comp_min = float(STAGE2_RANGE_PARAMS.get("comp_min", 0.55))
+        except Exception:
+            comp_min = 0.55
+        try:
+            band_min_pct = float(STAGE2_RANGE_PARAMS.get("band_min_pct", 1.5))
+        except Exception:
+            band_min_pct = 1.5
+        near_edge = (isinstance(d_s, (int, float)) and d_s < near_edge_pct) or (
+            isinstance(d_r, (int, float)) and d_r < near_edge_pct
+        )
+        try:
+            band_val = float(band) if isinstance(band, (int, float)) else None
+        except Exception:
+            band_val = None
+        non_tight_range = band_val is None or band_val >= band_min_pct
+        can_trade_range = (
+            near_edge
+            and (composite >= comp_min)
+            and (htf_ok_local is True)
+            and non_tight_range
+        )
+        if can_trade_range:
+            # дозволяємо торгівлю в діапазоні тільки на краях і з високою впевненістю
             return "RANGE_TRADE"
-        # Фолбек — чекаємо
         return "WAIT_FOR_CONFIRMATION"
 
     # Ранній gate для всіх інших/невизначених сценаріїв: уникаємо активних рішень при низькій впевненості

@@ -11,6 +11,7 @@
 
 # ───────────── Стандартна бібліотека ─────────────
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime
@@ -211,6 +212,31 @@ async def process_single_stage2(
             update["state"] = update.get("state") or ASSET_STATE["NO_TRADE"]
         update["narrative"] = raw_narr or None
         state_manager.update_asset(symbol, update)
+
+        # JSONL аудит Stage2 рішень (best‑effort, без винятків)
+        try:
+            audit = {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "symbol": symbol,
+                "scenario": scenario,
+                "recommendation": recommendation,
+                "signal": signal_type,
+                "confidence": composite_conf,
+                "htf_ok": (market_ctx.get("meta", {}) or {}).get("htf_ok"),
+                "atr_pct": (market_ctx.get("meta", {}) or {}).get("atr_pct"),
+                "low_gate": (market_ctx.get("meta", {}) or {}).get("low_gate"),
+                "near_edge": (
+                    (market_ctx.get("key_levels_meta", {}) or {}).get("band_pct")
+                    if isinstance(market_ctx, dict)
+                    else None
+                ),
+                "triggers": merged_triggers,
+            }
+            line = json.dumps(audit, ensure_ascii=False)
+            with open("stage2_decisions.jsonl", "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
     except Exception:
         logger.exception("Stage2 помилка для %s", symbol)

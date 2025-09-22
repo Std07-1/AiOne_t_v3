@@ -120,6 +120,8 @@ class MetricResults:
 ASSET_CLASS_MAPPING: dict[str, list[str]]
 STAGE2_CONFIG: dict[str, Any]
 OPTUNA_PARAM_RANGES: dict[str, tuple]
+STAGE2_RANGE_PARAMS: dict[str, float]
+STAGE3_TRADE_PARAMS: dict[str, float]
 
 INTERVAL_TTL_MAP: dict[str, int]
 

@@ -469,13 +469,13 @@ class AssetMonitorStage1:
                 symbol=symbol,
                 use_vol_atr=self.use_vol_atr,
             ):
-                # Upward-only: враховуємо сплеск обсягу лише для «зеленого» бару
+                # Визначаємо напрям бару, щоб розрізняти бичий/ведмежий сплеск
                 try:
                     last_open = float(df["open"].iloc[-1])
                     last_close = float(df["close"].iloc[-1])
                     upward = last_close > last_open
                 except Exception:
-                    upward = True  # якщо неможливо визначити — не блокуємо
+                    upward = True  # якщо неможливо визначити — припускаємо вгору
                 # Визначимо, яка саме умова спрацювала, щоб лог не вводив в оману
                 try:
                     z_val = float(stats.get("volume_z", 0.0))
@@ -484,17 +484,23 @@ class AssetMonitorStage1:
                 # (VOL/ATR гілка вимкнена за замовчуванням)
                 if upward:
                     reason_txt = (
-                        f"📈 Сплеск обсягу (Z>{volz:.2f})"
+                        f"📈 Бичий сплеск обсягу (Z>{volz:.2f})"
                         if z_val >= volz
-                        else "📈 Сплеск обсягу (VOL/ATR)"
+                        else "📈 Бичий сплеск обсягу (VOL/ATR)"
                     )
-                    _add("volume_spike", reason_txt)
+                    _add("bull_volume_spike", reason_txt)
                     logger.debug(
-                        f"[{symbol}] Volume spike detected (upward) | Z={z_val:.2f} thr={volz:.2f} use_vol_atr={self.use_vol_atr}"
+                        f"[{symbol}] Bull volume spike | Z={z_val:.2f} thr={volz:.2f} use_vol_atr={self.use_vol_atr}"
                     )
                 else:
+                    reason_txt = (
+                        f"📉 Ведмежий сплеск обсягу (Z>{volz:.2f})"
+                        if z_val >= volz
+                        else "📉 Ведмежий сплеск обсягу (VOL/ATR)"
+                    )
+                    _add("bear_volume_spike", reason_txt)
                     logger.debug(
-                        f"[{symbol}] Volume spike suppressed (downward bar): open={last_open:.6f} close={last_close:.6f}"
+                        f"[{symbol}] Bear volume spike | Z={z_val:.2f} thr={volz:.2f} use_vol_atr={self.use_vol_atr}"
                     )
 
         # 2. Пробій рівнів (локальний breakout, підхід до рівня)

@@ -20,6 +20,7 @@ import logging
 import os
 from typing import Any, cast
 
+import aiohttp
 import orjson
 import pandas as pd
 import websockets
@@ -102,7 +103,7 @@ DEFAULT_SYMBOLS = [s.lower() for s in STATIC_SYMBOLS.split(",") if s] or ["btcus
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.data.ws_worker")
 if not logger.handlers:
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     # show_path=True для точного місця походження WARNING/ERROR
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=True))
     logger.propagate = False
@@ -286,6 +287,8 @@ class WSWorker:
             pass
 
         # Write via UnifiedDataStore (single row DataFrame) — без конвертації часу
+        is_closed = bool(k.get("x", False))
+        close_time_val = ts + 60_000 - 1
         df_row = pd.DataFrame(
             [
                 {
@@ -295,7 +298,8 @@ class WSWorker:
                     "low": bar["low"],
                     "close": bar["close"],
                     "volume": bar["volume"],
-                    "close_time": ts + 60_000,
+                    "close_time": close_time_val,
+                    "is_closed": is_closed,
                 }
             ]
         )
@@ -322,8 +326,112 @@ class WSWorker:
         # Запис у Redis (як fallback і для stage2+)
         df_1m = await self._store_minute(sym, ts, k)
         await self.store.redis.r.publish(PARTIAL_CHANNEL, sym)
-        if k.get("x"):
-            await self._on_final_candle(sym, df_1m)
+        if is_closed:
+            # Gap-detector: очікуємо, що цей open_time на 60_000 більший за попередній закритий
+            try:
+                prev = await self.store.get_df(sym, tf, limit=2)
+                if prev is not None and len(prev) >= 2:
+                    last_two = prev.tail(2)
+                    ot_prev = int(last_two["open_time"].iloc[-2])
+                    ot_cur = int(last_two["open_time"].iloc[-1])
+                    if (ot_cur - ot_prev) != 60_000:
+                        logger.warning(
+                            "[WS GAP] %s %s gap detected: prev=%s cur=%s delta=%s",
+                            sym,
+                            tf,
+                            ot_prev,
+                            ot_cur,
+                            ot_cur - ot_prev,
+                        )
+                        # Мінімальний auto-heal: backfill пропущених хвилин через REST
+                        missing = (ot_cur - ot_prev) // 60_000 - 1
+                        if missing > 0:
+                            # Запускаємо у фоні, щоб не блокувати WS-цикл
+                            asyncio.create_task(
+                                self._safe_backfill(
+                                    sym=sym,
+                                    start_open_time=ot_prev + 60_000,
+                                    end_open_time=ot_cur - 60_000,
+                                    max_bars=missing,
+                                )
+                            )
+            except Exception:
+                pass
+            # Публікуємо 1h лише на межі години
+            if (close_time_val % 3_600_000) == (3_600_000 - 1):
+                await self._on_final_candle(sym, df_1m)
+
+    async def _backfill_gap_1m(
+        self,
+        sym: str,
+        *,
+        start_open_time: int,
+        end_open_time: int,
+        max_bars: int,
+    ) -> None:
+        """Backfill пропущених 1m барів через Binance Futures REST.
+
+        Args:
+            sym: символ у lower (напр., "btcusdt").
+            start_open_time: перший пропущений open_time (ms, UTC).
+            end_open_time: останній пропущений open_time (ms, UTC).
+            max_bars: верхня межа кількості барів (зазвичай невеликий).
+        """
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        interval = "1m"
+        # Binance дозволяє limit до ~1500; для безпеки візьмемо 1000
+        remaining = max_bars
+        start = start_open_time
+        async with aiohttp.ClientSession() as sess:
+            while remaining > 0 and start <= end_open_time:
+                limit = min(1000, remaining)
+                params: dict[str, str | int] = {
+                    "symbol": sym.upper(),
+                    "interval": interval,
+                    "startTime": int(start),
+                    # endTime інколи корисний, але можна не ставити, щоб брати limit від start
+                    "limit": int(limit),
+                }
+                async with sess.get(
+                    url, params=params, timeout=aiohttp.ClientTimeout(total=5.0)
+                ) as resp:
+                    if resp.status != 200:
+                        txt = await resp.text()
+                        raise RuntimeError(
+                            f"REST backfill HTTP {resp.status}: {txt[:200]}"
+                        )
+                    data = await resp.json()
+                if not data:
+                    break
+                # Побудуємо DataFrame з потрібними колонками
+                rows = []
+                for it in data:
+                    # формат: [open_time, o, h, l, c, v, close_time, ... , trades, ...]
+                    ot = int(it[0])
+                    if ot > end_open_time:
+                        break
+                    rows.append(
+                        {
+                            "open_time": ot,
+                            "open": float(it[1]),
+                            "high": float(it[2]),
+                            "low": float(it[3]),
+                            "close": float(it[4]),
+                            "volume": float(it[5]),
+                            "close_time": int(it[6]),
+                            "is_closed": True,
+                        }
+                    )
+                if not rows:
+                    break
+                df = pd.DataFrame(rows)
+                await self.store.put_bars(sym, "1m", df)
+                # Рухаємося далі
+                last_ot = int(df["open_time"].iloc[-1])
+                if last_ot >= end_open_time:
+                    break
+                start = last_ot + 60_000
+                remaining -= len(df)
             # Стенограма видалена
             # Опціональний reactive Stage1 hook: викликати монітор одразу після закриття бару
             try:
@@ -335,9 +443,35 @@ class WSWorker:
                     # не блокуємо WS – запускаємо як окрему задачу
                     import asyncio as _asyncio
 
-                    _asyncio.create_task(self._reactive_stage1_call(monitor, sym, bar))
+                    _asyncio.create_task(self._reactive_stage1_call(monitor, sym, None))
             except Exception:  # pragma: no cover
                 pass
+
+    async def _safe_backfill(
+        self,
+        *,
+        sym: str,
+        start_open_time: int,
+        end_open_time: int,
+        max_bars: int,
+    ) -> None:
+        """Безпечний обгортник backfill з перехопленням винятків."""
+        try:
+            await self._backfill_gap_1m(
+                sym,
+                start_open_time=start_open_time,
+                end_open_time=end_open_time,
+                max_bars=max_bars,
+            )
+            logger.info(
+                "[WS GAP] backfill done %s 1m: %s→%s (%s bars)",
+                sym,
+                start_open_time,
+                end_open_time,
+                max_bars,
+            )
+        except Exception as e:
+            logger.warning("[WS GAP] backfill failed %s 1m: %s", sym, e, exc_info=True)
 
     async def _refresh_symbols(self, ws: Any) -> None:
         """Фоновий таск: refresh whitelist і ресабскрайб."""

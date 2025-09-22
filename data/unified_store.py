@@ -966,7 +966,16 @@ class UnifiedDataStore:
     @staticmethod
     def _dedup_sort(df: pd.DataFrame) -> pd.DataFrame:
         if "open_time" in df.columns:
-            df = df.drop_duplicates(subset=["open_time"]).sort_values("open_time")
+            # Строгий upsert: якщо є колонка is_closed, то фіналізований рядок
+            # має пріоритет над незакритим для того ж open_time.
+            if "is_closed" in df.columns:
+                df = df.sort_values(
+                    ["open_time", "is_closed"]
+                ).drop_duplicates(  # False < True
+                    subset=["open_time"], keep="last"
+                )
+            else:
+                df = df.drop_duplicates(subset=["open_time"]).sort_values("open_time")
         return df.reset_index(drop=True)
 
     def _merge_bars(
@@ -1003,6 +1012,13 @@ class UnifiedDataStore:
         if len(parts) == 1:
             return self._dedup_sort(parts[0].copy())
         cat = pd.concat(parts, ignore_index=True)
+        # Якщо присутній is_closed — забезпечимо пріоритет фіналізованих
+        if "is_closed" in cat.columns:
+            cat = cat.sort_values(
+                ["open_time", "is_closed"]
+            ).drop_duplicates(  # відкриті перед закритими
+                subset=["open_time"], keep="last"
+            )
         return self._dedup_sort(cat)
 
     def _validate_bars(self, df: pd.DataFrame, *, stage: str) -> None:

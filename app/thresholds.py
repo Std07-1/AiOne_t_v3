@@ -71,6 +71,16 @@ class Thresholds:
             "vwap_deviation", config.get("vwap_deviation_threshold", 0.02)
         )  # 2% за замовчуванням
 
+        # Розширена конфігурація (необов'язкова): для state-aware порогів
+        # Залишаємо як словники, щоб не ламати існуючі тести/АПІ
+        self.signal_thresholds: dict[str, Any] = dict(
+            config.get("signal_thresholds", {}) or {}
+        )
+        self.state_overrides: dict[str, dict[str, float]] = dict(
+            config.get("state_overrides", {}) or {}
+        )
+        self.meta: dict[str, Any] = dict(config.get("meta", {}) or {})
+
         # Калібрування відключено – просто пост-обробка
         self._post_init()
 
@@ -104,35 +114,37 @@ class Thresholds:
         # Видаляємо symbol із calibrated_params, щоб уникнути float('btcusdt')
         # (залишено як коментар: {k: v for k, v in data.items() if k != "symbol"})
 
+        cfg: dict[str, Any] = {
+            "low_gate": data.get("low_gate", 0.0015),  # Нижня межа ATR/price (0.15%)
+            "high_gate": data.get("high_gate", 0.0134),  # Верхня межа ATR/price (1.34%)
+            "atr_target": float(
+                data.get("atr_target", 0.3)
+            ),  # Цільовий ATR (float; раніше помилково список)
+            "volume_z_threshold": data.get(
+                "volume_z_threshold", data.get("vol_z_threshold", 1.2)
+            ),  # сплеск обсягу ≥1.2σ (уніфіковано з fallback)
+            "rsi_oversold": data.get(
+                "rsi_oversold", 23.0
+            ),  # Рівень перепроданності RSI (23%)
+            "rsi_overbought": data.get(
+                "rsi_overbought", 74.0
+            ),  # Рівень перекупленості RSI (74%)
+            "atr_period": 14,  # Період ATR (14)
+            "min_atr_percent": data.get(
+                "min_atr_percent", data.get("atr_pct_min", 0.002)
+            ),  # Мінімальний ATR у відсотках
+            "vwap_deviation": data.get(
+                "vwap_deviation", data.get("vwap_deviation_threshold", 0.02)
+            ),  # Поріг відхилення від VWAP
+        }
+        # Пропускаємо розширені поля як є (беккомпат):
+        for k in ("signal_thresholds", "state_overrides", "meta"):
+            if k in data:
+                cfg[k] = data[k]
+
         return cls(
             symbol=symbol,
-            config={
-                "low_gate": data.get(
-                    "low_gate", 0.0015
-                ),  # Нижня межа ATR/price (0.15%)
-                "high_gate": data.get(
-                    "high_gate", 0.0134
-                ),  # Верхня межа ATR/price (1.34%)
-                "atr_target": float(
-                    data.get("atr_target", 0.3)
-                ),  # Цільовий ATR (float; раніше помилково список)
-                "volume_z_threshold": data.get(
-                    "volume_z_threshold", data.get("vol_z_threshold", 1.2)
-                ),  # сплеск обсягу ≥1.2σ (уніфіковано з fallback)
-                "rsi_oversold": data.get(
-                    "rsi_oversold", 23.0
-                ),  # Рівень перепроданності RSI (23%)
-                "rsi_overbought": data.get(
-                    "rsi_overbought", 74.0
-                ),  # Рівень перекупленості RSI (74%)
-                "atr_period": 14,  # Період ATR (14)
-                "min_atr_percent": data.get(
-                    "min_atr_percent", data.get("atr_pct_min", 0.002)
-                ),  # Мінімальний ATR у відсотках
-                "vwap_deviation": data.get(
-                    "vwap_deviation", data.get("vwap_deviation_threshold", 0.02)
-                ),  # Поріг відхилення від VWAP
-            },
+            config=cfg,
             calibrated_params=None,  # калібрування вимкнено
         )
 
@@ -148,6 +160,171 @@ class Thresholds:
             "min_atr_percent": self.min_atr_percent,
             "vwap_deviation": self.vwap_deviation,
         }
+
+    # ────────────────────── State-aware resolve (мінімальна версія) ──────────────────────
+    def effective_thresholds(
+        self,
+        *,
+        market_state: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Обчислює «ефективні» пороги з урахуванням state_overrides.
+
+        Args:
+            market_state: Простий класифікатор стану ринку
+                ("range_bound" | "trend_strong" | "high_volatility" | None).
+
+        Returns:
+            dict[str, Any]: плаский базовий словник порогів + вкладені signal_thresholds
+                (тільки невелика підмножина, яку використовує Stage1).
+
+        Notes:
+            - Мінімальні зміни: застосовуємо лише коригування для ключів, які
+              безпосередньо використовує Stage1 сьогодні: vol_z_threshold, vwap_deviation.
+            - Підтримуємо dot-path у overrides (наприклад, "volume_spike.z_score").
+            - Для числових полів overrides трактуються як Δ (дельта): додаємо до бази.
+        """
+        # Базова копія з основних полів
+        effective: dict[str, Any] = {
+            "low_gate": float(self.low_gate),
+            "high_gate": float(self.high_gate),
+            "atr_target": float(self.atr_target),
+            "vol_z_threshold": float(self.vol_z_threshold),
+            "rsi_oversold": float(self.rsi_oversold),
+            "rsi_overbought": float(self.rsi_overbought),
+            "min_atr_percent": float(self.min_atr_percent),
+            "vwap_deviation": float(self.vwap_deviation),
+            # вкладені зони
+            "signal_thresholds": {
+                k: (v.copy() if isinstance(v, dict) else v)
+                for k, v in (self.signal_thresholds or {}).items()
+            },
+        }
+
+        # 1) Базове застосування atr_volatility → low/high gates (із signal_thresholds)
+        try:
+            st = effective.get("signal_thresholds", {}) or {}
+            av = st.get("atr_volatility", {}) or {}
+
+            def _to_fraction(val: Any, *, is_pct_hint: bool = False) -> float | None:
+                """Нормалізує значення у частку від 1.
+
+                - Якщо ключ має суфікс _pct або is_pct_hint=True → ділимо на 100.
+                - Інакше: якщо val > 0.2 (ймовірно це відсоток) → поділити на 100,
+                  інакше трактуємо як вже-нормалізовану частку.
+                """
+                try:
+                    x = float(val)
+                except Exception:
+                    return None
+                if is_pct_hint:
+                    return round(x / 100.0, 6)
+                # евристика: значення > 0.2 швидше за все задали у відсотках (наприклад 0.6% → 0.6)
+                return round((x / 100.0) if x > 0.2 else x, 6)
+
+            low_raw = None
+            high_raw = None
+            src = ""
+            if "low_gate_pct" in av or "high_gate_pct" in av:
+                low_raw = _to_fraction(av.get("low_gate_pct"), is_pct_hint=True)
+                high_raw = _to_fraction(av.get("high_gate_pct"), is_pct_hint=True)
+                src = "atr_volatility._pct"
+            elif "low_gate" in av or "high_gate" in av:
+                # TON-варіант конфігу: ключі без _pct, але значення у відсотках за коментарями
+                low_raw = _to_fraction(av.get("low_gate"), is_pct_hint=False)
+                high_raw = _to_fraction(av.get("high_gate"), is_pct_hint=False)
+                src = "atr_volatility"
+
+            applied: dict[str, float] = {}
+            if isinstance(low_raw, float) and low_raw > 0:
+                effective["low_gate"] = float(low_raw)
+                applied["low_gate"] = float(low_raw)
+            if isinstance(high_raw, float) and high_raw > 0:
+                effective["high_gate"] = float(high_raw)
+                applied["high_gate"] = float(high_raw)
+
+            if applied:
+                log.debug(
+                    "effective_thresholds: застосовано atr_volatility",
+                    extra={
+                        "symbol": self.symbol,
+                        "source": src,
+                        "applied": applied,
+                        "base": {
+                            "low_gate": self.low_gate,
+                            "high_gate": self.high_gate,
+                        },
+                    },
+                )
+        except Exception as e:  # не зривати пайплайн
+            log.debug(
+                "effective_thresholds: atr_volatility пропущено через помилку",
+                extra={"symbol": self.symbol, "err": str(e)},
+            )
+
+        # 2) Якщо задано стан — застосовуємо overrides як дельти
+        if market_state and market_state in self.state_overrides:
+            overrides = self.state_overrides.get(market_state, {})
+            for key, delta in overrides.items():
+                try:
+                    # Підтримка dot-path (наприклад, "signal_thresholds.breakout.band_pct_atr")
+                    if "." in key:
+                        parts = key.split(".")
+                        node = effective
+                        # Якщо це відомий тригер без префіксу, застосуємо до signal_thresholds
+                        try:
+                            st = effective.setdefault("signal_thresholds", {})  # type: ignore[assignment]
+                            if parts[0] not in node and parts[0] in (st or {}):
+                                node = st  # direct into signal_thresholds namespace
+                        except Exception:
+                            pass
+                        for p in parts[:-1]:
+                            node = node.setdefault(p, {})  # type: ignore[assignment]
+                        leaf = parts[-1]
+                        base_val = node.get(leaf)
+                        if isinstance(base_val, (int, float)) and isinstance(
+                            delta, (int, float)
+                        ):
+                            node[leaf] = float(base_val) + float(delta)
+                        elif base_val is None and isinstance(delta, (int, float)):
+                            node[leaf] = float(delta)
+                        else:
+                            # Якщо тип нечисловий — просто присвоюємо
+                            node[leaf] = delta
+                    else:
+                        base_val = effective.get(key)
+                        if isinstance(base_val, (int, float)) and isinstance(
+                            delta, (int, float)
+                        ):
+                            effective[key] = float(base_val) + float(delta)
+                        elif base_val is None and isinstance(delta, (int, float)):
+                            effective[key] = float(delta)
+                        else:
+                            effective[key] = delta
+                except Exception:
+                    # Не зривати пайплайн через незнайомий ключ — пропускаємо
+                    continue
+
+        # 3) Гарантуємо коректність меж після можливих дельт
+        try:
+            if effective["high_gate"] <= effective["low_gate"]:
+                effective["high_gate"] = effective["low_gate"] * 1.5
+        except Exception:
+            pass
+        # 4) Синхронізуємо скорочення з вкладених порогів (якщо задані)
+        try:
+            st = effective.get("signal_thresholds", {}) or {}
+            volz_nested = st.get("volume_spike", {}).get("z_score")
+            if isinstance(volz_nested, (int, float)):
+                effective["vol_z_threshold"] = float(volz_nested)
+            vwap_nested = st.get("vwap_deviation", {}).get("threshold")
+            if isinstance(vwap_nested, (int, float)) and not effective.get(
+                "vwap_deviation"
+            ):
+                effective["vwap_deviation"] = float(vwap_nested)
+        except Exception:
+            pass
+        return effective
 
 
 # Redis-ключ

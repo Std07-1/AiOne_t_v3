@@ -93,6 +93,27 @@ def first_not_none(seq: Sequence[Any | None] | None) -> Any | None:
     return None
 
 
+def safe_number(value: Any, default: float = 0.0) -> float:
+    """Безпечне приведення до float з перевіркою finiteness.
+
+    Args:
+        value: Вхідне значення будь-якого типу.
+        default: Значення за замовчуванням, якщо конверсія неможлива або не скінченна.
+
+    Returns:
+        float: Скінченне число або default.
+    """
+    try:
+        if isinstance(value, str):
+            value = value.strip().replace(",", ".")
+        v = float(value)
+        if math.isnan(v) or math.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
 # ── Timestamp / DataFrame ────────────────────────────────────────────────────
 def ensure_timestamp_column(
     df: pd.DataFrame,
@@ -141,6 +162,84 @@ def ensure_timestamp_column(
 
     # Нормалізація колонки
     if "timestamp" in df.columns:
+
+        ts = df["timestamp"]
+
+        # 1) Якщо dtype не datetime → як і було:
+        if not pd.api.types.is_datetime64_any_dtype(ts):
+            if pd.api.types.is_integer_dtype(ts):
+                v = ts.astype("int64")
+                try:
+                    med = float(v.median())
+                except Exception:
+                    med = float(v.iloc[0]) if len(v) else 0.0
+                # Автовизначення одиниць часу за порядком величини
+                if 1e11 <= med < 1e14:
+                    unit = "ms"
+                elif 1e9 <= med < 1e11:
+                    unit = "s"
+                elif 1e14 <= med < 1e17:
+                    unit = "us"
+                elif 1e17 <= med < 1e20:
+                    unit = "ns"
+                else:
+                    unit = "ms"  # дефолт безпечний для Binance
+                df["timestamp"] = pd.to_datetime(
+                    v, unit=unit, errors="coerce", utc=True
+                )
+                _log(f"[ensure_timestamp_column] int→datetime(unit={unit}).")
+            else:
+                df["timestamp"] = pd.to_datetime(ts, errors="coerce", utc=True)
+                _log("[ensure_timestamp_column] to_datetime(auto).")
+        else:
+            # 2) Уже datetime, але схоже на епоху → спробуємо відновити з сирих колонок
+            try:
+                years = ts.dt.year
+                if years.max() <= 1971:
+                    # спроба відновлення з альтернативних сирих полів
+                    candidates = ["open_time", "openTime", "time", "t", "close_time"]
+                    raw_col = None
+                    for c in candidates:
+                        if c in df.columns:
+                            raw_col = c
+                            break
+                    if raw_col is not None:
+                        raw = df[raw_col]
+                        if pd.api.types.is_integer_dtype(raw):
+                            v = raw.astype("int64")
+                            med = float(v.median())
+                            # Вибір одиниць:
+                            # ~1e9..1e10 → секунди, ~1e11..1e13 → мілісекунди,
+                            # ~1e14..1e16 → мікросекунди, ~1e17..1e19 → наносекунди
+                            if 1e11 <= med < 1e14:
+                                unit = "ms"
+                            elif 1e9 <= med < 1e11:
+                                unit = "s"
+                            elif 1e14 <= med < 1e17:
+                                unit = "us"
+                            elif 1e17 <= med < 1e20:
+                                unit = "ns"
+                            else:
+                                unit = None
+                            if unit:
+                                df["timestamp"] = pd.to_datetime(v, unit=unit, utc=True)
+                                _log(
+                                    f"[ensure_timestamp_column] Відновлено з '{raw_col}' (unit={unit})."
+                                )
+                            else:
+                                _log(
+                                    f"[ensure_timestamp_column] '{raw_col}' має нетипову шкалу (median={med:.3g})."
+                                )
+                        else:
+                            _log(
+                                f"[ensure_timestamp_column] '{raw_col}' не є цілочисельним."
+                            )
+                    else:
+                        _log(
+                            "[ensure_timestamp_column] Нема сирої колонки часу для відновлення."
+                        )
+            except Exception:
+                pass
         if not pd.api.types.is_datetime64_any_dtype(df["timestamp"]):
             df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
             _log("[ensure_timestamp_column] Конвертовано 'timestamp' у datetime (UTC).")
@@ -192,6 +291,137 @@ def ensure_timestamp_column(
         return pd.DataFrame()
 
     return df
+
+
+def ensure_epoch_ms_columns(
+    df: pd.DataFrame,
+    *,
+    columns: Sequence[str] = ("open_time", "close_time"),
+    drop_out_of_range: bool = True,
+    future_drift_sec: int = 300,
+    logger_obj: logging.Logger | None = None,
+) -> pd.DataFrame:
+    """Призводить часові колонки до int64 мс від epoch та (опційно) фільтрує аномалії.
+
+    Дії:
+      - Для кожної колонки з `columns`, якщо вона існує:
+        • авто-визначення одиниць (s/ms/us/ns) за медіаною;
+        • конвертація у мілісекунди (int64);
+      - (опційно) видаляє рядки з майбутнім часом (далі ніж `future_drift_sec`) і
+        підозріло малими значеннями (< 2009-01-01).
+
+    Args:
+        df: Вхідний DataFrame.
+        columns: Список часових колонок для нормалізації.
+        drop_out_of_range: Видаляти рядки з аномальним часом.
+        future_drift_sec: Допустимий дрейф у майбутнє (секунди).
+        logger_obj: Необов'язковий логер для діагностики.
+
+    Returns:
+        pd.DataFrame: Новий DataFrame з узгодженими часовими колонками.
+    """
+
+    def _log(msg: str) -> None:
+        if logger_obj:
+            logger_obj.debug(msg)
+
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    out = df.copy()
+    changed = False
+
+    for name in columns:
+        if name not in out.columns:
+            continue
+        s = pd.to_numeric(out[name], errors="coerce").astype("Int64")
+        if len(s) == 0 or s.isna().all():
+            continue
+        try:
+            med = float(s.dropna().astype("int64").median())
+        except Exception:
+            med = float(s.dropna().iloc[0]) if (~s.isna()).any() else 0.0
+        unit = "ms"
+        if 1e11 <= med < 1e14:
+            unit = "ms"
+            conv = s.astype("int64")
+        elif 1e9 <= med < 1e11:
+            unit = "s"
+            conv = s.astype("int64") * 1000
+        elif 1e14 <= med < 1e17:
+            unit = "us"
+            conv = s.astype("int64") // 1000
+        elif 1e17 <= med < 1e20:
+            unit = "ns"
+            conv = s.astype("int64") // 1_000_000
+        else:
+            unit = "unknown"
+            conv = s.astype("int64")
+        if unit != "ms":
+            _log(
+                f"[ensure_epoch_ms_columns] {name}: coerced {unit} → ms (median={med:.3g})"
+            )
+        out[name] = conv
+        changed = True
+
+    if drop_out_of_range and any(c in out.columns for c in columns):
+        # Перевіряємо лише за open_time, якщо він присутній, інакше шукаємо перший наявний
+        ref_col: str | None
+        if columns[0] in out.columns:
+            ref_col = columns[0]
+        else:
+            ref_col = None
+            for c in columns:
+                if c in out.columns:
+                    ref_col = c
+                    break
+        if ref_col is not None:
+            try:
+                now_ms = int(datetime.utcnow().timestamp() * 1000)
+                low_ms = int(datetime(2009, 1, 1).timestamp() * 1000)
+                hi_ms = now_ms + int(max(0, future_drift_sec) * 1000)
+                before = len(out)
+                mask = (
+                    pd.to_numeric(out[ref_col], errors="coerce")
+                    .astype("Int64")
+                    .astype("int64")
+                    .between(low_ms, hi_ms)
+                )
+                filtered = out[mask].copy()
+                removed = before - len(filtered)
+                if removed > 0:
+                    _log(
+                        f"[ensure_epoch_ms_columns] Відфільтровано {removed} рядків поза діапазоном [{low_ms},{hi_ms}] по {ref_col}."
+                    )
+                if before > 0 and len(filtered) == 0:
+                    # Оцінимо медіану як евристичний індикатор «майбутнього»
+                    try:
+                        med_ms = int(
+                            pd.to_numeric(out[ref_col], errors="coerce")
+                            .dropna()
+                            .astype("int64")
+                            .median()
+                        )
+                    except Exception:
+                        med_ms = hi_ms + 1  # змусити політику «future» за замовчуванням
+                    if med_ms > hi_ms:
+                        # Дані в майбутньому (наприклад, 2030 рік) — краще відкинути, ніж пускати далі
+                        _log(
+                            "[ensure_epoch_ms_columns] Усі рядки в майбутньому (med > hi) — відкидаємо набір (без fallback)."
+                        )
+                        out = filtered  # порожньо
+                    else:
+                        # Амбівалентний випадок — залишаємо fallback, щоб не губити можливі коректні дані
+                        _log(
+                            "[ensure_epoch_ms_columns] Весь набір випав, але медіана не в майбутньому — повертаємо без фільтрації (fallback)."
+                        )
+                        # залишаємо out без змін (але вже у ms одиницях)
+                else:
+                    out = filtered
+            except Exception:
+                pass
+
+    return out if changed else df
 
 
 # ── Map / Normalize (рекомендації, TP/SL, тригери) ───────────────────────────

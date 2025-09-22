@@ -29,7 +29,8 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 from app.screening_producer import AssetStateManager, screening_producer
-from app.settings import DataStoreCfg, load_datastore_cfg, settings
+from app.settings import load_datastore_cfg, settings
+from app.thresholds import Thresholds
 from app.utils.helper import (
     estimate_atr_pct,
     resample_5m,
@@ -49,13 +50,13 @@ from config.config import (
     STAGE2_CONFIG,  # (залишаємо якщо ще потрібні switch'і Stage2)
     USER_SETTINGS_DEFAULT,
 )
+from config.TOP100_THRESHOLDS import TOP100_THRESHOLDS
 
 # UnifiedDataStore now the single source of truth
 from data.unified_store import StoreConfig, StoreProfile, UnifiedDataStore
 
 # ─────────────────────────── Імпорти бізнес-логіки ───────────────────────────
 from data.ws_worker import WSWorker
-from monitoring.transcript_recorder import TranscriptConfig, TranscriptRecorder
 from stage1.asset_monitoring import AssetMonitorStage1
 from stage1.indicators import calculate_global_levels
 from stage1.optimized_asset_filter import get_filtered_assets
@@ -80,7 +81,8 @@ load_dotenv()
 logger = logging.getLogger("app.main")
 if not logger.handlers:  # захист від повторної ініціалізації
     logger.setLevel(logging.INFO)
-    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    # show_path=True для відображення файлу/рядка у WARN/ERROR
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=True))
     logger.propagate = False
 
 
@@ -106,8 +108,7 @@ async def bootstrap() -> UnifiedDataStore:
       1. Завантаження datastore конфігурації
       2. Підключення до Redis
       3. Ініціалізація UnifiedDataStore + maintenance loop
-      4. (Опційно) запуск Prometheus metrics server
-      5. Запуск командного адміністративного циклу та health-pinger
+    4. Запуск командного адміністративного циклу
     """
     global store
     cfg = load_datastore_cfg()
@@ -144,33 +145,7 @@ async def bootstrap() -> UnifiedDataStore:
     store = UnifiedDataStore(redis=redis, cfg=store_cfg)
     await store.start_maintenance()
     logger.info("[Launch] UnifiedDataStore maintenance loop started")
-    # Опційний запуск TranscriptRecorder (стенограми) через змінну середовища
-    if os.getenv("MONITOR_TRANSCRIPT", "0") in ("1", "true", "True"):
-        try:
-            raw = os.getenv("MONITOR_SYMBOLS", "").lower()
-            allowed = [s.strip() for s in raw.split(",") if s.strip()]
-            allowed_set = set(allowed)
-            tr_cfg = TranscriptConfig(
-                base_dir=cfg.base_dir, allowed_symbols=allowed_set or None
-            )
-            store.transcript = TranscriptRecorder(tr_cfg)  # type: ignore[attr-defined]
-            await store.transcript.start()  # type: ignore[attr-defined]
-            try:
-                # Діагностика: зафіксувати старт і whitelist символів у стенограмі
-                store.transcript.log_meta(  # type: ignore[attr-defined]
-                    started=True,
-                    allowed_symbols=list(allowed_set) if allowed_set else None,
-                )
-            except Exception:
-                pass
-            logger.info("[Launch] Transcript recorder enabled")
-        except Exception:
-            logger.warning("Transcript recorder initialization failed", exc_info=True)
     # adapters removed – use store directly
-
-    prom_started = start_prometheus_if_enabled(cfg)
-    if prom_started:
-        logger.info("[Launch] Prometheus metrics server on :%s", cfg.prometheus.port)
     if getattr(cfg.admin, "enabled", True):
         admin = DataStoreAdmin(store, store.redis, cfg)
         asyncio.create_task(admin_command_loop(admin))
@@ -180,104 +155,8 @@ async def bootstrap() -> UnifiedDataStore:
         )
     else:
         logger.info("[Launch] Admin command loop disabled via settings")
-    asyncio.create_task(health_pinger(store.metrics, cfg))
-    asyncio.create_task(event_loop_lag_sampler())
-    logger.info("[Launch] Admin command loop + health pinger started")
+    logger.info("[Launch] Admin command loop started")
     return store
-
-
-def start_prometheus_if_enabled(cfg: DataStoreCfg) -> bool:
-    """Запускає HTTP endpoint метрик, якщо активовано у конфізі.
-
-    Returns:
-        bool: True якщо сервер стартував, False якщо вимкнено або залежність відсутня.
-    """
-    if not cfg.prometheus.enabled:
-        return False
-    try:
-        from prometheus_client import start_http_server  # type: ignore
-
-        start_http_server(cfg.prometheus.port)
-        return True
-    except Exception:  # broad except: зовнішня залежність може бути не встановлена
-        logger.warning("Prometheus client не встановлено – метрики HTTP не активні")
-        return False
-
-
-async def health_pinger(metrics: object, cfg: DataStoreCfg) -> None:
-    """Проста періодична інкрементація лічильника для моніторингу життєздатності."""
-    while True:
-        try:
-            # ds_errors_total має label 'stage' -> треба викликати через labels
-            metrics.errors.labels(stage="health_ping").inc()  # type: ignore
-        except Exception:
-            # fallback на raw inc без labels якщо Noop або інша реалізація
-            try:
-                metrics.errors.inc()  # type: ignore
-            except Exception:
-                pass
-        await asyncio.sleep(cfg.admin.health_ping_sec)
-
-
-async def event_loop_lag_sampler(interval: float = 0.5) -> None:
-    """Періодично вимірює лаг планування event loop та експортує
-    histogram event_loop_lag_seconds.
-
-    Лаг = (фактичний інтервал між циклами) - interval якщо позитивний.
-    Негативні/нульові ігноруємо. Використовується кастомний набір бакетів
-    для коротких затримок.
-    """
-    try:
-        from prometheus_client import Histogram  # type: ignore
-    except Exception:  # pragma: no cover
-        return
-
-    try:
-        loop_lag = Histogram(
-            "event_loop_lag_seconds",
-            "Asyncio event loop scheduling lag (actual sleep - expected)",
-            buckets=(
-                0.0005,
-                0.001,
-                0.002,
-                0.005,
-                0.01,
-                0.02,
-                0.05,
-                0.1,
-                0.2,
-                0.5,
-                1.0,
-                2.0,
-            ),
-        )
-    except Exception:  # already registered
-        try:  # pragma: no cover
-            from prometheus_client import REGISTRY  # type: ignore
-
-            loop_lag = None
-            for m in REGISTRY.collect():
-                if m.name == "event_loop_lag_seconds":
-                    loop_lag = m
-                    break
-            if loop_lag is None:
-                return
-        except Exception:
-            return
-
-    loop = asyncio.get_event_loop()
-    prev = loop.time()
-    while True:
-        await asyncio.sleep(interval)
-        now = loop.time()
-        actual = now - prev
-        diff = actual - interval
-        if diff > 0:
-            try:
-                loop_lag.observe(diff)  # type: ignore
-            except Exception:
-                pass
-        prev = now
 
 
 def launch_ui_consumer() -> None:
@@ -409,7 +288,7 @@ async def run_pipeline() -> None:
 
         # Preload денних рівнів
         daily_data = await preload_daily_levels(
-            fast_symbols, days=PRELOAD_DAILY_DAYS, session=session
+            fast_symbols, ds, days=PRELOAD_DAILY_DAYS, session=session
         )
         for sym, df in daily_data.items():
             levels = calculate_global_levels(df, window=20)
@@ -482,6 +361,58 @@ async def run_pipeline() -> None:
             ),
             on_alert=on_alert_stage2,
         )
+        logger.info(
+            (
+                "[Main] AssetMonitorStage1 ініціалізовано: vol_z=%.1f, "
+                "rsi_overbought=%s, rsi_oversold=%s, dyn_mult=%.2f, min_reasons=%d"
+            ),
+            getattr(monitor, "vol_z_threshold", None),
+            getattr(monitor, "rsi_overbought", None),
+            getattr(monitor, "rsi_oversold", None),
+            getattr(monitor, "dynamic_rsi_multiplier", None),
+            getattr(monitor, "min_reasons_for_alert", None),
+        )
+
+        # Предзавантажуємо пороги для top-100 (без Redis-залежності)
+        for sym, cfg in TOP100_THRESHOLDS.items():
+            monitor._symbol_cfg[sym] = Thresholds(symbol=sym, config=cfg)
+        logger.info("[Main] TOP100_THRESHOLDS предзавантаження успішне.")
+
+        # Виводимо приклад порогів саме для перших 5 fast-символів (ефективні значення)
+        try:
+            sample_syms = list(fast_symbols)[:5]
+            if sample_syms:
+                lines: list[str] = []
+                for sym in sample_syms:
+                    # гарантуємо наявність конфігів у моніторі
+                    if sym not in monitor._symbol_cfg and sym in TOP100_THRESHOLDS:
+                        monitor._symbol_cfg[sym] = Thresholds(
+                            symbol=sym, config=TOP100_THRESHOLDS[sym]
+                        )
+                    thr_obj = monitor._symbol_cfg.get(sym)
+                    if not thr_obj:
+                        thr_obj = Thresholds(symbol=sym, config={})
+                        monitor._symbol_cfg[sym] = thr_obj
+                    eff = thr_obj.effective_thresholds(market_state=None)
+                    parts = [
+                        f"low_gate={eff.get('low_gate')}",
+                        f"high_gate={eff.get('high_gate')}",
+                        f"vol_z_threshold={eff.get('vol_z_threshold')}",
+                        f"vwap_deviation={eff.get('vwap_deviation')}",
+                        f"rsi_os={eff.get('rsi_oversold')}",
+                        f"rsi_ob={eff.get('rsi_overbought')}",
+                    ]
+                    lines.append(f"  {sym}: " + ", ".join(parts))
+                logger.info(
+                    "[Main] Приклад порогів для fast-символів (%d):\n%s",
+                    len(sample_syms),
+                    "\n".join(lines),
+                )
+        except Exception as e:
+            logger.debug(
+                "[Main] Не вдалося сформувати приклад порогів для fast-символів: %s", e
+            )
+
         # Надаємо доступ до монітора через store для WSWorker reactive hook
         try:
             # безпечніше пряме присвоєння, аніж setattr (ruff B010)
@@ -588,13 +519,6 @@ async def run_pipeline() -> None:
     except Exception as e:
         logger.error("[Main] run_pipeline error: %s", e)
     finally:
-        # Акуратне завершення стенографа (якщо увімкнено)
-        try:
-            tr = getattr(ds, "transcript", None)
-            if tr is not None:
-                await tr.stop()  # type: ignore[attr-defined]
-        except Exception:
-            pass
         await session.close()
 
 

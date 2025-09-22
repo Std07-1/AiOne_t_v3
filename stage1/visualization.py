@@ -27,7 +27,7 @@ console = Console()
 def print_results(result: list[str], metrics: MetricResults):
     """
     Виводить результати фільтрації у зручному форматі.
-    :param results: список відфільтрованих символів
+    :param result: список відфільтрованих символів
     :param metrics: об'єкт з метриками фільтрації
     """
 

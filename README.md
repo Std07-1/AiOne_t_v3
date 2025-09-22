@@ -56,7 +56,7 @@ REST preload → історичні бари (1m + daily) → Stage1 моніт�
 │  • Prefilter (ліквідність, vol, OI, depth)                         │
 │  • Моніторинг + тригери (volume, volatility, RSI div, breakout)   │
 └───────────────────────────────────────────────────────────────────┘
-          │   (список активів + тригери) 
+          │   (список активів + тригери)
           ▼
 ┌───────────────────────────────────────────────────────────────────┐
 │                           Stage2 (QDE)                            │
@@ -64,7 +64,7 @@ REST preload → історичні бари (1m + daily) → Stage1 моніт�
 │  • Контекст (ATR/RSI/VWAP/Volume профіль)                         │
 │  • Композитний скоринг + рекомендації (BUY/SELL, TP/SL, conf)     │
 └───────────────────────────────────────────────────────────────────┘
-          │   (рекомендації + метрики) 
+          │   (рекомендації + метрики)
           ▼
 ┌───────────────────────────────────────────────────────────────────┐
 │                           Stage3                                  │
@@ -145,12 +145,7 @@ pytest -q
 
 ## 📊 Метрики
 
-Внутрішній `MetricsCollector` агрегує лічильники та таймінги (Stage1/Stage2 цикли, WS повідомлення). Якщо встановлено `prometheus_client`, автоматично піднімається HTTP endpoint (`:8001/metrics`).
-
-Метрики включають (приклади):
-- `stage1_cycle_seconds`, `stage2_cycle_seconds`
-- `ws_messages_total`, `symbols_filtered_total`
-- `prefilter_elapsed_seconds`
+Внутрішній MetricsCollector наразі працює у no-op режимі (Prometheus видалено). Залишені тільки легкі агрегати для UI (див. `monitoring/metrics_reporter.py`).
 
 ## 🚀 Запуск
 
@@ -361,6 +356,118 @@ stage=stage2 kind=dyn_stats rule_id=quiet_market_relax priority=60 evaluations=1
 ## 🔭 Подальші Ідеї (Audit + Thresholds)
 * Винос audit_stream у окремий async sink (S3 / Kafka / Redis Stream).
 * Інтеграція правил для Stage3 (динамічні TP/SL множники).
+
+
+
+
+## 🧩 State‑aware Thresholds (Stage1, мінімалістично)
+
+Для швидкої адаптації порогів у Stage1 без складних правил підтримано два додаткові поля в пороговій конфігурації символу (див. `app/thresholds.py`):
+
+- `signal_thresholds` — прості вкладені налаштування для тригерів (наприклад, `volume_spike.z_score`, `vwap_deviation.threshold`).
+- `state_overrides` — дельти значень за простими станами ринку: `range_bound`, `trend_strong`, `high_volatility`.
+
+Stage1 викликає `Thresholds.effective_thresholds(market_state=...)` і застосовує результат мінімально: наразі використовуються `vol_z_threshold` і `vwap_deviation` (інші значення залишаються для сумісності і майбутніх розширень).
+
+Приклад конфігурації (Python dict):
+
+```python
+{
+    "symbol": "btcusdt",
+    "low_gate": 0.006,
+    "high_gate": 0.015,
+    "vol_z_threshold": 2.0,
+    "vwap_deviation": 0.01,
+    "signal_thresholds": {
+        "volume_spike": {"z_score": 3.0},
+        "vwap_deviation": {"threshold": 0.02}
+    },
+    "state_overrides": {
+        "range_bound": {
+            "vol_z_threshold": +1.0,
+            "vwap_deviation.threshold": +0.01  # dot‑path у вкладені ключі
+        },
+        "high_volatility": {"vol_z_threshold": -0.5}
+    }
+}
+```
+
+Примітки:
+- Беккомпат збережено: якщо `signal_thresholds`/`state_overrides` відсутні, працюють плоскі поля (`vol_z_threshold`, `vwap_deviation`, тощо).
+- `state_overrides` обробляються як дельти до базових значень. Після застосування дельт гарантується коректність `high_gate > low_gate`.
+- Якщо в `signal_thresholds` задано `volume_spike.z_score` чи `vwap_deviation.threshold`, ці значення синхронізуються до верхнього рівня (`vol_z_threshold`/`vwap_deviation`) для зручності Stage1.
+
+Логування:
+- Рівень логів можна задати через `.env` або змінну середовища `LOG_LEVEL` (наприклад: `INFO`, `DEBUG`).
+- При зміні стану ринку для символу Stage1 видає INFO‑подію із знімком ефективних порогів (volZ/vwap/gates).
+
+
+## 📑 Контракт Stage1 → Stage2 → UI (Ключі і дефолти)
+
+Канонічні ключі (див. `config/config.py`):
+
+- Stage1Signal:
+    - symbol (str) — інструмент.
+    - signal (str) — "ALERT" або "NORMAL".
+    - trigger_reasons (list[str]) — уніфіковані теги (див. TRIGGER_NAME_MAP).
+    - stats (dict) — обовʼязково містить: current_price, atr, vwap, daily_low, daily_high; опційно rsi, volume_z, bid_ask_spread тощо.
+    - raw_trigger_reasons (list[str], опц.) — сирі теги до нормалізації.
+    - thresholds (dict, опц.) — застосовані пороги.
+
+- Stage2Output:
+    - market_context (dict) — scenario, triggers, key_levels{immediate_support, immediate_resistance, next_major_level}, key_levels_meta{band_pct, confidence, mid, dist_to_support_pct, dist_to_resistance_pct}.
+    - recommendation (str) — наприклад: BUY_IN_DIPS, SELL_ON_RALLIES, AVOID, HOLD, RANGE_TRADE, AVOID_HIGH_RISK, WAIT_FOR_CONFIRMATION.
+    - confidence_metrics (dict) — breakout_probability, pullback_probability, composite_confidence.
+    - risk_parameters (dict) — sl_level, tp_targets[], risk_reward_ratio.
+    - anomaly_detection (dict) — volume_spike, wide_spread, vwap_whipsaw …
+
+
+
+## 📦 Приклад структури стану активу (K_*)
+
+Нижче наведено компактний приклад одного елемента стану активу у форматі з канонічними ключами K_* (див. `config/config.py`). Це орієнтир для UI/логів/обробників:
+
+```python
+from config.config import (
+    K_SYMBOL, K_SIGNAL, K_TRIGGER_REASONS, K_STATS,
+    K_MARKET_CONTEXT, K_RECOMMENDATION,
+    K_CONFIDENCE_METRICS, K_RISK_PARAMETERS,
+)
+
+asset_state = {
+    K_SYMBOL: "btcusdt",
+    K_SIGNAL: "ALERT_BUY",            # або "ALERT_SELL" / "NORMAL"
+    K_TRIGGER_REASONS: ["volume_spike", "breakout_up"],
+    K_STATS: {
+        "current_price": 65234.5,
+        "atr": 0.0123,
+        "vwap": 65180.2,
+        "daily_low": 64010.0,
+        "daily_high": 65890.0,
+        # опційно: "rsi": 62.1, "volume_z": 3.4, ...
+    },
+    # Результати Stage2 (за наявності):
+    K_MARKET_CONTEXT: {"scenario": "BREAKOUT", "key_levels": {"immediate_resistance": 65500}},
+    K_RECOMMENDATION: "BUY_IN_DIPS",
+    K_CONFIDENCE_METRICS: {"composite_confidence": 0.81},
+    K_RISK_PARAMETERS: {"sl_level": 64500.0, "tp_targets": [66000.0, 67200.0]},
+    # Додаткові службові поля (не K_*):
+    "state": "alert",
+    "stage2": True,
+    "stage2_status": "completed",
+    "last_updated": "2025-09-21T12:34:56Z",
+    "hints": ["Розширення діапазону на високому обсязі"],
+}
+```
+
+Рекомендації:
+- Завжди користуйтесь K_* константами замість хардкод-рядків.
+- Поле `stats` має містити принаймні `current_price`, `atr`, `vwap`, `daily_low`, `daily_high`.
+- Після обробки Stage2 очікуються заповнені `market_context`, `recommendation`, `confidence_metrics`, `risk_parameters`.
+
+Примітки:
+- Усі строкові ключі централізовані: K_SYMBOL, K_SIGNAL, K_STATS, K_TRIGGER_REASONS, K_MARKET_CONTEXT, K_RECOMMENDATION, K_CONFIDENCE_METRICS, K_RISK_PARAMETERS, K_ANOMALY_DETECTION.
+- Використовуйте ці константи у новому коді замість хардкод‑рядків.
 
 
 

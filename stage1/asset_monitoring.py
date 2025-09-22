@@ -24,6 +24,13 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 from app.thresholds import Thresholds, load_thresholds
+from config.config import (  # додано USE_RSI_DIV, USE_VWAP_DEVIATION
+    K_SIGNAL,
+    K_STATS,
+    K_SYMBOL,
+    K_TRIGGER_REASONS,
+    USE_VOL_ATR,
+)
 from stage1.asset_triggers import (
     breakout_level_trigger,
     rsi_divergence_trigger,
@@ -38,18 +45,14 @@ from stage1.indicators import (
     format_rsi,
     vwap_deviation_trigger,
 )
-from utils.utils import ensure_timestamp_column, normalize_trigger_reasons
-
-try:  # optional Prometheus
-    from prometheus_client import Counter, Gauge
-except Exception:  # pragma: no cover
-    Gauge = None  # type: ignore[assignment]
-    Counter = None  # type: ignore[assignment]
+from utils.utils import (
+    normalize_trigger_reasons,
+)
 
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.stage1.asset_monitoring")
 if not logger.handlers:  # guard від подвійного підключення
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
     logger.propagate = False
 
@@ -99,46 +102,52 @@ class AssetMonitorStage1:
         self._sw_triggers = self.feature_switches.get("triggers") or {}
         # Stage2 trigger callback (async function expected). Signature: (signal: dict) -> Awaitable[None]
         self._on_alert_cb = on_alert
-        # ── Prometheus метрики Stage1 (опціонально) ──
-        self._m_feed_lag = None  # Gauge (max feed lag seconds across symbols)
-        self._m_missing_bars = None  # Counter (detected gaps)
+        # Службові маркери для дедуплікації обробки барів
         self._last_processed_last_ts: dict[str, float] = {}
-        self._last_symbol_lag: dict[str, float] = {}
+        # Пер-символьні замки для реактивної обробки
         # Per-symbol reactive lock to avoid overlapping processing
         self._locks: dict[str, asyncio.Lock] = {}
-        if Gauge and Counter:
-            try:
-                from prometheus_client import REGISTRY
+        # Тогл для OR-гілки Vol/ATR у volume_spike
+        self.use_vol_atr: bool = USE_VOL_ATR
 
-                def _gauge(name: str, desc: str):
-                    try:
-                        return Gauge(name, desc)
-                    except Exception:
-                        # спробуємо знайти існуючий
-                        for m in REGISTRY.collect():  # pragma: no cover
-                            if m.name == name:
-                                return m
-                        return None
+        # Можливий оверрайд через feature_switches
+        try:
+            sw = (feature_switches or {}).get("volume_spike", {})
+            if isinstance(sw, dict) and "use_vol_atr" in sw:
+                self.use_vol_atr = bool(sw["use_vol_atr"])
+        except Exception:
+            pass
 
-                def _counter(name: str, desc: str):
-                    try:
-                        return Counter(name, desc)
-                    except Exception:
-                        for m in REGISTRY.collect():  # pragma: no cover
-                            if m.name == name:
-                                return m
-                        return None
+        logger.debug("[Stage1] use_vol_atr=%s", self.use_vol_atr)
 
-                self._m_feed_lag = _gauge(
-                    "stage1_feed_lag_seconds",
-                    "Max feed lag (seconds) across tracked symbols (now - last bar timestamp)",
-                )
-                self._m_missing_bars = _counter(
-                    "stage1_missing_bars_total",
-                    "Accumulated count of inferred missing bars (gaps in timestamps)",
-                )
-            except Exception:  # pragma: no cover
-                pass
+    def _detect_market_state(self, symbol: str, stats: dict[str, Any]) -> str | None:
+        """Грубе евристичне визначення стану ринку.
+
+        Повертає один з: "range_bound" | "trend_strong" | "high_volatility" | None
+
+        Heuristics (мінімально інвазивно):
+          - high_volatility: ATR% > high_gate
+          - range_bound: ATR% < low_gate і |price_change| < 1%
+          - trend_strong: |price_change| >= 2% або RSI далеко від 50 (>|60| або <|40|)
+        """
+        try:
+            price = float(stats.get("current_price") or 0.0)
+            atr = float(stats.get("atr") or 0.0)
+            price_change = float(stats.get("price_change") or 0.0)
+            rsi = float(stats.get("rsi") or 50.0)
+            thr = self._symbol_cfg.get(symbol)
+            low_gate = getattr(thr, "low_gate", 0.006) if thr else 0.006
+            high_gate = getattr(thr, "high_gate", 0.015) if thr else 0.015
+            atr_pct = (atr / price) if price else 0.0
+            if atr_pct > high_gate:
+                return "high_volatility"
+            if atr_pct < low_gate and abs(price_change) < 0.01:
+                return "range_bound"
+            if abs(price_change) >= 0.02 or rsi >= 60 or rsi <= 40:
+                return "trend_strong"
+        except Exception:
+            return None
+        return None
 
     def update_params(
         self,
@@ -200,79 +209,9 @@ class AssetMonitorStage1:
         Забезпечує стандартизацію формату, коректний розрахунок RSI (інкрементально),
         крос-метрики для UI та тригерів.
         """
-        df = ensure_timestamp_column(df)
+        # Не виконуємо конвертацію часу: працюємо з наданим df як є
         if df.empty:
             raise ValueError(f"[{symbol}] Передано порожній DataFrame для статистики!")
-
-        # ── Feed lag & missing bars instrumentation ──
-        try:
-            ts_series = df["timestamp"]
-            # Нормалізуємо до секунд (якщо ms)
-            last_raw = ts_series.iloc[-1]
-            prev_raw = ts_series.iloc[-2] if len(ts_series) > 1 else ts_series.iloc[-1]
-
-            # Конвертація у float seconds
-            def _to_sec(v: Any) -> float:
-                try:
-                    fv = float(v)
-                    # heuristics: ms if >1e12
-                    if fv > 1_000_000_000_000:
-                        return fv / 1000.0
-                    # ns (pandas) if >1e18
-                    if fv > 1_000_000_000_000_000_000:
-                        return fv / 1_000_000_000.0
-                    return fv
-                except Exception:
-                    try:
-                        # try parse via pandas
-                        return pd.to_datetime([v]).view("int64")[0] / 1e9  # type: ignore
-                    except Exception:
-                        return float("nan")
-
-            last_ts = _to_sec(last_raw)
-            prev_ts = _to_sec(prev_raw)
-            now_sec = dt.datetime.now(dt.UTC).timestamp()
-            if self._m_feed_lag is not None and not np.isnan(last_ts):
-                lag = max(0.0, now_sec - last_ts)
-                self._last_symbol_lag[symbol] = lag
-                try:
-                    # оновлюємо gauge максимальним lag по всіх символах
-                    self._m_feed_lag.set(max(self._last_symbol_lag.values()))  # type: ignore
-                except Exception:
-                    pass
-
-            # Missing bars: рахуємо тільки якщо новий last_ts (щоб не подвоювати)
-            if (
-                self._m_missing_bars is not None
-                and not np.isnan(last_ts)
-                and symbol in self._last_processed_last_ts
-                and self._last_processed_last_ts[symbol] != last_ts
-            ):
-                # очікуваний інтервал (median останніх diff або fallback 60s)
-                if len(ts_series) >= 3:
-                    diffs = []
-                    for a, b in zip(
-                        ts_series.values[-10:-1], ts_series.values[-9:], strict=True
-                    ):
-                        da = _to_sec(a)
-                        db = _to_sec(b)
-                        if not np.isnan(da) and not np.isnan(db):
-                            diffs.append(db - da)
-                    expected = float(np.median(diffs)) if diffs else 60.0
-                else:
-                    expected = 60.0
-                gap = last_ts - prev_ts
-                if expected > 0 and gap > expected * 1.5:
-                    missing = int(gap / expected) - 1
-                    if missing > 0:
-                        try:
-                            self._m_missing_bars.inc(missing)  # type: ignore
-                        except Exception:
-                            pass
-            # оновлюємо маркер останнього опрацьованого last_ts
-            self._last_processed_last_ts[symbol] = last_ts
-        except Exception:  # instrumentation не повинен ламати основний потік
-            pass
 
         # 2. Основні ціни/зміни
         price = df["close"].iloc[-1]
@@ -363,232 +302,6 @@ class AssetMonitorStage1:
             logger.debug(f"[{symbol}] Оновлено статистику: {stats}")
         return stats
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Сумісність із старим інтерфейсом тестів/WS: update_and_check(symbol, bar)
-    # ──────────────────────────────────────────────────────────────────────
-    async def update_and_check(
-        self, symbol: str, bar: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Сумісний шім: оновлює останній бар або додає новий, без дублювань.
-
-        Args:
-            symbol: Наприклад, "btcusdt".
-            bar: Словник з полями open/high/low/close/volume/timestamp (секунди).
-
-        Returns:
-            dict: Короткий результат із полями:
-                - action: "replace" | "append"
-                - last_ts: int (секунди)
-                - length: int (довжина ряду після оновлення, якщо відомо)
-
-        Notes:
-            - Працює поверх cache_handler якщо є методи get_df/put_bars.
-            - Якщо методів немає, працює без побічних ефектів і повертає only meta.
-        """
-        ts_sec = int(bar.get("timestamp", 0))
-        if ts_sec <= 0:
-            return {"action": "noop", "last_ts": ts_sec, "length": None}
-
-        # Захист від дублів: якщо цей самий ts уже оброблявся цим інстансом — пропускаємо
-        if self._last_processed_last_ts.get(symbol) == ts_sec:
-            return None  # дублікат, немає змін
-
-        # 1) Отримуємо коротке вікно (останній бар) із кеша, якщо можливо
-        df = None
-        try:
-            get_df = getattr(self.cache_handler, "get_df", None)
-            if callable(get_df):
-                maybe = get_df(symbol, "1m", limit=2)
-                df = await maybe if asyncio.iscoroutine(maybe) else maybe  # type: ignore[misc]
-        except Exception:
-            df = None
-
-        # 2) Визначаємо дію: заміна останнього або додавання нового
-        action = "append"
-        try:
-            if df is not None and not df.empty:
-                cur = df
-                if "timestamp" not in cur.columns and "open_time" in cur.columns:
-                    cur = cur.rename(columns={"open_time": "timestamp"})
-                last_raw = cur["timestamp"].iloc[-1]
-                last_ts = (
-                    pd.to_datetime(last_raw, unit="ms", utc=True)
-                    if isinstance(last_raw, (int, float)) and last_raw > 1e11
-                    else pd.to_datetime(last_raw, utc=True)
-                )
-                new_ts = pd.to_datetime(ts_sec, unit="s", utc=True)
-                if pd.Timestamp(last_ts) == new_ts:
-                    action = "replace"
-        except Exception:
-            pass
-
-        # 3) Пишемо інкремент у UnifiedDataStore‑сумісному форматі, якщо можливо
-        try:
-            put_bars = getattr(self.cache_handler, "put_bars", None)
-            if callable(put_bars):
-                row = pd.DataFrame(
-                    [
-                        {
-                            "open_time": ts_sec * 1000,
-                            "open": float(bar["open"]),
-                            "high": float(bar["high"]),
-                            "low": float(bar["low"]),
-                            "close": float(bar["close"]),
-                            "volume": float(bar["volume"]),
-                            "close_time": ts_sec * 1000 + 60_000,
-                        }
-                    ]
-                )
-                maybe_put = put_bars(symbol, "1m", row)
-                await maybe_put if asyncio.iscoroutine(maybe_put) else None  # type: ignore[misc]
-                # Позначимо цей ts як останньо опрацьований (для дедуплікації наступних викликів)
-                self._last_processed_last_ts[symbol] = float(ts_sec)
-        except Exception:
-            pass
-
-        # 4) Повертаємо короткий результат
-        length = None
-        try:
-            if df is not None:
-                length = len(df) if action == "replace" else len(df) + 1
-        except Exception:
-            pass
-        # Оновлюємо маркер останнього опрацьованого бару для дедуплікації наступних викликів
-        try:
-            self._last_processed_last_ts[symbol] = float(ts_sec)
-        except Exception:
-            pass
-        return {
-            "symbol": symbol,
-            "action": action,
-            "last_ts": ts_sec,
-            "length": length,
-        }
-
-    async def process_new_bar(
-        self,
-        symbol: str,
-        *,
-        timeframe: str = "1m",
-        lookback: int = 50,
-    ) -> dict[str, Any] | None:
-        """Реактивна обробка нового бару для символу.
-
-        1) Забирає коротке вікно останніх барів із UnifiedDataStore (RAM)
-        2) Пропускає, якщо цей самий last_ts вже опрацьовано (захист від дублювань)
-        3) Викликає check_anomalies(symbol, df) і за потреби оновлює state_manager
-
-        Returns: normalізований результат або None, якщо даних немає чи дублікат.
-        """
-        # Ensure a per-symbol lock exists
-        lock = self._locks.setdefault(symbol, asyncio.Lock())
-        try:
-            async with lock:
-                store = getattr(self, "cache_handler", None)
-                if store is None:
-                    return None
-                # Очікуємо, що store має метод get_df(symbol, timeframe, limit)
-                df = await store.get_df(symbol, timeframe, limit=lookback)
-                if df is None or df.empty:
-                    return None
-                if "open_time" in df.columns and "timestamp" not in df.columns:
-                    df = df.rename(columns={"open_time": "timestamp"})
-                df = ensure_timestamp_column(df)
-
-                # Захист від дублювань: пропускаємо, якщо last_ts вже бачили
-                try:
-                    last_raw = df["timestamp"].iloc[-1]
-                    last_ts: float | None
-                    if np.isscalar(last_raw):
-                        try:
-                            last_ts = float(last_raw)  # type: ignore[arg-type]
-                        except Exception:
-                            try:
-                                last_ts = pd.to_datetime(str(last_raw)).timestamp()
-                            except Exception:
-                                last_ts = None
-                    else:
-                        try:
-                            last_ts = pd.to_datetime(str(last_raw)).timestamp()
-                        except Exception:
-                            last_ts = None
-                except Exception:
-                    last_ts = None
-                if (
-                    last_ts is not None
-                    and symbol in self._last_processed_last_ts
-                    and self._last_processed_last_ts[symbol] == last_ts
-                ):
-                    return None
-
-                signal = await self.check_anomalies(symbol, df)
-                # Нормалізуємо типи для state_manager
-                try:
-                    from utils.utils import (  # локальний імпорт, щоб уникнути циклів
-                        normalize_result_types,
-                    )
-
-                    normalized = normalize_result_types(signal)
-                except Exception:
-                    normalized = signal  # fallback
-
-                # Transcript recorder (опційно): запис сигналу та планування outcomes
-                try:
-                    tr = getattr(self.cache_handler, "transcript", None)
-                    if tr is not None and normalized:
-                        # оцінюємо мітку часу в мс
-                        last_raw = df["timestamp"].iloc[-1]
-                        if hasattr(last_raw, "value"):
-                            ts_ms = int(last_raw.value // 1_000_000)  # type: ignore[attr-defined]
-                        else:
-                            ts_ms = int(
-                                pd.to_datetime(str(last_raw)).value // 1_000_000
-                            )
-                        price = float(
-                            normalized.get("current_price")
-                            or normalized.get("stats", {}).get("current_price")
-                            or df["close"].iloc[-1]
-                        )
-                        sid = tr.log_signal(
-                            symbol=symbol,
-                            ts_ms=ts_ms,
-                            price=price,
-                            signal=str(normalized.get("signal", "")),
-                            reasons=list(normalized.get("trigger_reasons", [])),
-                            stats=normalized.get("stats"),
-                        )
-                        # Плануємо вимірювання наслідків на кількох горизонтах
-                        tr.schedule_outcomes(
-                            store=self.cache_handler,
-                            symbol=symbol,
-                            signal_id=sid,
-                            base_ts_ms=ts_ms,
-                            base_price=price,
-                        )
-                except Exception:
-                    pass
-
-                if self.state_manager is not None:
-                    try:
-                        self.state_manager.update_asset(symbol, normalized)
-                    except Exception:
-                        pass
-
-                # Trigger Stage2 callback if ALERT
-                if normalized and str(normalized.get("signal", "")).upper() == "ALERT":
-                    cb = getattr(self, "_on_alert_cb", None)
-                    if cb and asyncio.iscoroutinefunction(cb):
-                        try:
-                            asyncio.create_task(cb(normalized))
-                        except Exception:
-                            logger.debug(
-                                "[%s] on_alert callback failed", symbol, exc_info=True
-                            )
-                return normalized
-        except Exception:
-            logger.debug("[%s] process_new_bar: помилка обробки", symbol, exc_info=True)
-            return None
-
     async def check_anomalies(
         self,
         symbol: str,
@@ -606,19 +319,58 @@ class AssetMonitorStage1:
         if trigger_reasons is None:
             trigger_reasons = []
 
-        # Короткий DEBUG head/tail по колонці часу (якщо є)
+        # Boundary log: отримано DataFrame для аналізу (лише raw numeric значення)
         try:
-            ts = df["timestamp"] if "timestamp" in df.columns else df.index
-            head_vals = [str(x) for x in list(ts[:3])]
-            tail_vals = [str(x) for x in list(ts[-3:])]
-            logger.debug(
-                "[check_anomalies] %s | time head:3=%s\ttail:3=%s",
-                symbol,
-                head_vals,
-                tail_vals,
-            )
+            n = len(df)
+            if "timestamp" in df.columns:
+                t_head = (
+                    pd.to_numeric(df["timestamp"], errors="coerce")
+                    .astype("Int64")
+                    .head(3)
+                    .dropna()
+                    .astype("int64")
+                    .tolist()
+                )
+                t_tail = (
+                    pd.to_numeric(df["timestamp"], errors="coerce")
+                    .astype("Int64")
+                    .tail(3)
+                    .dropna()
+                    .astype("int64")
+                    .tolist()
+                )
+                logger.debug(
+                    "[Stage1 RECEIVE] %s | rows=%d timestamp head=%s tail=%s",
+                    symbol,
+                    n,
+                    t_head,
+                    t_tail,
+                )
         except Exception:
             pass
+
+        # Додатково: лог сирих open_time/close_time як приходять (інт/рядки)
+        try:
+            if "open_time" in df.columns:
+                ot = pd.to_numeric(df["open_time"], errors="coerce").astype("Int64")
+                logger.debug(
+                    "[check_anomalies] %s | RAW open_time head=%s tail=%s",
+                    symbol,
+                    ot.head(3).dropna().astype("int64").tolist(),
+                    ot.tail(3).dropna().astype("int64").tolist(),
+                )
+            if "close_time" in df.columns:
+                ct = pd.to_numeric(df["close_time"], errors="coerce").astype("Int64")
+                logger.debug(
+                    "[check_anomalies] %s | RAW close_time head=%s tail=%s",
+                    symbol,
+                    ct.head(3).dropna().astype("int64").tolist(),
+                    ct.tail(3).dropna().astype("int64").tolist(),
+                )
+        except Exception:
+            pass
+
+        # Не конвертуємо час — лишаємо raw numeric логіку вище
 
         # Завжди оновлюємо метрики по новому df
         stats = await self.update_statistics(symbol, df)
@@ -643,11 +395,37 @@ class AssetMonitorStage1:
 
         # Калібровані параметри видалені — використовуються лише завантажені/дефолтні thresholds
 
+        # Визначаємо стан ринку і ефективні пороги (мінімальні зміни)
+        market_state = self._detect_market_state(symbol, stats)
+        try:
+            effective = thr.effective_thresholds(market_state=market_state)
+        except Exception:
+            effective = thr.to_dict()
         logger.debug(
-            f"[check_anomalies] {symbol} | Параметри застосовані: "
-            f"lg={thr.low_gate:.4f}, hg={thr.high_gate:.4f}, volz={thr.vol_z_threshold:.2f}, "
-            f"rsi_os={thr.rsi_oversold}, rsi_ob={thr.rsi_overbought}"
+            f"[check_anomalies] {symbol} | Застосовано пороги: "
+            f"lg={effective.get('low_gate'):.4f}, hg={effective.get('high_gate'):.4f}, "
+            f"volz={effective.get('vol_z_threshold'):.2f}, "
+            f"rsi_os={effective.get('rsi_oversold')}, rsi_ob={effective.get('rsi_overbought')}, "
+            f"state={market_state}"
         )
+        # Інформативний лог на INFO-рівні (нечасто): показати зміну стану
+        try:
+            # Лог лише коли стан змінюється (зберігаємо попередній у self.asset_stats)
+            prev_state = self.asset_stats.get(symbol, {}).get("_market_state")
+            if prev_state != market_state:
+                logger.info(
+                    "[%s] Ринковий стан: %s → ефективні пороги: volZ=%.2f, vwap=%.3f, gates=[%.3f..%.3f]",
+                    symbol,
+                    market_state,
+                    float(effective.get("vol_z_threshold", float("nan"))),
+                    float(effective.get("vwap_deviation", float("nan"))),
+                    float(effective.get("low_gate", float("nan"))),
+                    float(effective.get("high_gate", float("nan"))),
+                )
+            # збережемо стан для наступного порівняння
+            self.asset_stats.setdefault(symbol, {})["_market_state"] = market_state
+        except Exception:
+            pass
 
         def _add(reason: str, text: str) -> None:
             anomalies.append(text)
@@ -670,34 +448,88 @@ class AssetMonitorStage1:
             low_atr_flag = True
             _add("low_volatility", "📉 Низька волатильність")
 
-        # Додаткове логування для зневадження
         logger.debug(
             f"[{symbol}] Перевірка тригерів:"
             f" price={price:.4f}"
-            f" - ATR={atr_pct:.4f} (поріг low={thr.low_gate:.4f}, high={thr.high_gate:.4f})"
-            f" - VolumeZ: {stats['volume_z']:.2f} (поріг {thr.vol_z_threshold:.2f})"
+            f" - ATR={atr_pct:.4f} (поріг low={effective.get('low_gate'):.4f}, high={effective.get('high_gate'):.4f})"
+            f" - VolumeZ: {stats['volume_z']:.2f} (поріг {effective.get('vol_z_threshold'):.2f})"
             f" - RSI: {stats['rsi']:.2f} (OB {over:.2f}, OS {under:.2f})"
-            # f" - VWAP: {stats['vwap']:.4f} (поріг відхилення {thr.vwap_threshold:.2f})"
         )
 
         # ————— ІНТЕГРАЦІЯ ВСІХ СУЧАСНИХ ТРИГЕРІВ —————
         # 1. Сплеск обсягу
         if self._sw_triggers.get("volume_spike", True):
-            if volume_spike_trigger(df, z_thresh=thr.vol_z_threshold):
-                _add("volume_spike", f"📈 Сплеск обсягу (Z>{thr.vol_z_threshold:.2f})")
+            volz = float(
+                effective.get("vol_z_threshold", getattr(thr, "vol_z_threshold", 2.0))
+            )
+            # За замовчуванням використовуємо лише Z-score (use_vol_atr=False)
+            if volume_spike_trigger(
+                df,
+                z_thresh=volz,
+                symbol=symbol,
+                use_vol_atr=self.use_vol_atr,
+            ):
+                # Визначимо, яка саме умова спрацювала, щоб лог не вводив в оману
+                try:
+                    z_val = float(stats.get("volume_z", 0.0))
+                except Exception:
+                    z_val = 0.0
+                # (VOL/ATR гілка вимкнена за замовчуванням)
+                reason_txt = f"📈 Сплеск обсягу (Z>{volz:.2f})"
+                _add("volume_spike", reason_txt)
                 logger.debug(
-                    f"[{symbol}] Volume spike detected: {stats['volume_z']:.2f} > {thr.vol_z_threshold:.2f}"
+                    f"[{symbol}] Volume spike detected by Z | Z={z_val:.2f} thr={volz:.2f}"
                 )
 
         # 2. Пробій рівнів (локальний breakout, підхід до рівня)
         if self._sw_triggers.get("breakout", True):
+            # Налаштування breakout із конфігурації (state-aware)
+            br_cfg: dict[str, Any] = {}
+            try:
+                st = (
+                    effective.get("signal_thresholds", {})
+                    if isinstance(effective, dict)
+                    else {}
+                )
+                if isinstance(st, dict):
+                    br_cfg = st.get("breakout", {}) or {}
+            except Exception:
+                br_cfg = {}
+
+            band_pct_atr = br_cfg.get("band_pct_atr", br_cfg.get("band_pct"))
+            confirm_bars = int(br_cfg.get("confirm_bars", 1) or 1)
+            min_retests = int(br_cfg.get("min_retests", 0) or 0)
+
+            # Обчислимо поріг близькості як частку від ціни: band_pct_atr * (ATR/price)
+            try:
+                atr_pct_local = float(stats.get("atr", 0.0)) / float(price)
+            except Exception:
+                atr_pct_local = 0.0
+            if isinstance(band_pct_atr, (int, float)) and atr_pct_local > 0:
+                near_thr = float(band_pct_atr) * atr_pct_local
+                # Клапани безпеки
+                near_thr = float(min(0.03, max(0.001, near_thr)))
+            else:
+                near_thr = 0.005
+
+            logger.debug(
+                "[%s] Breakout cfg: band_pct_atr=%s → near_thr=%.5f, confirm_bars=%d, min_retests=%d",
+                symbol,
+                band_pct_atr,
+                near_thr,
+                confirm_bars,
+                min_retests,
+            )
+
             breakout = breakout_level_trigger(
                 df,
                 stats,
                 window=20,
-                near_threshold=0.005,
-                near_daily_threshold=0.5,  # наприклад, 0.5%
+                near_threshold=float(near_thr),
+                near_daily_threshold=0.5,  # у % (0.5% за замовчуванням)
                 symbol=symbol,
+                confirm_bars=confirm_bars,
+                min_retests=min_retests,
             )
             if breakout["breakout_up"]:
                 _add("breakout_up", "🔺 Пробій вгору локального максимуму")
@@ -721,9 +553,43 @@ class AssetMonitorStage1:
         if self._sw_triggers.get("rsi", True):
             rsi_res = rsi_divergence_trigger(df, rsi_period=14)
             if rsi_res.get("rsi") is not None:
-                # Замість фіксованих 70/30 — динамічні з stats
+                # Замість фіксованих 70/30 — динамічні з stats, із clamp від конфігу (за наявності)
                 over = stats["dynamic_overbought"]
                 under = stats["dynamic_oversold"]
+                # Застосуємо обмеження (стеля/підлога) з signal_thresholds.rsi_trigger
+                try:
+                    st = (
+                        effective.get("signal_thresholds", {})
+                        if isinstance(effective, dict)
+                        else {}
+                    )
+                    rsi_cfg = st.get("rsi_trigger", {}) if isinstance(st, dict) else {}
+                    clamp_over = rsi_cfg.get("overbought")
+                    clamp_under = rsi_cfg.get("oversold")
+                    over_eff = (
+                        float(min(float(over), float(clamp_over)))
+                        if isinstance(clamp_over, (int, float))
+                        else float(over)
+                    )
+                    under_eff = (
+                        float(max(float(under), float(clamp_under)))
+                        if isinstance(clamp_under, (int, float))
+                        else float(under)
+                    )
+                    if over_eff != over or under_eff != under:
+                        logger.debug(
+                            "[%s] RSI clamp застосовано",
+                            symbol,
+                            extra={
+                                "base": {"over": float(over), "under": float(under)},
+                                "clamp": {"over": clamp_over, "under": clamp_under},
+                                "effective": {"over": over_eff, "under": under_eff},
+                            },
+                        )
+                    over = over_eff
+                    under = under_eff
+                except Exception:
+                    pass
                 if rsi_res["rsi"] > over:
                     _add(
                         "rsi_overbought",
@@ -741,7 +607,10 @@ class AssetMonitorStage1:
 
         # 5. Відхилення від VWAP (порог з thresholds)
         if self._sw_triggers.get("vwap_deviation", True):
-            vwap_thr = getattr(thr, "vwap_deviation", 0.02) or 0.02
+            vwap_thr = float(
+                effective.get("vwap_deviation", getattr(thr, "vwap_deviation", 0.02))
+                or 0.02
+            )
             vwap_trig = vwap_deviation_trigger(
                 self.vwap_manager, symbol, price, threshold=float(vwap_thr)
             )
@@ -778,13 +647,13 @@ class AssetMonitorStage1:
         )
 
         return {
-            "symbol": symbol,
+            K_SYMBOL: symbol,
             "current_price": price,
             "anomalies": anomalies,
-            "signal": signal,
-            "trigger_reasons": trigger_reasons,  # повертаємо канонічні імена
+            K_SIGNAL: signal,
+            K_TRIGGER_REASONS: trigger_reasons,  # повертаємо канонічні імена
             "raw_trigger_reasons": raw_reasons,  # опційно: залишимо для дебагу
-            "stats": stats,
+            K_STATS: stats,
             "calibrated_params": thr.to_dict(),
             "thresholds": thr.to_dict(),
         }

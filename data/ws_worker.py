@@ -27,9 +27,10 @@ from lz4.frame import compress, decompress
 from rich.console import Console
 from rich.logging import RichHandler
 
-from data.unified_store import (  # unified store (single source of truth)
-    UnifiedDataStore,
-)
+# unified store (single source of truth)
+from data.unified_store import UnifiedDataStore
+
+# Аудит: жодної нормалізації часу — працюємо із сирими значеннями як приходять
 
 
 # ── Вбудовані (мінімальні) серіалізатори DataFrame (видалено raw_data.py) ──
@@ -40,12 +41,24 @@ def _df_to_bytes(df: pd.DataFrame, *, compress_lz4: bool = True) -> bytes:
     Якщо є datetime колонка `timestamp`, перетворюємо у int64 ms для JS.
     """
     df_out = df.copy()
+    # 1) Конвертуємо datetime-колонку 'timestamp' у мс (int64) для сумісності з JS
     if "timestamp" in df_out.columns and pd.api.types.is_datetime64_any_dtype(
         df_out["timestamp"]
     ):
         df_out["timestamp"] = (df_out["timestamp"].astype("int64") // 1_000_000).astype(
             "int64"
         )
+    # 2) Якщо індекс datetime-подібний — теж конвертуємо у мс (int64),
+    #    інакше orjson не зможе серіалізувати pandas.Timestamp у split['index']
+    try:
+        if isinstance(
+            df_out.index, pd.DatetimeIndex
+        ) or pd.api.types.is_datetime64_any_dtype(df_out.index):
+            idx_ms = (df_out.index.view("int64") // 1_000_000).astype("int64")
+            df_out.index = idx_ms
+    except Exception:
+        # індекс не datetime або не вдалося — залишаємо як є
+        pass
     raw_json = orjson.dumps(df_out.to_dict(orient="split"))
     if compress_lz4:
         return cast(bytes, compress(raw_json))
@@ -60,6 +73,15 @@ def _bytes_to_df(buf: bytes | str, *, compressed: bool = True) -> pd.DataFrame:
         raw = decompress(raw)
     obj = orjson.loads(raw)
     df = pd.DataFrame(**obj)
+    # Відновлюємо datetime-індекс, якщо індекс цілий (мс)
+    try:
+        if getattr(
+            df.index, "dtype", None
+        ) is not None and pd.api.types.is_integer_dtype(df.index):
+            df.index = pd.to_datetime(df.index.astype("int64"), unit="ms", utc=True)
+    except Exception:
+        pass
+    # Відновлюємо колонку 'timestamp', якщо вона збережена як цілі числа (мс)
     if "timestamp" in df.columns and pd.api.types.is_integer_dtype(df["timestamp"]):
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     return df
@@ -80,8 +102,9 @@ DEFAULT_SYMBOLS = [s.lower() for s in STATIC_SYMBOLS.split(",") if s] or ["btcus
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.data.ws_worker")
 if not logger.handlers:
-    logger.setLevel(logging.WARNING)
-    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.setLevel(logging.DEBUG)
+    # show_path=True для точного місця походження WARNING/ERROR
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=True))
     logger.propagate = False
 
 logging.getLogger("websockets").setLevel(logging.WARNING)
@@ -227,6 +250,10 @@ class WSWorker:
         """
         sym = k["s"].lower()
         ts = int(k["t"])
+
+        if ts < 1_000_000_000_000:  # < 1e12 → це секунди
+            ts *= 1_000
+
         tf = "1m"
         bar = {
             "open": float(k["o"]),
@@ -234,9 +261,31 @@ class WSWorker:
             "low": float(k["l"]),
             "close": float(k["c"]),
             "volume": float(k["v"]),
-            "timestamp": ts,
+            "timestamp": ts,  # має бути ms
         }
-        # Write via UnifiedDataStore (single row DataFrame)
+        # Аудит: лог сирих значень часу/бару (перші повідомлення по символу)
+        try:
+            logger.debug(
+                "[WS RECEIVE] %s | t=%s x=%s",
+                sym,
+                k.get("t"),
+                k.get("x"),
+            )
+            logger.debug(
+                "[WS RAW] %s t=%s o=%s h=%s l=%s c=%s v=%s x=%s",
+                sym,
+                k.get("t"),
+                k.get("o"),
+                k.get("h"),
+                k.get("l"),
+                k.get("c"),
+                k.get("v"),
+                k.get("x"),
+            )
+        except Exception:
+            pass
+
+        # Write via UnifiedDataStore (single row DataFrame) — без конвертації часу
         df_row = pd.DataFrame(
             [
                 {
@@ -251,6 +300,13 @@ class WSWorker:
             ]
         )
         try:
+            logger.debug(
+                "[WS PASS] %s | put_bars %s rows=1 open_time=%s close_time=%s",
+                sym,
+                tf,
+                df_row["open_time"].iloc[0],
+                df_row["close_time"].iloc[0],
+            )
             await self.store.put_bars(sym, tf, df_row)
         except Exception as e:
             logger.warning("Failed to put bars into UnifiedDataStore: %s", e)
@@ -268,32 +324,7 @@ class WSWorker:
         await self.store.redis.r.publish(PARTIAL_CHANNEL, sym)
         if k.get("x"):
             await self._on_final_candle(sym, df_1m)
-            # Transcript recorder: лог бару при закритті хвилини (якщо увімкнено)
-            try:
-                tr = getattr(self.store, "transcript", None)
-                if tr is not None:
-                    # Діагностика: чи проходить фільтр allowed_symbols
-                    try:
-                        cfg = getattr(tr, "cfg", None)
-                        allowed_set = getattr(cfg, "allowed_symbols", None)
-                        allowed = (allowed_set is None) or (sym in allowed_set)
-                        tr.log_meta(event="bar_seen", symbol=sym, allowed=allowed)
-                    except Exception:
-                        pass
-                    tr.log_bar(
-                        symbol=sym,
-                        interval=tf,
-                        ts_ms=ts,
-                        open=bar["open"],
-                        high=bar["high"],
-                        low=bar["low"],
-                        close=bar["close"],
-                        volume=bar["volume"],
-                        source="ws",
-                        closed=True,
-                    )
-            except Exception:
-                pass
+            # Стенограма видалена
             # Опціональний reactive Stage1 hook: викликати монітор одразу після закриття бару
             try:
                 import os
@@ -360,41 +391,13 @@ class WSWorker:
                     len(self._symbols),
                     list(self._symbols)[:5],
                 )
-                # Діагностика: запишемо у стенограму початок WS та перші символи
-                try:
-                    tr = getattr(self.store, "transcript", None)
-                    if tr is not None:
-                        tr.log_meta(
-                            event="ws_connect",
-                            total=len(self._symbols),
-                            symbols=list(self._symbols)[:10],
-                        )
-                except Exception:
-                    pass
+                # Стенограма видалена
                 async with websockets.connect(self._ws_url, ping_interval=20) as ws:
                     logger.debug("WS connected (%d streams)…", len(self._symbols))
                     self._backoff = 3
                     self._stop_event.clear()
                     self._refresh_task = asyncio.create_task(self._refresh_symbols(ws))
-                    # Heartbeat meta: підтверджує живість стріму навіть без повідомлень
-                    try:
-                        _tr = getattr(self.store, "transcript", None)
-                        if _tr is not None:
-
-                            async def _hb(tr_local=_tr) -> None:
-                                while True:
-                                    try:
-                                        tr_local.log_meta(
-                                            event="ws_heartbeat",
-                                            total=len(self._symbols),
-                                        )
-                                    except Exception:
-                                        pass
-                                    await asyncio.sleep(30)
-
-                            self._hb_task = asyncio.create_task(_hb())
-                    except Exception:
-                        pass
+                    # Стенограма видалена
                     async for msg in ws:
                         try:
                             data = json.loads(msg).get("data", {}).get("k")
@@ -411,15 +414,7 @@ class WSWorker:
                                 logger.debug("Bad WS message: <unserializable> (%s)", e)
             except Exception as exc:
                 logger.warning("WS error: %s → reconnect in %ds", exc, self._backoff)
-                # Запишемо помилку у стенограму для діагностики
-                try:
-                    tr = getattr(self.store, "transcript", None)
-                    if tr is not None:
-                        tr.log_meta(
-                            event="ws_error", error=str(exc), backoff=self._backoff
-                        )
-                except Exception:
-                    pass
+                # Стенограма видалена
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * 2, 30)
             finally:
@@ -444,7 +439,8 @@ class WSWorker:
         if payload is None:
             try:
                 maybe2 = monitor.process_new_bar(symbol)
-                await maybe2 if asyncio.iscoroutine(maybe2) else None  # type: ignore[misc]
+                if asyncio.iscoroutine(maybe2):
+                    await maybe2
             except Exception:
                 pass
             return
@@ -453,14 +449,16 @@ class WSWorker:
             fn = getattr(monitor, "update_and_check", None)
             if callable(fn):
                 maybe = fn(symbol, payload)
-                await maybe if asyncio.iscoroutine(maybe) else None  # type: ignore[misc]
+                if asyncio.iscoroutine(maybe):
+                    await maybe
                 return
         except Exception:
             pass
         # Fallback
         try:
             maybe2 = monitor.process_new_bar(symbol)
-            await maybe2 if asyncio.iscoroutine(maybe2) else None  # type: ignore[misc]
+            if asyncio.iscoroutine(maybe2):
+                await maybe2
         except Exception:
             pass
 

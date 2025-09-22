@@ -26,11 +26,6 @@ validate_on_read: true
 io_retry_attempts: 3
 io_retry_backoff: 0.25
 
-prometheus:
-  enabled: true
-  port: 9109
-  path: /metrics
-
 admin:
   # вмикає командний канал для живого керування (через redis pubsub)
   commands_channel: ai_one:admin:commands

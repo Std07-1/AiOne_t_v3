@@ -71,12 +71,6 @@ class Profile(BaseModel):
     flush_queue_hard: int = 1000
 
 
-class PrometheusCfg(BaseModel):
-    enabled: bool = True
-    port: int = 9109
-    path: str = "/metrics"
-
-
 class TradeUpdaterCfg(BaseModel):
     skipped_ewma_alpha: float = 0.3
     backoff_multiplier: float = 1.5
@@ -153,7 +147,6 @@ class DataStoreCfg(BaseModel):
     validate_on_read: bool = True
     io_retry_attempts: int = 3
     io_retry_backoff: float = 0.25
-    prometheus: PrometheusCfg = PrometheusCfg()
     admin: AdminCfg = AdminCfg()
 
 

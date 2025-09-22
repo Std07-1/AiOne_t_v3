@@ -11,7 +11,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def get_top100_threshold(symbol: str) -> dict[str, Any] | None:
@@ -45,54 +48,267 @@ def get_top100_threshold(symbol: str) -> dict[str, Any] | None:
             mapping["rsi_overbought"] = cfg.get("rsi_overbought")
         if "rsi_oversold" in cfg:
             mapping["rsi_oversold"] = cfg.get("rsi_oversold")
-        # За потреби можна використати atr_pct_min/vwap_deviation для похідних порогів
+        # Додаткові розширені ключі (пас-тру) для сучасної логіки порогів
+        #  • atr_pct_min → min_atr_percent (бек-сов сумісна назва)
+        #  • vwap_deviation, signal_thresholds, state_overrides, meta — без змін
+        if "atr_pct_min" in cfg:
+            mapping["min_atr_percent"] = cfg.get("atr_pct_min")
+        if "vwap_deviation" in cfg:
+            mapping["vwap_deviation"] = cfg.get("vwap_deviation")
+        st = cfg.get("signal_thresholds")
+        if isinstance(st, dict):
+            mapping["signal_thresholds"] = st
+            # Синхронізація: якщо верхній vwap_deviation не заданий, але є
+            # signal_thresholds.vwap_deviation.threshold — підтягуємо його як базовий.
+            try:
+                if "vwap_deviation" not in mapping:
+                    vwap_thr = st.get("vwap_deviation", {}).get("threshold")
+                    if isinstance(vwap_thr, (int, float)):
+                        mapping["vwap_deviation"] = float(vwap_thr)
+            except Exception:
+                # не критично: пропускаємо, логи нижче покажуть включені ключі
+                pass
+            # Аналогічно: якщо верхній volume_z_threshold відсутній —
+            # візьмемо його зі signal_thresholds.volume_spike.z_score (як дефолт).
+            try:
+                if "volume_z_threshold" not in mapping:
+                    z_thr = st.get("volume_spike", {}).get("z_score")
+                    if isinstance(z_thr, (int, float)):
+                        mapping["volume_z_threshold"] = float(z_thr)
+            except Exception:
+                pass
+        so = cfg.get("state_overrides")
+        if isinstance(so, dict):
+            mapping["state_overrides"] = so
+        meta = cfg.get("meta")
+        if isinstance(meta, dict):
+            mapping["meta"] = meta
+
+        logger.debug(
+            "get_top100_threshold: застосовано мапінг",
+            extra={
+                "symbol": symbol.upper(),
+                "included_keys": sorted(list(mapping.keys())),
+                "source_keys": sorted(list(cfg.keys())),
+            },
+        )
+
         return mapping
     except Exception:
         return None
 
 
-TOP100_THRESHOLDS: dict[str, dict[str, float]] = {
+# ───────────────────────────── TOP-10: розширені пороги ─────────────────────────────
+# Логіка:
+#  • mega-cap (BTC, ETH): нижчі vol_z / тісніші VWAP-пороги; суворіші ретести на breakout.
+#  • high-beta (SOL, AVAX, LINK): середні vol_z, ширший ATR-band для breakout.
+#  • noisy/meme (DOGE, частково XRP): підвищені vol_z / RSI; ширші VWAP-відхилення.
+#  • нові/агресивні (TON): високі vol_z/ATR гейти, але допускаємо швидкі breakouts.
+#
+# Пояснення ключів:
+#  • atr_pct_min — мінімальна волатильність (ATR% від ціни), нижче якої сигнали занижуються/ігноруються.
+#  • vwap_deviation — базовий поріг відхилення від VWAP (частка від ціни).
+#  • signal_thresholds.* — детальні пороги для Stage1 тригерів.
+#  • state_overrides — мультиплікатори/дельти до порогів залежно від поточного стану (range, trend, high_vol).
+
+
+TOP100_THRESHOLDS: dict[str, dict[str, Any]] = {
     "btcusdt": {
-        "vol_z_threshold": 2.0,
+        # --- Загальні параметри ---
+        "vol_z_threshold": 2.0,  # сплеск обсягу ≥2.0σ, помірний, бо BTC має великі стабільні обсяги
         "rsi_overbought": 70.0,
         "rsi_oversold": 30.0,
-        "atr_pct_min": 0.005,
-        "vwap_deviation": 0.01,
+        "atr_pct_min": 0.005,  # мінімальна волатильність ~0.5% для врахування сигналів
+        "vwap_deviation": 0.010,  # відхилення 1% від VWAP як сигнал
+        # --- Параметри за типами сигналів ---
+        "signal_thresholds": {
+            "volume_spike": {
+                "z_score": 2.2,  # сильний сплеск для BTC вважаємо від 2.2σ
+                "min_notional_usd": 5_000_000.0,  # мінімальний обсяг 5 млн USD
+                "cooldown_bars": 2,  # мінімум 2 бари між сплесками
+            },
+            "rsi_trigger": {
+                "overbought": 72.0,  # трохи суворіше для BTC
+                "oversold": 28.0,
+                "divergence_strength": 1.2,  # помірна вимога до сили дивергенції
+            },
+            "breakout": {
+                "band_pct_atr": 0.80,  # відстань до рівня в % ATR
+                "min_retests": 2,  # мінімум 2 ретести підтверджень рівня
+                "confirm_bars": 2,  # підтверджуючі бари для надійності
+            },
+            "vwap_deviation": {
+                "threshold": 0.012,  # відхилення 1.2% від VWAP як сигнал
+                "duration_bars": 3,
+            },  # тривалість підтвердження в барах, зберігається хоча б 3 хвилини
+            "atr_volatility": {
+                "low_gate_pct": 0.40,  # 0.4% ATR/price - нижня межа волатильності для сигналів
+                "high_gate_pct": 1.20,  # 1.2% ATR/price - верхня межа волатильності для сигналів
+            },  # у % від ціни
+        },
+        # --- Специфічні налаштування для BTC ---
+        "state_overrides": {
+            "range_bound": {
+                "vwap_deviation": +0.002,  # трохи суворіше для range-bound, для уникнення шумів
+                "signal_thresholds.breakout.band_pct_atr": +0.10,  # трохи ширше для breakout, для уникнення фальшивих спрацьовувань
+            },
+            "trend_strong": {
+                "rsi_trigger.overbought": +2.0,  # трохи вищий поріг для тренду, для уникнення фальшивих спрацьовувань
+                "rsi_trigger.oversold": -2.0,  # трохи нижчий поріг для тренду, для уникнення фальшивих спрацьовувань
+            },
+            "high_volatility": {
+                "volume_spike.z_score": +0.2,  # трохи вищий поріг для шумних періодів
+                "vwap_deviation": +0.002,
+            },  # трохи суворіше для шумних періодів
+        },
+        # --- Метадані для аналізу стану ---
+        "meta": {
+            "class": "mega_cap",  # клас активу, mega-cap
+            "sensitivity": "low_noise",
+        },  # низька чутливість до шумів
     },
     "ethusdt": {
         "vol_z_threshold": 2.0,
         "rsi_overbought": 70.0,
         "rsi_oversold": 30.0,
         "atr_pct_min": 0.005,
-        "vwap_deviation": 0.01,
+        "vwap_deviation": 0.010,
+        "signal_thresholds": {
+            "volume_spike": {
+                "z_score": 2.1,
+                "min_notional_usd": 3_000_000.0,
+                "cooldown_bars": 2,
+            },
+            "rsi_trigger": {
+                "overbought": 71.0,
+                "oversold": 29.0,
+                "divergence_strength": 1.2,
+            },
+            "breakout": {"band_pct_atr": 0.85, "min_retests": 2, "confirm_bars": 2},
+            "vwap_deviation": {"threshold": 0.012, "duration_bars": 3},
+            "atr_volatility": {"low_gate_pct": 0.45, "high_gate_pct": 1.30},
+        },
+        "state_overrides": {
+            "range_bound": {"vwap_deviation": +0.002},
+            "trend_strong": {"breakout.confirm_bars": -1},
+            "high_volatility": {"volume_spike.z_score": +0.2},
+        },
+        "meta": {"class": "mega_cap", "sensitivity": "low_noise"},
     },
     "solusdt": {
         "vol_z_threshold": 2.5,
         "rsi_overbought": 80.0,
         "rsi_oversold": 20.0,
         "atr_pct_min": 0.008,
-        "vwap_deviation": 0.02,
+        "vwap_deviation": 0.020,
+        "signal_thresholds": {
+            "volume_spike": {
+                "z_score": 2.6,
+                "min_notional_usd": 1_800_000.0,
+                "cooldown_bars": 2,
+            },
+            "rsi_trigger": {
+                "overbought": 82.0,
+                "oversold": 18.0,
+                "divergence_strength": 1.3,
+            },
+            "breakout": {"band_pct_atr": 0.95, "min_retests": 2, "confirm_bars": 1},
+            "vwap_deviation": {"threshold": 0.022, "duration_bars": 2},
+            "atr_volatility": {"low_gate_pct": 0.60, "high_gate_pct": 1.60},
+        },
+        "state_overrides": {
+            "range_bound": {"breakout.band_pct_atr": +0.10},
+            "trend_strong": {"vwap_deviation": -0.002},
+            "high_volatility": {"volume_spike.z_score": +0.3, "vwap_deviation": +0.003},
+        },
+        "meta": {"class": "high_beta", "sensitivity": "fast_trend"},
     },
     "dogeusdt": {
         "vol_z_threshold": 3.0,
         "rsi_overbought": 80.0,
         "rsi_oversold": 20.0,
         "atr_pct_min": 0.010,
-        "vwap_deviation": 0.04,
+        "vwap_deviation": 0.040,
+        "signal_thresholds": {
+            "volume_spike": {
+                "z_score": 3.2,
+                "min_notional_usd": 1_000_000.0,
+                "cooldown_bars": 3,
+            },
+            "rsi_trigger": {
+                "overbought": 83.0,
+                "oversold": 17.0,
+                "divergence_strength": 1.6,
+            },
+            "breakout": {"band_pct_atr": 1.10, "min_retests": 1, "confirm_bars": 2},
+            "vwap_deviation": {"threshold": 0.045, "duration_bars": 2},
+            "atr_volatility": {"low_gate_pct": 0.70, "high_gate_pct": 2.20},
+        },
+        "state_overrides": {
+            "range_bound": {"volume_spike.z_score": +0.2},
+            "trend_strong": {"breakout.confirm_bars": -1},
+            "high_volatility": {"vwap_deviation": +0.005},
+        },
+        "meta": {"class": "meme", "sensitivity": "noise_resistant"},
     },
     "xrpusdt": {
         "vol_z_threshold": 2.5,
         "rsi_overbought": 80.0,
         "rsi_oversold": 20.0,
         "atr_pct_min": 0.008,
-        "vwap_deviation": 0.03,
+        "vwap_deviation": 0.030,
+        "signal_thresholds": {
+            "volume_spike": {
+                "z_score": 2.8,
+                "min_notional_usd": 1_200_000.0,
+                "cooldown_bars": 2,
+            },
+            "rsi_trigger": {
+                "overbought": 82.0,
+                "oversold": 18.0,
+                "divergence_strength": 1.35,
+            },
+            "breakout": {"band_pct_atr": 1.00, "min_retests": 1, "confirm_bars": 2},
+            "vwap_deviation": {"threshold": 0.032, "duration_bars": 2},
+            "atr_volatility": {"low_gate_pct": 0.60, "high_gate_pct": 1.80},
+        },
+        "state_overrides": {
+            "range_bound": {"breakout.min_retests": +1},
+            "trend_strong": {
+                "rsi_trigger.overbought": +2.0,
+                "rsi_trigger.oversold": -2.0,
+            },
+            "high_volatility": {"vwap_deviation": +0.003},
+        },
+        "meta": {"class": "noisy_liquidity", "sensitivity": "whipsaw_filter"},
     },
     "bnbusdt": {
         "vol_z_threshold": 2.5,
         "rsi_overbought": 75.0,
         "rsi_oversold": 25.0,
         "atr_pct_min": 0.007,
-        "vwap_deviation": 0.02,
+        "vwap_deviation": 0.018,
+        "signal_thresholds": {
+            "volume_spike": {
+                "z_score": 2.4,
+                "min_notional_usd": 1_500_000.0,
+                "cooldown_bars": 2,
+            },
+            "rsi_trigger": {
+                "overbought": 76.0,
+                "oversold": 24.0,
+                "divergence_strength": 1.25,
+            },
+            "breakout": {"band_pct_atr": 0.90, "min_retests": 2, "confirm_bars": 2},
+            "vwap_deviation": {"threshold": 0.020, "duration_bars": 2},
+            "atr_volatility": {"low_gate_pct": 0.55, "high_gate_pct": 1.40},
+        },
+        "state_overrides": {
+            "range_bound": {"vwap_deviation": +0.003},
+            "trend_strong": {"breakout.confirm_bars": -1},
+            "high_volatility": {"volume_spike.z_score": +0.2},
+        },
+        "meta": {"class": "large_cap", "sensitivity": "balanced"},
     },
     "1000shibusdt": {
         "vol_z_threshold": 3.0,
@@ -106,7 +322,28 @@ TOP100_THRESHOLDS: dict[str, dict[str, float]] = {
         "rsi_overbought": 75.0,
         "rsi_oversold": 25.0,
         "atr_pct_min": 0.007,
-        "vwap_deviation": 0.02,
+        "vwap_deviation": 0.020,
+        "signal_thresholds": {
+            "volume_spike": {
+                "z_score": 2.6,
+                "min_notional_usd": 1_000_000.0,
+                "cooldown_bars": 2,
+            },
+            "rsi_trigger": {
+                "overbought": 77.0,
+                "oversold": 23.0,
+                "divergence_strength": 1.3,
+            },
+            "breakout": {"band_pct_atr": 0.95, "min_retests": 2, "confirm_bars": 2},
+            "vwap_deviation": {"threshold": 0.022, "duration_bars": 2},
+            "atr_volatility": {"low_gate_pct": 0.55, "high_gate_pct": 1.50},
+        },
+        "state_overrides": {
+            "range_bound": {"breakout.min_retests": +1},
+            "trend_strong": {"vwap_deviation": -0.002},
+            "high_volatility": {"volume_spike.z_score": +0.2},
+        },
+        "meta": {"class": "large_cap", "sensitivity": "balanced"},
     },
     "trxusdt": {
         "vol_z_threshold": 2.5,
@@ -127,14 +364,59 @@ TOP100_THRESHOLDS: dict[str, dict[str, float]] = {
         "rsi_overbought": 75.0,
         "rsi_oversold": 25.0,
         "atr_pct_min": 0.008,
-        "vwap_deviation": 0.02,
+        "vwap_deviation": 0.020,
+        "signal_thresholds": {
+            "volume_spike": {
+                "z_score": 2.7,
+                "min_notional_usd": 1_200_000.0,
+                "cooldown_bars": 2,
+            },
+            "rsi_trigger": {
+                "overbought": 77.0,
+                "oversold": 23.0,
+                "divergence_strength": 1.35,
+            },
+            "breakout": {"band_pct_atr": 1.00, "min_retests": 2, "confirm_bars": 1},
+            "vwap_deviation": {"threshold": 0.022, "duration_bars": 2},
+            "atr_volatility": {"low_gate_pct": 0.60, "high_gate_pct": 1.70},
+        },
+        "state_overrides": {
+            "range_bound": {"breakout.band_pct_atr": +0.10},
+            "trend_strong": {
+                "rsi_trigger.overbought": +2.0,
+                "rsi_trigger.oversold": -2.0,
+            },
+            "high_volatility": {"volume_spike.z_score": +0.2},
+        },
+        "meta": {"class": "high_beta", "sensitivity": "fast_trend"},
     },
     "linkusdt": {
         "vol_z_threshold": 2.5,
         "rsi_overbought": 78.0,
         "rsi_oversold": 22.0,
         "atr_pct_min": 0.008,
-        "vwap_deviation": 0.02,
+        "vwap_deviation": 0.020,
+        "signal_thresholds": {
+            "volume_spike": {
+                "z_score": 2.7,
+                "min_notional_usd": 1_200_000.0,
+                "cooldown_bars": 2,
+            },
+            "rsi_trigger": {
+                "overbought": 80.0,
+                "oversold": 20.0,
+                "divergence_strength": 1.35,
+            },
+            "breakout": {"band_pct_atr": 0.95, "min_retests": 2, "confirm_bars": 1},
+            "vwap_deviation": {"threshold": 0.022, "duration_bars": 2},
+            "atr_volatility": {"low_gate_pct": 0.60, "high_gate_pct": 1.60},
+        },
+        "state_overrides": {
+            "range_bound": {"breakout.band_pct_atr": +0.10},
+            "trend_strong": {"breakout.confirm_bars": -1},
+            "high_volatility": {"vwap_deviation": +0.003},
+        },
+        "meta": {"class": "high_beta", "sensitivity": "trend_follow"},
     },
     "suiusdt": {
         "vol_z_threshold": 2.5,
@@ -144,11 +426,43 @@ TOP100_THRESHOLDS: dict[str, dict[str, float]] = {
         "vwap_deviation": 0.02,
     },
     "tonusdt": {
-        "vol_z_threshold": 2.5,
-        "rsi_overbought": 72.0,
-        "rsi_oversold": 28.0,
-        "atr_pct_min": 0.007,
-        "vwap_deviation": 0.02,
+        # --- Загальні параметри ---
+        "vol_z_threshold": 2.8,  # вище, щоб уникати фальшивих сплесків
+        "rsi_overbought": 75.0,
+        "rsi_oversold": 25.0,
+        "atr_pct_min": 0.009,  # мінімальна волатильність ~0.9%
+        "vwap_deviation": 0.018,  # відхилення 1.8% від VWAP як сигнал
+        # --- Параметри за типами сигналів ---
+        "signal_thresholds": {
+            "volume_spike": {
+                "z_score": 3.0,  # TON часто має шумні обсяги, потрібен вищий поріг
+                "min_notional_usd": 1_500_000.0,
+                "cooldown_bars": 2,  # мінімум 2 бари між сплесками
+            },
+            "rsi_trigger": {
+                "overbought": 78.0,
+                "oversold": 22.0,
+                "divergence_strength": 1.5,  # жорсткіше, бо багато фейкових дивергенцій
+            },
+            "breakout": {
+                "band_pct": 1.0,  # ATR*1.0 → ширший допуск
+                "min_retests": 1,  # можна пропускати з одним підтвердженням
+                "confirm_bars": 1,  # підтверджуючий бар для швидких рухів
+            },
+            "vwap_deviation": {
+                "threshold": 0.025,  # 2.5% відхилення
+                "duration_bars": 2,  # тривалість підтвердження в барах, зберігається хоча б 2 хвилини
+            },
+            "atr_volatility": {
+                "low_gate": 0.6,  # 0.6% ATR/price - нижня межа волатильності для сигналів
+                "high_gate": 2.0,  # високі пороги через агресивні рухи
+            },
+        },
+        # --- Метадані для аналізу стану ---
+        "meta": {
+            "class": "mid_cap_new",  # клас активу, mid-cap, новий
+            "sensitivity": "high_volatility_high_risk",  # висока чутливість до волатильності і ризиків
+        },
     },
     "nearusdt": {
         "vol_z_threshold": 2.5,

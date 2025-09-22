@@ -81,7 +81,7 @@ datastore/
 .gitconfig
 .orig
 
-# ───────────────────────────── Додаткові (за запитом) ─────────────────────────────
+# ───────────────────────────── Додаткові ─────────────────────────────
 # Конфіги/звіти та службові каталоги, які не хочемо випадково додати в коміт
 pytest.ini
 pyproject.toml
@@ -90,6 +90,8 @@ pytest_report.txt
 ruff_report.txt
 TYPING_ROADMAP.md
 pyrightconfig.json
+mypy.ini
+STYLE_GUIDE.md
 tools/
 .github/
 .rej# Byte-compiled / optimized / DLL files

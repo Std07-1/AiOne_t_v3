@@ -45,6 +45,8 @@ async def get_filtered_assets(
     min_atr: float = 0.5,
     max_symbols: int = 30,
     dynamic: bool = False,
+    *,
+    thresholds: object | None = None,
 ) -> list[str]:
     """
     Публічний інтерфейс для отримання відфільтрованих активів Binance USDT-M Futures.
@@ -70,6 +72,9 @@ async def get_filtered_assets(
 
     """
     logger.debug("[STEP] Ініціалізація параметрів фільтрації")
+    # thresholds: сумісність із існуючим викликом; наразі не використовується напряму
+    _ = thresholds
+
     params = FilterParams(
         min_quote_volume=min_quote_vol,  # мінімальний об'єм торгів
         min_price_change=min_price_change,  # мінімальна зміна ціни

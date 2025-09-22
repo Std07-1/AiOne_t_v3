@@ -21,11 +21,6 @@ from app.settings import load_datastore_cfg
 from stage1.asset_monitoring import AssetMonitorStage1
 from stage3.trade_manager import TradeLifecycleManager
 
-try:  # optional Prometheus
-    from prometheus_client import Gauge, Histogram  # type: ignore
-except Exception:  # pragma: no cover
-    Gauge = None  # type: ignore
-
 # ── Logger ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger("stage3.trade_manager_updater")
 if not logger.handlers:  # guard щоб не дублювати хендлери
@@ -79,19 +74,7 @@ async def trade_manager_updater(
         backoff_multiplier = getattr(tu_cfg, "backoff_multiplier", 1.5)
     max_backoff_sec = getattr(tu_cfg, "max_backoff_sec", max_backoff_sec)
 
-    # Prometheus gauges (optional) with safe registrar to avoid duplicate registration
-    active_g: Any | None = None
-    closed_g: Any | None = None
-    cycle_time_g: Any | None = None
-    cycle_time_h: Any | None = None  # Histogram
-    drift_ratio_g: Any | None = None
-    dynamic_interval_g: Any | None = None
-    last_update_ts_g: Any | None = None
-    skipped_ewma_g: Any | None = None
-    pressure_g: Any | None = None
-    pressure_norm_g: Any | None = None
-    consecutive_drift_high_g: Any | None = None
-    consecutive_pressure_high_g: Any | None = None
+    # Метрики Prometheus видалено; зберігаємо локальні змінні стану
     skipped_ewma: float = 0.0
     # smoothing factor (конфігурований): або параметр, або ENV TRADE_UPDATER_SKIPPED_ALPHA, дефолт 0.3
     if skipped_ewma_alpha is None:
@@ -110,82 +93,7 @@ async def trade_manager_updater(
     skipped_alpha = max(0.01, min(0.95, float(skipped_ewma_alpha)))
 
     # локальний кеш створених Gauge щоб уникнути повторної реєстрації
-    _gauge_cache: dict[str, Any] = {}
-
-    def _register_gauge(name: str, description: str) -> Any | None:
-        """Idempotent gauge creator.
-
-        Avoids ValueError on module reload / multi-start by caching locally.
-        If already created in this function scope, returns cached instance.
-        (Prometheus client does not expose a simple public fetch-by-name API,
-        so on duplicate registration we just swallow and reuse local cache.)
-        """
-        if not Gauge:
-            return None
-        if name in _gauge_cache:
-            return _gauge_cache[name]
-        try:
-            g = Gauge(name, description)
-            _gauge_cache[name] = g
-            return g
-        except Exception:  # pragma: no cover - duplicate or registry error
-            return _gauge_cache.get(name)
-
-    if Gauge:
-        active_g = _register_gauge(
-            "trade_active_total", "Number of active trades (Stage3 updater)"
-        )
-        closed_g = _register_gauge(
-            "trade_closed_total", "Number of closed trades (Stage3 updater)"
-        )
-        cycle_time_g = _register_gauge(
-            "trade_updater_cycle_seconds",
-            "Cycle wall time of trade updater loop (last)",
-        )
-        drift_ratio_g = _register_gauge(
-            "trade_updater_drift_ratio", "cycle_time / configured_interval ratio"
-        )
-        # Histogram (best-effort) – використовуємо окрему реєстрацію бо потрібні buckets
-        if "Histogram" in globals() and Histogram:
-            try:
-                buckets_cfg = None
-                if tu_cfg is not None:
-                    buckets_cfg = getattr(tu_cfg, "cycle_histogram_buckets", None)
-                if not buckets_cfg:
-                    buckets_cfg = [0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
-                cycle_time_h = Histogram(
-                    "trade_updater_cycle_seconds_bucket",
-                    "Distribution of trade updater cycle durations",
-                    buckets=tuple(buckets_cfg),
-                )
-            except Exception:
-                cycle_time_h = None
-        dynamic_interval_g = _register_gauge(
-            "trade_updater_dynamic_interval_seconds", "Current adaptive sleep interval"
-        )
-        last_update_ts_g = _register_gauge(
-            "trade_updater_last_update_ts",
-            "Last successful update timestamp (monotonic)",
-        )
-        skipped_ewma_g = _register_gauge(
-            "trade_updater_skipped_symbols_ewma", "EWMA of skipped symbols per cycle"
-        )
-        pressure_g = _register_gauge(
-            "trade_updater_pressure",
-            "Skipped symbols pressure = skipped_ewma / active_trades",
-        )
-        pressure_norm_g = _register_gauge(
-            "trade_updater_pressure_norm",
-            "Normalized pressure log1p(skipped_ewma / active_trades)",
-        )
-        consecutive_drift_high_g = _register_gauge(
-            "trade_updater_consecutive_drift_high",
-            "Consecutive cycles with drift_ratio above high threshold",
-        )
-        consecutive_pressure_high_g = _register_gauge(
-            "trade_updater_consecutive_pressure_high",
-            "Consecutive cycles with pressure above threshold",
-        )
+    # Видалено _register_gauge та всі реєстрації
     if log_interval_sec is None:
         # за замовчуванням = interval_sec (раз на цикл) якщо немає режиму only-on-change
         log_interval_sec = interval_sec if not log_on_change else 0
@@ -261,17 +169,7 @@ async def trade_manager_updater(
             last_log_ts = now
             last_counts = counts
 
-        # Publish metrics (Prometheus gauges)
-        if active_g:
-            try:
-                active_g.set(counts[0])
-                if closed_g:
-                    closed_g.set(counts[1])
-                if cycle_time_g:
-                    # expose skipped_symbols via gauge labels would need Histogram; keep simple via UI publish
-                    pass
-            except Exception:  # pragma: no cover
-                pass
+        # Публікація метрик Prometheus видалена
 
         # 3) Поточний час виконання циклу (elapsed) ДО формування payload щоб мати drift_ratio
         elapsed = asyncio.get_event_loop().time() - cycle_start
@@ -291,16 +189,7 @@ async def trade_manager_updater(
             skipped_ewma / active_trades_count if active_trades_count > 0 else 0.0
         )
         pressure_norm = math.log1p(pressure_ratio) if pressure_ratio > 0 else 0.0
-        if pressure_g:
-            try:
-                pressure_g.set(pressure_ratio)
-            except Exception:
-                pass
-        if pressure_norm_g:
-            try:
-                pressure_norm_g.set(pressure_norm)
-            except Exception:
-                pass
+        # Prometheus gauges видалено
 
         # Drift warnings (rate limited) & pressure warnings (rate limited)
         drift_ratio_value = elapsed / max(1e-6, interval_sec)
@@ -363,10 +252,6 @@ async def trade_manager_updater(
                         last_warn_pressure_ts = now_wall
                 else:
                     consecutive_high_pressure = 0
-                if consecutive_drift_high_g:
-                    consecutive_drift_high_g.set(consecutive_high_drift)
-                if consecutive_pressure_high_g:
-                    consecutive_pressure_high_g.set(consecutive_high_pressure)
 
                 # ── Adaptive interval scaling (optional) ──
                 if getattr(tu_cfg, "auto_interval_scale_enabled", False):
@@ -512,37 +397,7 @@ async def trade_manager_updater(
             except Exception:
                 pass
 
-        # Cycle time metric & drift ratio & other gauges
-        if cycle_time_g:
-            try:
-                cycle_time_g.set(elapsed)
-            except Exception:  # pragma: no cover
-                pass
-        if "cycle_time_h" in locals() and cycle_time_h is not None:
-            try:
-                cycle_time_h.observe(elapsed)
-            except Exception:
-                pass
-        if drift_ratio_g:
-            try:
-                drift_ratio_g.set(elapsed / max(1e-6, interval_sec))
-            except Exception:  # pragma: no cover
-                pass
-        if dynamic_interval_g:
-            try:
-                dynamic_interval_g.set(dynamic_interval)
-            except Exception:  # pragma: no cover
-                pass
-        if last_update_ts_g:
-            try:
-                last_update_ts_g.set(last_success_ts)
-            except Exception:  # pragma: no cover
-                pass
-        if skipped_ewma_g:
-            try:
-                skipped_ewma_g.set(skipped_ewma)
-            except Exception:  # pragma: no cover
-                pass
+        # Метрики Prometheus видалено
 
         # Exponential backoff if cycle took longer than current interval (reset skipped counter per cycle)
         skipped_symbols = 0

@@ -19,7 +19,12 @@ if not logger.handlers:
 
 
 def volume_spike_trigger(
-    df: pd.DataFrame, z_thresh: float = 2.0, atr_window: int = 14, symbol: str = ""
+    df: pd.DataFrame,
+    z_thresh: float = 2.0,
+    atr_window: int = 14,
+    symbol: str = "",
+    *,
+    use_vol_atr: bool = False,
 ) -> bool:
     """Повертає True якщо останній бар має аномально великий обсяг."""
     if len(df) < atr_window:
@@ -42,9 +47,14 @@ def volume_spike_trigger(
     ).max(axis=1)
     atr = tr.tail(atr_window).mean()
     vol_atr_ratio = np.inf if atr is None or atr == 0 else latest_vol / atr
-    vol_spike_atr = vol_atr_ratio > 2.0
-    logger.debug(
-        f"[{symbol}] [VolumeSpike] Z-score={z_score:.2f} (>{z_thresh})? {vol_spike_z}, "
-        f"Volume/ATR={vol_atr_ratio:.2f} (>2.0)? {vol_spike_atr}"
-    )
+    vol_spike_atr = (vol_atr_ratio > 2.0) if use_vol_atr else False
+    if use_vol_atr:
+        logger.debug(
+            f"[{symbol}] [VolumeSpike] Z-score={z_score:.2f} (>{z_thresh})? {vol_spike_z}, "
+            f"Volume/ATR={vol_atr_ratio:.2f} (>2.0)? {vol_spike_atr}"
+        )
+    else:
+        logger.debug(
+            f"[{symbol}] [VolumeSpike] Z-score={z_score:.2f} (>{z_thresh})? {vol_spike_z}, Vol/ATR path disabled"
+        )
     return bool(vol_spike_z or vol_spike_atr)

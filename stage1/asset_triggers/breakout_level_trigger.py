@@ -27,6 +27,9 @@ def breakout_level_trigger(
     near_threshold: float = 0.005,
     near_daily_threshold: float = 0.5,
     symbol: str = "",
+    *,
+    confirm_bars: int = 1,
+    min_retests: int = 0,
 ) -> dict[str, bool]:
     """Виявляє пробій локальних екстремумів і близькість до них та денних рівнів.
 
@@ -62,9 +65,20 @@ def breakout_level_trigger(
     current_close = df["close"].iloc[-1]
     prev_close = df["close"].iloc[-2]
 
-    # Пробій
-    triggers["breakout_up"] = current_close > recent_high and prev_close <= recent_high
-    triggers["breakout_down"] = current_close < recent_low and prev_close >= recent_low
+    # Пробій з підтвердженням confirm_bars
+    confirm_bars = max(1, int(confirm_bars))
+    try:
+        prev_window = df["close"].iloc[-(confirm_bars + 1) : -1]
+    except Exception:
+        prev_window = df["close"].iloc[-2:-1]
+    prev_ok_up = bool((prev_window <= recent_high).all())
+    prev_ok_dn = bool((prev_window >= recent_low).all())
+    triggers["breakout_up"] = (
+        current_close > recent_high and prev_close <= recent_high and prev_ok_up
+    )
+    triggers["breakout_down"] = (
+        current_close < recent_low and prev_close >= recent_low and prev_ok_dn
+    )
 
     # Близькість до локальних рівнів
     if near_threshold > 0:
@@ -74,6 +88,28 @@ def breakout_level_trigger(
         triggers["near_low"] = (
             current_close - recent_low
         ) / recent_low < near_threshold
+
+    # Retests: кількість торкань рівня перед пробоєм
+    retests_high = 0
+    retests_low = 0
+    if min_retests and near_threshold > 0 and len(df) > window:
+        try:
+            before = df.iloc[-(window + 1) : -1]
+            ch = before["close"]
+            retests_high = int(
+                (((recent_high - ch) / recent_high).abs() < near_threshold).sum()
+            )
+            retests_low = int(
+                (((ch - recent_low) / recent_low).abs() < near_threshold).sum()
+            )
+        except Exception:
+            retests_high = 0
+            retests_low = 0
+        # Вимога мінімальних ретестів лише для фінального виставлення прапора breakout
+        if triggers["breakout_up"] and retests_high < int(min_retests):
+            triggers["breakout_up"] = False
+        if triggers["breakout_down"] and retests_low < int(min_retests):
+            triggers["breakout_down"] = False
 
     # Глобальні денні рівні з stats
     price = current_close
@@ -88,9 +124,16 @@ def breakout_level_trigger(
                 triggers["near_daily_resistance"] = True
 
     logger.debug(
-        "[%s] breakout_up=%s, breakout_down=%s, near_high=%s, near_low=%s, "
-        "near_daily_support=%s, near_daily_resistance=%s, "
-        "recent_high=%.4f, recent_low=%.4f, close=%.4f",
+        "[%s] breakout params | window=%d near_thr=%.5f daily_thr=%.2f%% confirm_bars=%d min_retests=%d",
+        symbol,
+        window,
+        float(near_threshold),
+        float(near_daily_threshold),
+        int(confirm_bars),
+        int(min_retests),
+    )
+    logger.debug(
+        "[%s] breakout flags | up=%s down=%s near_high=%s near_low=%s daily_supp=%s daily_res=%s | recent_high=%.4f recent_low=%.4f close=%.4f retests_high=%d retests_low=%d",
         symbol,
         triggers["breakout_up"],
         triggers["breakout_down"],
@@ -101,5 +144,7 @@ def breakout_level_trigger(
         recent_high,
         recent_low,
         current_close,
+        retests_high,
+        retests_low,
     )
     return triggers

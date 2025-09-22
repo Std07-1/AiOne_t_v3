@@ -29,7 +29,6 @@ recommendation, narrative, risk_parameters.
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +36,8 @@ import numpy as np
 import pandas as pd
 from rich.console import Console
 from rich.logging import RichHandler
+
+from utils.utils import safe_number as _safe
 
 # ── Logger ──
 logger = logging.getLogger("app.stage2.qde_core")
@@ -75,14 +76,6 @@ class QDEConfig:
 
 
 # ── Утиліти ──
-def _safe(x: Any, default: float = 0.0) -> float:
-    try:
-        v = float(x)
-        if math.isnan(v) or math.isinf(v):
-            return default
-        return v
-    except Exception:  # broad except: універсальна санітизація вхідних значень stats
-        return default
 
 
 def _clamp01(x: float) -> float:

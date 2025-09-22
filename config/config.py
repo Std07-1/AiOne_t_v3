@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import builtins as _bl
 import logging
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -136,6 +136,72 @@ ASSET_STATE = {
     "NO_DATA": "no_data",
     "ERROR": "error",
 }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# КАНОНІЧНІ КЛЮЧІ ДЛЯ ПЕРЕДАЧІ ДАНИХ МІЖ ЕТАПАМИ
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage1 → Stage2 → UI: єдина термінологія для ключів у словниках подій/сигналів
+K_SYMBOL: str = "symbol"
+K_SIGNAL: str = "signal"
+K_TRIGGER_REASONS: str = "trigger_reasons"
+K_RAW_TRIGGER_REASONS: str = "raw_trigger_reasons"
+K_STATS: str = "stats"
+K_THRESHOLDS: str = "thresholds"
+
+# Stage2 результат → UI
+K_MARKET_CONTEXT: str = "market_context"
+K_RECOMMENDATION: str = "recommendation"
+K_CONFIDENCE_METRICS: str = "confidence_metrics"
+K_ANOMALY_DETECTION: str = "anomaly_detection"
+K_RISK_PARAMETERS: str = "risk_parameters"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TypedDict контракти (для підказок mypy та документації)
+# ──────────────────────────────────────────────────────────────────────────────
+class Stage1Signal(TypedDict):
+    """Сигнал Stage1, що передається у Stage2.
+
+    Поля:
+        symbol: Інструмент (напр., "BTCUSDT").
+        signal: "ALERT" або "NORMAL" (без buy/sell семантики на цьому етапі).
+        trigger_reasons: Список канонічних тригерів (див. TRIGGER_NAME_MAP).
+        stats: Плоский словник базових метрик (price/atr/vwap/...).
+        raw_trigger_reasons: (опц.) Сирові теги до нормалізації (для дебагу).
+        thresholds: (опц.) Використані пороги/налаштування тригерів.
+    """
+
+    symbol: str
+    signal: str
+    trigger_reasons: list[str]
+    stats: dict[str, Any]
+    raw_trigger_reasons: NotRequired[list[str]]
+    thresholds: NotRequired[dict[str, Any]]
+
+
+class Stage2Output(TypedDict):
+    """Результат QDE Core для UI/наступних етапів.
+
+    Поля:
+        symbol: Інструмент, до якого належить рішення.
+        market_context: Контекст ринку (levels/scenario/triggers/... ).
+        recommendation: Рекомендація (наприклад, "BUY_IN_DIPS", "AVOID").
+        narrative: Людинозрозумілий опис ситуації.
+        confidence_metrics: Ймовірності/композитна впевненість.
+        risk_parameters: Рівні SL/TP та RR.
+        anomaly_detection: Детектор аномалій (ознаки/прапорці).
+        timestamp: (опц.) ISO-час обробки.
+    """
+
+    symbol: str
+    market_context: dict[str, Any]
+    recommendation: str
+    narrative: str
+    confidence_metrics: dict[str, Any]
+    risk_parameters: dict[str, Any]
+    anomaly_detection: dict[str, Any]
+    timestamp: NotRequired[str]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -564,6 +630,12 @@ STAGE1_MONITOR_PARAMS: dict[str, float | int] = {
     "dynamic_rsi_multiplier": 1.1,  # Множник динамічного RSI
 }
 
+# ── Feature flags ──
+USE_VOL_ATR: bool = True  # контроль логіки volume_spike
+USE_RSI_DIV: bool = True  # контроль логіки rsi_divergence
+USE_VWAP_DEVIATION: bool = True  # контроль логіки vwap_deviation
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # PREFILTER (OptimizedAssetFilter) ДЕФОЛТНІ ДОД. ПАРАМЕТРИ
 # ──────────────────────────────────────────────────────────────────────────────
@@ -604,6 +676,18 @@ __all__ = [
     "TICK_SIZE_DEFAULT",
     "STAGE2_STATUS",
     "ASSET_STATE",
+    # Узгоджені ключі Stage1→Stage2→UI
+    "K_SYMBOL",
+    "K_SIGNAL",
+    "K_TRIGGER_REASONS",
+    "K_RAW_TRIGGER_REASONS",
+    "K_STATS",
+    "K_THRESHOLDS",
+    "K_MARKET_CONTEXT",
+    "K_RECOMMENDATION",
+    "K_CONFIDENCE_METRICS",
+    "K_ANOMALY_DETECTION",
+    "K_RISK_PARAMETERS",
     # Тригери
     "TRIGGER_TP_SL_SWAP_LONG",
     "TRIGGER_TP_SL_SWAP_SHORT",
@@ -621,6 +705,9 @@ __all__ = [
     "SymbolInfo",
     "FilterParams",
     "MetricResults",
+    # Контракти TypedDict
+    "Stage1Signal",
+    "Stage2Output",
     # Stage2/QDE
     "ASSET_CLASS_MAPPING",
     "STAGE2_CONFIG",

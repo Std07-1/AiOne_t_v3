@@ -39,8 +39,9 @@ from config.config import DATASTORE_BASE_DIR, NAMESPACE
 # ── Логування ──
 logger = logging.getLogger("app.data.unified_store")
 if not logger.handlers:  # guard проти повторної ініціалізації
-    logger.setLevel(logging.INFO)
-    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
+    logger.setLevel(logging.DEBUG)
+    # show_path=True щоб у WARNING/ERROR було видно точний файл і рядок
+    logger.addHandler(RichHandler(console=Console(stderr=True), show_path=True))
     logger.propagate = False
 
 # ── Стандарти й константи ──
@@ -63,10 +64,16 @@ REQUIRED_OHLCV_COLS = (
 MIN_COLUMNS: set[str] = set(REQUIRED_OHLCV_COLS)
 
 
-# ── Допоміжні структури ──
 @dataclass
 class StoreProfile:
-    """Профіль використання ресурсів."""
+    """Профіль використання ресурсів.
+
+    Примітка:
+        Раніше був клас з атрибутами за замовчуванням і без __init__, що
+        не дозволяло створювати об'єкт через kwargs. Переведено на dataclass,
+        щоб підтримати конструкцію StoreProfile(**profile_data) та зберегти
+        сумісність із викликами без аргументів і default_factory=StoreProfile.
+    """
 
     name: str = "small"
     ram_limit_mb: int = 512
@@ -164,67 +171,24 @@ class HistogramLike(Protocol):
 
 
 class Metrics:
-    """Проста обгортка метрик з опціональною Prometheus-інтеграцією.
+    """Легка обгортка метрик без зовнішніх залежностей.
 
-    Примітка: текстові описи метрик (help) лишаємо англійською для сумісності з
-    наявними дашбордами / алертами.
+    Інтерфейс сумісний із попереднім, але всі лічильники — локальні no-op об'єкти,
+    що підтримують методи inc/set/observe та labels(). Це спрощує код і прибирає
+    залежність від prometheus_client.
     """
 
     def __init__(self) -> None:
-        try:
-            from prometheus_client import Counter, Gauge, Histogram
-
-            self._counter = Counter
-            self._gauge = Gauge
-            self._hist = Histogram
-            self.enabled = True
-        except Exception:  # pragma: no cover
-            self.enabled = False
-
         # Атрибути метрик типізовані через Protocol-інтерфейси, щоби підтримувати _Noop
-        self.get_latency: HistogramLike
-        self.put_latency: HistogramLike
-        self.ram_hit_ratio: GaugeLike
-        self.redis_hit_ratio: GaugeLike
-        self.bytes_in_ram: GaugeLike
-        self.flush_backlog: GaugeLike
-        self.evictions: CounterLike
-        self.errors: CounterLike
-        self.last_put_ts: GaugeLike
-
-        if self.enabled:
-            self.get_latency = self._hist(
-                "ds_get_latency_seconds", "Latency of get_df/get_last", ["layer"]
-            )
-            self.put_latency = self._hist(
-                "ds_put_latency_seconds", "Latency of put_bars", ["layer"]
-            )
-            self.ram_hit_ratio = self._gauge("ds_ram_hit_ratio", "RAM hit ratio (0..1)")
-            self.redis_hit_ratio = self._gauge(
-                "ds_redis_hit_ratio", "Redis hit ratio (0..1)"
-            )
-            self.bytes_in_ram = self._gauge("ds_bytes_in_ram", "Bytes in RAM")
-            self.flush_backlog = self._gauge(
-                "ds_flush_backlog", "Write-behind backlog size"
-            )
-            self.evictions = self._counter(
-                "ds_evictions_total", "RAM evictions", ["reason"]
-            )
-            self.errors = self._counter("ds_errors_total", "Errors", ["stage"])
-            self.last_put_ts = self._gauge(
-                "ds_last_put_timestamp",
-                "Unix timestamp (s) of last successful put_bars",
-            )
-        else:
-            self.get_latency = _Noop()
-            self.put_latency = _Noop()
-            self.ram_hit_ratio = _Noop()
-            self.redis_hit_ratio = _Noop()
-            self.bytes_in_ram = _Noop()
-            self.flush_backlog = _Noop()
-            self.evictions = _Noop()
-            self.errors = _Noop()
-            self.last_put_ts = _Noop()
+        self.get_latency: HistogramLike = _Noop()
+        self.put_latency: HistogramLike = _Noop()
+        self.ram_hit_ratio: GaugeLike = _Noop()
+        self.redis_hit_ratio: GaugeLike = _Noop()
+        self.bytes_in_ram: GaugeLike = _Noop()
+        self.flush_backlog: GaugeLike = _Noop()
+        self.evictions: CounterLike = _Noop()
+        self.errors: CounterLike = _Noop()
+        self.last_put_ts: GaugeLike = _Noop()
 
 
 # ── RAM Layer ────────────────────────────────────────────────────────────────
@@ -383,7 +347,7 @@ class RedisAdapter:
             except Exception as e:
                 await asyncio.sleep(self.cfg.io_retry_backoff * (2**attempt))
                 if attempt == self.cfg.io_retry_attempts - 1:
-                    logger.error(f"Redis GET failed for {key}: {e}")
+                    logger.error(f"Redis GET failed for {key}: {e}", exc_info=True)
                     return default
         return default
 
@@ -400,7 +364,7 @@ class RedisAdapter:
             except Exception as e:
                 await asyncio.sleep(self.cfg.io_retry_backoff * (2**attempt))
                 if attempt == self.cfg.io_retry_attempts - 1:
-                    logger.error(f"Redis SET failed for {key}: {e}")
+                    logger.error(f"Redis SET failed for {key}: {e}", exc_info=True)
 
 
 # ── Disk Adapter ──
@@ -538,16 +502,82 @@ class StorageAdapter:
             self.base_dir, file_name(symbol, context, "snapshot", "json")
         )
         loop = asyncio.get_running_loop()
+
+        def _postfix_df(df: pd.DataFrame) -> pd.DataFrame:
+            """Мінімальний guard для старих снапшотів часу.
+
+            - Визначає одиниці виміру open_time/close_time за порядком величини.
+            - Конвертує до мілісекунд (int64) тільки якщо потрібно.
+            - Відкидає явні майбутні/застарілі значення за широким вікном.
+            """
+            try:
+                if df is None or df.empty:
+                    return df
+                cols = set(df.columns)
+                if "open_time" not in cols:
+                    # деякі старі снапшоти могли мати поле "time"
+                    if "time" in cols:
+                        df = df.rename(columns={"time": "open_time"})
+                if "open_time" in df.columns:
+                    ot = pd.to_numeric(df["open_time"], errors="coerce")
+                    # Автодетект одиниць часу
+                    if ot.notna().any():
+                        med = float(ot.dropna().median())
+                        # seconds
+                        if 1e9 <= med < 1e11:
+                            df["open_time"] = (ot * 1000).astype("int64")
+                        # microseconds
+                        elif 1e14 <= med < 1e17:
+                            df["open_time"] = (ot // 1000).astype("int64")
+                        # nanoseconds
+                        elif 1e17 <= med < 1e20:
+                            df["open_time"] = (ot // 1_000_000).astype("int64")
+                        else:
+                            df["open_time"] = ot.astype("int64")
+                if "close_time" in df.columns:
+                    ct = pd.to_numeric(df["close_time"], errors="coerce")
+                    if ct.notna().any():
+                        med = float(ct.dropna().median())
+                        if 1e9 <= med < 1e11:
+                            df["close_time"] = (ct * 1000).astype("int64")
+                        elif 1e14 <= med < 1e17:
+                            df["close_time"] = (ct // 1000).astype("int64")
+                        elif 1e17 <= med < 1e20:
+                            df["close_time"] = (ct // 1_000_000).astype("int64")
+                        else:
+                            df["close_time"] = ct.astype("int64")
+
+                # Дуже широке вікно валідності: [now-400d, now+12h]
+                import time as _time
+
+                now_ms = int(_time.time() * 1000)
+                low = now_ms - int(400 * 24 * 3600 * 1000)
+                hi = now_ms + int(12 * 3600 * 1000)
+                if "open_time" in df.columns:
+                    ot = pd.to_numeric(df["open_time"], errors="coerce").astype("Int64")
+                    mask = ot.notna() & (ot.astype("int64").between(low, hi))
+                    # Якщо все випало — повертаємо як є (аудит), інакше — фільтруємо
+                    if mask.any():
+                        df = df[mask.values].copy()
+                        df.reset_index(drop=True, inplace=True)
+            except Exception:
+                # У режимі аудиту — жодних кидків; максимум попередження на рівні вище
+                return df
+            return df
+
         if _HAS_PARQUET and os.path.exists(parquet):
-            return await loop.run_in_executor(None, pd.read_parquet, parquet)
+            df = await loop.run_in_executor(None, pd.read_parquet, parquet)
+            return _postfix_df(df)
         # Спочатку читаємо новий jsonl формат
         if os.path.exists(jsonl):
-            return await loop.run_in_executor(
+            df = await loop.run_in_executor(
                 None, lambda: pd.read_json(jsonl, orient="records", lines=True)
             )
+            return _postfix_df(df)
         # Fallback на старий json (без lines)
         if os.path.exists(legacy_json):
-            return await loop.run_in_executor(None, pd.read_json, legacy_json)
+            df = await loop.run_in_executor(None, pd.read_json, legacy_json)
+            return _postfix_df(df)
         return None
 
 
@@ -814,19 +844,10 @@ class UnifiedDataStore:
         """
         t0 = time.perf_counter()
 
-        # Нормалізуємо dtype open_time (ms int) щоб уникнути порівнянь Timestamp/int
-        if "open_time" in bars.columns:
-            try:
-                if not pd.api.types.is_integer_dtype(bars["open_time"]):
-                    bars = bars.copy()
-                    bars["open_time"] = (
-                        pd.to_datetime(
-                            bars["open_time"], unit="ms", errors="coerce"
-                        ).astype("int64")
-                        // 10**6
-                    )
-            except Exception:  # broad-except: коерція open_time не критична
-                pass
+        # Аудит сирих даних: НЕ нормалізуємо час, передаємо як є
+        if bars is None or bars.empty:
+            logger.warning("[put_bars] Порожній фрейм: %s %s", symbol, interval)
+            return
 
         if self.cfg.validate_on_write:
             self._validate_bars(bars, stage="put_bars")
@@ -839,8 +860,15 @@ class UnifiedDataStore:
 
             # 2) останній бар у Redis
             ttl = self.cfg.intervals_ttl.get(interval, self.cfg.profile.warm_ttl_sec)
-            last_bar = merged.iloc[-1].to_dict()
-            await self.redis.jset("candles", symbol, interval, value=last_bar, ttl=ttl)
+            if len(merged):
+                last_bar = merged.iloc[-1].to_dict()
+                await self.redis.jset(
+                    "candles", symbol, interval, value=last_bar, ttl=ttl
+                )
+            else:
+                logger.warning(
+                    "[put_bars] Мerged порожній після злиття: %s %s", symbol, interval
+                )
 
             # 3) write-behind на диск
             if self.cfg.write_behind:
@@ -871,6 +899,7 @@ class UnifiedDataStore:
                 self._validate_bars(df, stage="warmup_read")
             if bars_needed > 0:
                 df = df.tail(bars_needed)
+            # Без нормалізації часу — кладемо як є
             self.ram.put(s, interval, self._dedup_sort(df))
 
     # ── Фонова обслуга ──────────────────────────────────────────────────────
@@ -924,7 +953,9 @@ class UnifiedDataStore:
                 await self.disk.save_bars(symbol, interval, df)
             except Exception as e:
                 # якщо не вдалось — повертаємо в хвіст і почекаємо
-                logger.error(f"Disk flush failed for {symbol} {interval}: {e}")
+                logger.error(
+                    f"Disk flush failed for {symbol} {interval}: {e}", exc_info=True
+                )
                 self._flush_q.append((symbol, interval, df))
                 await asyncio.sleep(self.cfg.io_retry_backoff)
 
@@ -941,29 +972,10 @@ class UnifiedDataStore:
     def _merge_bars(
         self, current: pd.DataFrame | None, new: pd.DataFrame
     ) -> pd.DataFrame:
-        # Приведення open_time в обох фреймах до однорідного int64 (ms)
-        def _coerce(df: pd.DataFrame) -> pd.DataFrame:
-            if "open_time" in df.columns and not pd.api.types.is_integer_dtype(
-                df["open_time"]
-            ):
-                try:
-                    df = df.copy()
-                    df["open_time"] = (
-                        pd.to_datetime(
-                            df["open_time"], unit="ms", errors="coerce"
-                        ).astype("int64")
-                        // 10**6
-                    )
-                except Exception:
-                    # broad-except: best-effort коерція
-                    # (пропускаємо пошкоджені значення)
-                    pass
-            return df
-
-        new = _coerce(new)
+        # Аудит сирих даних: не виконуємо жодної конвертації часу
         if current is None or current.empty:
             return self._dedup_sort(new.copy())
-        current = _coerce(current)
+        current = current
         # Early append optimization: if new strictly after current
         try:
             if (
@@ -997,7 +1009,10 @@ class UnifiedDataStore:
         cols = set(df.columns)
         missing = MIN_COLUMNS - cols
         if missing:
-            logger.error(f"[validate:{stage}] Відсутні стовпці: {missing}")
+            logger.error(
+                f"[validate:{stage}] Відсутні стовпці: {missing}",
+                extra={"stage": stage},
+            )
             try:
                 self.metrics.errors.labels(stage=f"validate_{stage}").inc()
             except Exception:
@@ -1005,17 +1020,7 @@ class UnifiedDataStore:
                     self.metrics.errors.inc()
                 except Exception:
                     pass
-        # простий детектор гепів (по open_time)
-        if "open_time" in cols:
-            s_dt = pd.to_datetime(df["open_time"], unit="ms", errors="coerce")
-            gaps = s_dt.isna().sum()
-            if gaps:
-                logger.warning(f"[validate:{stage}] NaT у open_time: {gaps}")
-        # монотонність часу
-        if "open_time" in cols and len(df) > 1:
-            s_num = pd.to_numeric(df["open_time"], errors="coerce")
-            if not pd.Series(s_num).is_monotonic_increasing:
-                logger.warning(f"[validate:{stage}] Виявлено немонотонний open_time")
+        # У режимі аудиту сирих даних — не виконуємо перетворень або перевірок часу
 
     def _publish_hit_ratios(self) -> None:
         total_ram = self._ram_hits + self._ram_miss

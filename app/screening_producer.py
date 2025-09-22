@@ -42,7 +42,6 @@ from UI.publish_full_state import RedisLike, publish_full_state
 from utils.utils import (
     create_error_signal,
     create_no_data_signal,
-    ensure_timestamp_column,
     first_not_none,
     get_tick_size,
     map_reco_to_signal,
@@ -86,7 +85,6 @@ async def process_asset_batch(
                 continue
             if "open_time" in df.columns and "timestamp" not in df.columns:
                 df = df.rename(columns={"open_time": "timestamp"})
-            df = ensure_timestamp_column(df)
             signal = await monitor.check_anomalies(symbol, df)
             normalized = normalize_result_types(signal)
             state_manager.update_asset(symbol, normalized)
@@ -397,13 +395,6 @@ async def screening_producer(
         logger.info("📢 Публікація стану активів...")
         await publish_full_state(state_manager, store, redis_conn)
         processing_time = time.time() - start_time
-        # Метрика часу циклу (Prometheus якщо увімкнено)
-        try:
-            store.metrics.put_latency.labels(layer="screening_cycle").observe(
-                processing_time
-            )
-        except Exception:
-            pass
         logger.info(f"⏳ Час обробки циклу: {processing_time:.2f} сек")
         if processing_time < 1:
             logger.warning(

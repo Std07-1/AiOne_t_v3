@@ -14,6 +14,10 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from config.config import (
+    K_SIGNAL,
+    K_STATS,
+    K_SYMBOL,
+    K_TRIGGER_REASONS,
     REDIS_CHANNEL_ASSET_STATE,
     REDIS_SNAPSHOT_KEY,
     STATS_CORE_KEY,
@@ -399,7 +403,9 @@ class UIConsumer:
                     ui_logger.error(f"Невідома помилка: {e}")
                     await asyncio.sleep(1)
 
-    def _build_signal_table(self, results: list[dict[str, Any]], loading: bool = False) -> Table:
+    def _build_signal_table(
+        self, results: list[dict[str, Any]], loading: bool = False
+    ) -> Table:
         """Побудова таблиці з сигналами та метриками системи."""
         # counters з payloadу, якщо є
         # Спершу беремо фактичну кількість рядків (що реально відображаються)
@@ -603,9 +609,9 @@ class UIConsumer:
             return table
 
         def priority_key(r: dict) -> tuple:
-            stats = r.get("stats", {})
-            reasons = set(r.get("trigger_reasons", []))
-            is_alert = str(r.get("signal", "")).upper().startswith("ALERT")
+            stats = r.get(K_STATS, {})
+            reasons = set(r.get(K_TRIGGER_REASONS, []))
+            is_alert = str(r.get(K_SIGNAL, "")).upper().startswith("ALERT")
             anomaly = (stats.get("volume_z", 0.0) or 0.0) >= self.vol_z_threshold
             warning = (not is_alert) and bool(reasons)
             if is_alert and "volume_spike" in reasons:
@@ -627,8 +633,8 @@ class UIConsumer:
             sorted_results = results
 
         for asset in sorted_results:
-            symbol = str(asset.get("symbol", "")).upper()
-            stats = asset.get("stats", {}) or {}
+            symbol = str(asset.get(K_SYMBOL, "")).upper()
+            stats = asset.get(K_STATS, {}) or {}
 
             # Перевага плоских ключів якщо вони вже розраховані продюсером
             if "price_str" in asset and isinstance(asset.get("price_str"), str):
@@ -644,7 +650,9 @@ class UIConsumer:
                         asset.get("price"), (int, float)
                     ):
                         price_val = asset.get("price")
-                        current_price = float(price_val) if price_val is not None else None
+                        current_price = (
+                            float(price_val) if price_val is not None else None
+                        )
                     else:
                         cp_raw = stats.get("current_price")
                         current_price = float(cp_raw) if cp_raw is not None else None
@@ -711,7 +719,7 @@ class UIConsumer:
                 status_icon = "🔴"
             status_str = f"{status_icon} {status}"
 
-            signal = str(asset.get("signal", "NONE")).upper()
+            signal = str(asset.get(K_SIGNAL, "NONE")).upper()
             signal_str = f"{self._get_signal_icon(signal)} {signal}"
 
             # Нова колонка впевненості (confidence)
@@ -746,7 +754,7 @@ class UIConsumer:
             )
 
             tags = []
-            for reason in asset.get("trigger_reasons", []) or []:
+            for reason in asset.get(K_TRIGGER_REASONS, []) or []:
                 tags.append(
                     "[magenta]Сплеск обсягу[/]"
                     if reason == "volume_spike"

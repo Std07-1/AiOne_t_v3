@@ -824,29 +824,23 @@ __all__ = [
 # ──────────────────────────────────────────────────────────────────────────────
 # Fallbacks для сумісності зі старими збірками (не впливають на сучасну версію)
 # ──────────────────────────────────────────────────────────────────────────────
-try:
-    _ = NAMESPACE
-except NameError:  # pragma: no cover
-    NAMESPACE = "ai_one"
-
-try:
-    _ = DATASTORE_BASE_DIR
-except NameError:  # pragma: no cover
+# Fallback-блок залишено мінімальним (legacy builds). У сучасному коді всі ці
+# константи визначені вище; тут лише убезпечення при частковому імпорті.
+if "NAMESPACE" not in globals():  # pragma: no cover
+    NAMESPACE = "ai_one"  # type: ignore[redefined-builtin]
+if "DATASTORE_BASE_DIR" not in globals():  # pragma: no cover
     DATASTORE_BASE_DIR = "./datastore"
-
-try:
-    _ = ADMIN_COMMANDS_CHANNEL
-except NameError:  # pragma: no cover
+if "ADMIN_COMMANDS_CHANNEL" not in globals():  # pragma: no cover
     ADMIN_COMMANDS_CHANNEL = f"{NAMESPACE}:admin:commands"
 
-try:
-    _ = __all__
-except NameError:  # pragma: no cover
-    __all__ = []  # type: ignore[assignment]
+# __all__ гарантуємо як список (mypy‑safe)
+if "__all__" not in globals():  # pragma: no cover
+    __all__: list[str] = []
+else:
+    # Якщо стара версія підклала рядок або інший тип — приводимо до списку
+    if not isinstance(__all__, list):  # type: ignore[name-defined]
+        __all__ = list(str(__all__).split(","))  # type: ignore[assignment]
 
 for _name in ("NAMESPACE", "DATASTORE_BASE_DIR", "ADMIN_COMMANDS_CHANNEL"):
-    try:
-        if _name not in __all__:  # type: ignore[operator]
-            __all__.append(_name)  # type: ignore[union-attr]
-    except Exception:
-        pass
+    if _name not in __all__:
+        __all__.append(_name)

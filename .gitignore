@@ -92,8 +92,10 @@ pytest_report.txt
 ruff_report.txt
 TYPING_ROADMAP.md
 pyrightconfig.json
+.pre-commit-config.yaml
 mypy.ini
 mypy_report.txt
+.markdownlint.json
 runtime.txt
 stage2_decisions.jsonl
 STYLE_GUIDE.md
@@ -128,7 +130,6 @@ etc/
 logs/
 symbols/
 analytics/
-indicators/
 !monitor/indicators/
 
 # Cache and intermediate data

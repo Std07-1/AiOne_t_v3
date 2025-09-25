@@ -268,24 +268,6 @@ async def publish_full_state(
                 # Якщо сигнали нейтральні, не чіпаємо asset['state'] / status
             except Exception:
                 pass
-            # Якщо була даунгрейд рекомендації — додаємо службові позначки в hints
-            try:
-                reco_original = asset.get("reco_original")
-                gate_reason = asset.get("reco_gate_reason")
-                final_reco = asset.get("recommendation")
-                if reco_original and final_reco and reco_original != final_reco:
-                    tag = f"downgraded:{reco_original}->{final_reco}"
-                    if gate_reason:
-                        tag = f"{tag}[{gate_reason}]"
-                    # hints існують як список — зберігаємо унікальність
-                    hints_list = asset.get("hints")
-                    if not isinstance(hints_list, list):
-                        hints_list = []
-                    if tag not in hints_list:
-                        hints_list.insert(0, tag)
-                    asset["hints"] = hints_list
-            except Exception:
-                pass
 
             # tp_sl: береться виключно зі Stage3 (core:trades.targets), без локальних розрахунків
             # Можна вимкнути повністю через feature‑flag UI_TP_SL_FROM_STAGE3_ENABLED

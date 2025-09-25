@@ -116,12 +116,13 @@ async def process_asset_batch(
                 stats_container = {}
                 signal["stats"] = stats_container
 
-            # Доповнюємо відсутні поля базових метрик тільки якщо їх немає
-            if current_price is not None and "current_price" not in stats_container:
+            # ВАЖЛИВО: ці базові метрики ОНОВЛЮЄМО КОЖЕН ЦИКЛ (інакше UI «зависає» на першому значенні)
+            # Раніше тут було set-if-missing, що призводило до застиглих price/volume/ts → повертаємо always-overwrite.
+            if current_price is not None:
                 stats_container["current_price"] = current_price
-            if volume_last is not None and "volume" not in stats_container:
+            if volume_last is not None:
                 stats_container["volume"] = volume_last
-            if last_ts_val is not None and "timestamp" not in stats_container:
+            if last_ts_val is not None:
                 stats_container["timestamp"] = last_ts_val
 
             # Нормалізуємо типи (існуючі метрики збережуться)
@@ -198,6 +199,18 @@ async def process_single_stage2(
                 logger.info("[NARR] %s %s", symbol, raw_narr.replace("\n", " "))
             except Exception:
                 logger.debug("[NARR] %s (logging failed)", symbol)
+        # Якщо рекомендація була даунгрейднута Stage2 гейтом — формуємо службовий тег
+        try:
+            original_reco = result.get("reco_original")
+            if original_reco and recommendation and original_reco != recommendation:
+                tag = f"downgraded:{original_reco}->{recommendation}"
+                gate_reason = result.get("reco_gate_reason")
+                if gate_reason:
+                    tag = f"{tag}[{gate_reason}]"
+                if tag not in hints:
+                    hints.insert(0, tag)
+        except Exception:
+            pass
 
         anomaly_det = result.get("anomaly_detection")
         # Об'єднуємо джерела причин: основний результат + market_context

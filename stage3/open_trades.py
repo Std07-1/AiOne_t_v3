@@ -48,9 +48,23 @@ async def open_trades(
     if not trade_manager or not signals:
         return
 
-    # Вибір найкращих сигналів
+    # Формуємо кандидатів: ігноруємо лише ті, що явно validation_passed=False
+    candidates: list[dict[str, Any]] = []
+    for s in signals:
+        if s.get("validation_passed") is False:
+            try:
+                logger.info("⛔️ Пропуск %s: validation_passed=False", s.get("symbol"))
+            except Exception:
+                pass
+            continue
+        candidates.append(s)
+    if not candidates:
+        logger.info("Stage3: немає кандидатів для відкриття (raw=%d)", len(signals))
+        return
+
+    # Вибір найкращих сигналів (за впевненістю)
     sorted_signals = sorted(
-        [s for s in signals if s.get("validation_passed")],
+        candidates,
         key=lambda x: x.get("confidence", 0),
         reverse=True,
     )[:max_parallel]
@@ -143,6 +157,26 @@ async def open_trades(
                     f"Коригування ATR для {symbol}: {signal.get('atr')} -> 0.01"
                 )
 
+            # Підготовка TP/SL: якщо відсутні топ-рівня, беремо з risk_parameters
+            tp_val = safe_float(signal.get("tp"))
+            sl_val = safe_float(signal.get("sl"))
+            if tp_val is None or sl_val is None:
+                rp = signal.get("risk_parameters") or {}
+                if tp_val is None:
+                    tp_fallback = safe_float(rp.get("take_profit"))
+                    if tp_fallback is not None:
+                        tp_val = tp_fallback
+                        logger.debug(
+                            "Fallback TP з risk_parameters для %s -> %s", symbol, tp_val
+                        )
+                if sl_val is None:
+                    sl_fallback = safe_float(rp.get("stop_loss"))
+                    if sl_fallback is not None:
+                        sl_val = sl_fallback
+                        logger.debug(
+                            "Fallback SL з risk_parameters для %s -> %s", symbol, sl_val
+                        )
+
             # Підготовка даних для відкриття угоди
             trade_data = {
                 "symbol": symbol,
@@ -150,8 +184,8 @@ async def open_trades(
                 "atr": safe_float(signal.get("atr")),
                 "rsi": safe_float(signal.get("rsi")),
                 "volume": safe_float(signal.get("volume_mean")),
-                "tp": safe_float(signal.get("tp")),
-                "sl": safe_float(signal.get("sl")),
+                "tp": tp_val,
+                "sl": sl_val,
                 "confidence": confidence,
                 "hints": signal.get("hints", []),
                 "cluster_factors": signal.get("cluster_factors", []),

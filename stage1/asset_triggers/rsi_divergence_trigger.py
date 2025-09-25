@@ -50,6 +50,7 @@ def rsi_divergence_trigger(
     rsi_series[avg_gain == 0] = 0
     current_rsi = rsi_series.iloc[-1]
     import numpy as np  # local import to avoid global dependency for tests
+
     prices = np.asarray(close.values, dtype=float)
     peak_indices, _ = find_peaks(prices)
     trough_indices, _ = find_peaks(-prices)

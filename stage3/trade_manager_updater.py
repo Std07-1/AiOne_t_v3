@@ -18,6 +18,14 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 from app.settings import load_datastore_cfg
+from config.config import (
+    CORE_DUAL_WRITE_OLD_STATS,
+    CORE_TTL_SEC,
+    REDIS_CORE_PATH_HEALTH,
+    REDIS_CORE_PATH_STATS,
+    REDIS_CORE_PATH_TRADES,
+    REDIS_DOC_CORE,
+)
 from stage1.asset_monitoring import AssetMonitorStage1
 from stage3.trade_manager import TradeLifecycleManager
 
@@ -333,11 +341,28 @@ async def trade_manager_updater(
 
         # UI publish (Redis JSON) for centralized consumer (two keys for backward compat)
         if publish_ui:
+            # Побудова компактної мапи TP/SL по активних угодах для UI/Publisher
+            targets: dict[str, dict[str, float]] = {}
+            try:
+                for tr in active:
+                    sym = str(tr.get("symbol", "")).upper()
+                    tp_v = tr.get("tp")
+                    sl_v = tr.get("sl")
+                    if isinstance(tp_v, (int, float)) and isinstance(
+                        sl_v, (int, float)
+                    ):
+                        if float(tp_v) > 0 and float(sl_v) > 0 and sym:
+                            targets[sym] = {"tp": float(tp_v), "sl": float(sl_v)}
+            except Exception:
+                # Якщо структура активних угод відрізняється — пропускаємо targets
+                targets = {}
+
             payload_trades = {
                 "active": counts[0],
                 "closed": counts[1],
                 "ts": last_success_ts,
                 "interval": timeframe,
+                "targets": targets,
             }
             core_payload = {
                 "trades": payload_trades,
@@ -373,17 +398,37 @@ async def trade_manager_updater(
                         core_payload["skip_reasons"] = dict(sorted_reasons)
                 except Exception:
                     pass
+            # ── Dual-write період: нові ключі ai_one:core + (опційно) legacy "stats" ──
             try:
-                # legacy key
+                # Новий єдиний документ core з json-путями
                 await store.redis.jset(
-                    "stats", "trades", value=payload_trades, ttl=ui_ttl
+                    REDIS_DOC_CORE,
+                    REDIS_CORE_PATH_TRADES,
+                    value=payload_trades,
+                    ttl=CORE_TTL_SEC,
                 )
-            except Exception:
-                pass
-            try:
-                await store.redis.jset("stats", "core", value=core_payload, ttl=ui_ttl)
-            except Exception as e:  # pragma: no cover
-                logger.debug(f"UI publish core failed: {e}")
+                await store.redis.jset(
+                    REDIS_DOC_CORE,
+                    REDIS_CORE_PATH_STATS,
+                    value=core_payload,
+                    ttl=CORE_TTL_SEC,
+                )
+            except Exception as e:
+                logger.debug(f"core dual-write (new) failed: {e}")
+
+            if CORE_DUAL_WRITE_OLD_STATS:
+                try:
+                    await store.redis.jset(
+                        "stats", "trades", value=payload_trades, ttl=ui_ttl
+                    )
+                except Exception:
+                    pass
+                try:
+                    await store.redis.jset(
+                        "stats", "core", value=core_payload, ttl=ui_ttl
+                    )
+                except Exception as e:  # pragma: no cover
+                    logger.debug(f"core dual-write (legacy) failed: {e}")
 
             # Health heartbeat key (short TTL)
             try:
@@ -394,7 +439,24 @@ async def trade_manager_updater(
                     "pressure": round(pressure_ratio, 4),
                 }
                 hb_ttl = max(5, int(interval_sec * 0.9))
-                await store.redis.jset("stats", "health", value=hb_payload, ttl=hb_ttl)
+                # Новий core:health
+                try:
+                    await store.redis.jset(
+                        REDIS_DOC_CORE,
+                        REDIS_CORE_PATH_HEALTH,
+                        value=hb_payload,
+                        ttl=hb_ttl,
+                    )
+                except Exception:
+                    logger.debug("core:health write failed", exc_info=True)
+                # Legacy під час dual-write
+                if CORE_DUAL_WRITE_OLD_STATS:
+                    try:
+                        await store.redis.jset(
+                            "stats", "health", value=hb_payload, ttl=hb_ttl
+                        )
+                    except Exception:
+                        pass
             except Exception:
                 pass
 

@@ -463,28 +463,20 @@ class AssetMonitorStage1:
                 effective.get("vol_z_threshold", getattr(thr, "vol_z_threshold", 2.0))
             )
             # За замовчуванням використовуємо лише Z-score (use_vol_atr=False)
-            if volume_spike_trigger(
+            fired, meta_vs = volume_spike_trigger(
                 df,
                 z_thresh=volz,
                 symbol=symbol,
                 use_vol_atr=self.use_vol_atr,
-            ):
-                # Визначаємо напрям бару, щоб розрізняти бичий/ведмежий сплеск
-                try:
-                    last_open = float(df["open"].iloc[-1])
-                    last_close = float(df["close"].iloc[-1])
-                    upward = last_close > last_open
-                except Exception:
-                    upward = True  # якщо неможливо визначити — припускаємо вгору
-                # Визначимо, яка саме умова спрацювала, щоб лог не вводив в оману
-                try:
-                    z_val = float(stats.get("volume_z", 0.0))
-                except Exception:
-                    z_val = 0.0
+            )
+            if fired:
+                # Використовуємо метадані тригера (анти-лукап, точні значення)
+                z_val = float(meta_vs.get("z", 0.0))
+                upward = bool(meta_vs.get("upbar", True))
                 # (VOL/ATR гілка вимкнена за замовчуванням)
                 if upward:
                     reason_txt = (
-                        f"📈 Бичий сплеск обсягу (Z>{volz:.2f})"
+                        f"📈 Бичий сплеск обсягу (Z≥{volz:.2f})"
                         if z_val >= volz
                         else "📈 Бичий сплеск обсягу (VOL/ATR)"
                     )
@@ -494,7 +486,7 @@ class AssetMonitorStage1:
                     )
                 else:
                     reason_txt = (
-                        f"📉 Ведмежий сплеск обсягу (Z>{volz:.2f})"
+                        f"📉 Ведмежий сплеск обсягу (Z≥{volz:.2f})"
                         if z_val >= volz
                         else "📉 Ведмежий сплеск обсягу (VOL/ATR)"
                     )
@@ -529,9 +521,11 @@ class AssetMonitorStage1:
                 atr_pct_local = 0.0
             if isinstance(band_pct_atr, (int, float)) and atr_pct_local > 0:
                 near_thr = float(band_pct_atr) * atr_pct_local
-                # Клапани безпеки
-                near_thr = float(min(0.03, max(0.001, near_thr)))
+                # Клапани безпеки: мінімум 0.20% щоб уникнути "липких" near_high/near_low на мікро‑ATR
+                min_near_pct = 0.002  # 0.20%
+                near_thr = float(min(0.03, max(min_near_pct, near_thr)))
             else:
+                # Дефолт 0.5%, але не нижче мінімуму
                 near_thr = 0.005
 
             logger.debug(

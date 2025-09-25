@@ -41,7 +41,9 @@ coverage.xml
 htmlcov/
 .tox/
 hypothesis/
-
+.toml
+.ini
+.pyproject.toml
 # Jupyter
 .ipynb_checkpoints/
 
@@ -91,6 +93,9 @@ ruff_report.txt
 TYPING_ROADMAP.md
 pyrightconfig.json
 mypy.ini
+mypy_report.txt
+runtime.txt
+stage2_decisions.jsonl
 STYLE_GUIDE.md
 tools/
 .github/

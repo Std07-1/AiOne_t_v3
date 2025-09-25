@@ -1,3 +1,5 @@
+"""UI консюмер у режимі render-only: без локальних обчислень цін/ATR/RSI/TP-SL."""
+
 import asyncio
 import json
 import logging
@@ -19,10 +21,11 @@ from config.config import (
     K_SYMBOL,
     K_TRIGGER_REASONS,
     REDIS_CHANNEL_ASSET_STATE,
+    REDIS_CHANNEL_UI_ASSET_STATE,
     REDIS_SNAPSHOT_KEY,
-    STATS_CORE_KEY,
+    REDIS_SNAPSHOT_UI_KEY,
+    UI_USE_V2_NAMESPACE,
 )
-from utils.utils import format_price
 
 ui_console = Console(stderr=False)
 
@@ -56,6 +59,8 @@ class UIConsumer:
         self.low_atr_threshold = low_atr_threshold
         self.alert_animator = AlertAnimator()
         self.last_update_time: float = time.time()
+        # Послідовність останнього прийнятого снапшоту (для відсікання застарілих)
+        self._last_seq: int = -1
         self._last_counters: dict[str, Any] = {}
         self._display_results: list[dict[str, Any]] = (
             []
@@ -63,21 +68,9 @@ class UIConsumer:
         self._blink_state = False  # для миготіння pressure
         self._pressure_alert_active = False
 
-    def _format_price(self, price: float | None, symbol: str) -> str:
-        """Форматує ціну для відображення у таблиці.
+    # self._last_core_refresh: float = 0.0  # видалено: Core/Health більше не використовуються
 
-        Якщо значення відсутнє або непозитивне — повертає "-";
-        інакше використовує utils.format_price.
-        """
-        try:
-            if price is None:
-                return "-"
-            p = float(price)
-            if p <= 0:
-                return "-"
-            return format_price(p, symbol)
-        except Exception:
-            return "-"
+    # Render-only режим: UI не форматує та не обчислює значення — лише стилізує
 
     def _get_rsi_color(self, rsi: float) -> str:
         if rsi < 30:
@@ -120,7 +113,7 @@ class UIConsumer:
     async def redis_consumer(
         self,
         redis_url: str | None = None,
-        channel: str = REDIS_CHANNEL_ASSET_STATE,
+        channel: str | None = None,
         refresh_rate: float = 0.8,
         loading_delay: float = 1.5,
         smooth_delay: float = 0.05,
@@ -145,9 +138,17 @@ class UIConsumer:
         )
         pubsub = redis_client.pubsub()
 
-        # Спроба початкового снапшоту перед підпискою + нові core-статистики
+        # Спроба початкового снапшоту перед підпискою (cold start only)
         try:
-            snapshot_raw = await redis_client.get(REDIS_SNAPSHOT_KEY)
+            primary_snapshot = (
+                REDIS_SNAPSHOT_UI_KEY if UI_USE_V2_NAMESPACE else REDIS_SNAPSHOT_KEY
+            )
+            fallback_snapshot = (
+                REDIS_SNAPSHOT_KEY if UI_USE_V2_NAMESPACE else REDIS_SNAPSHOT_UI_KEY
+            )
+            snapshot_raw = await redis_client.get(primary_snapshot)
+            if not snapshot_raw:
+                snapshot_raw = await redis_client.get(fallback_snapshot)
             if snapshot_raw:
                 snap = json.loads(snapshot_raw)
                 if isinstance(snap, dict) and isinstance(snap.get("assets"), list):
@@ -156,72 +157,42 @@ class UIConsumer:
                         self._display_results = self._last_results
                     self._last_counters = snap.get("counters", {}) or {}
                     meta_ts = snap.get("meta", {}).get("ts")
+                    meta_seq = snap.get("meta", {}).get("seq")
                     if meta_ts:
                         try:
+                            # Інтерпретуємо UTC-час коректно (Z → +00:00)
                             self.last_update_time = datetime.fromisoformat(
-                                meta_ts.replace("Z", "")
+                                str(meta_ts).replace("Z", "+00:00")
                             ).timestamp()
                         except Exception:
                             pass
+                    try:
+                        if meta_seq is not None:
+                            self._last_seq = int(meta_seq)
+                    except Exception:
+                        pass
                     ui_logger.info(
                         "📥 Завантажено початковий снапшот: %d активів",
                         len(self._last_results),
                     )
-            # Нові агреговані трейд-метрики (stats:core)
-            try:
-                core_raw = await redis_client.get(STATS_CORE_KEY)
-                if core_raw:
-                    core = json.loads(core_raw)
-                    if not isinstance(core, dict):
-                        core = {}
-                    trades_part = core.get("trades", {})
-                    # кешуємо як counters.* для заголовку
-                    if trades_part:
-                        self._last_counters.update(
-                            {
-                                "active_trades": trades_part.get("active"),
-                                "closed_trades": trades_part.get("closed"),
-                                "skipped": core.get("skipped"),
-                                "skipped_ewma": core.get("skipped_ewma"),
-                                "drift_ratio": core.get("drift_ratio"),
-                                "dynamic_interval": core.get("dynamic_interval"),
-                                "pressure": core.get("pressure"),
-                                "pressure_norm": core.get("pressure_norm"),
-                                "alpha": core.get("alpha"),
-                            }
-                        )
-                        thresholds = core.get("thresholds") or {}
-                        consecutive = core.get("consecutive") or {}
-                        self._last_counters["th_drift_high"] = thresholds.get(
-                            "drift_high"
-                        )
-                        self._last_counters["th_drift_low"] = thresholds.get(
-                            "drift_low"
-                        )
-                        self._last_counters["th_pressure"] = thresholds.get("pressure")
-                        self._last_counters["consec_drift_high"] = consecutive.get(
-                            "drift_high"
-                        )
-                        self._last_counters["consec_pressure_high"] = consecutive.get(
-                            "pressure_high"
-                        )
-                        if "skip_reasons" in core and isinstance(
-                            core.get("skip_reasons"), dict
-                        ):
-                            self._last_counters["skip_reasons"] = core.get(
-                                "skip_reasons"
-                            )
-                        # last_update_ts можна відобразити як heartbeat
-                        if core.get("last_update_ts"):
-                            self.last_update_time = float(core["last_update_ts"])
-            except Exception:
-                pass
         except Exception:  # broad-except: початковий снапшот не критичний
             ui_logger.debug("Не вдалося завантажити початковий снапшот", exc_info=True)
 
         await asyncio.sleep(loading_delay)
-        await pubsub.subscribe(channel)
-        ui_logger.info(f"🔗 Підключено до Redis ({redis_url}), канал '{channel}'...")
+        # Вибір каналу за namespace або явним аргументом
+        selected_channel: str = (
+            channel
+            if isinstance(channel, str) and channel
+            else (
+                REDIS_CHANNEL_UI_ASSET_STATE
+                if UI_USE_V2_NAMESPACE
+                else REDIS_CHANNEL_ASSET_STATE
+            )
+        )
+        await pubsub.subscribe(selected_channel)
+        ui_logger.info(
+            f"🔗 Підключено до Redis ({redis_url}), канал '{selected_channel}'..."
+        )
 
         # Початкове відображення: якщо вже є снапшот, показуємо його одразу
         initial_results = self._display_results if self._display_results else []
@@ -236,30 +207,8 @@ class UIConsumer:
         ) as live:
             while True:
                 try:
-                    # Періодичний fallback: якщо >7s без оновлень і маємо порожній
-                    # live список, пробуємо перезчитати снапшот
-                    if (
-                        (time.time() - self.last_update_time) > 7
-                        and not self._last_results
-                        and self._display_results
-                    ):
-                        try:
-                            snapshot_raw = await redis_client.get(REDIS_SNAPSHOT_KEY)
-                            if snapshot_raw:
-                                snap = json.loads(snapshot_raw)
-                                assets_snap = (
-                                    snap.get("assets")
-                                    if isinstance(snap, dict)
-                                    else None
-                                )
-                                if isinstance(assets_snap, list) and assets_snap:
-                                    self._display_results = assets_snap
-                                    ui_logger.info(
-                                        "♻️ Fallback snapshot reload: %d активів",
-                                        len(assets_snap),
-                                    )
-                        except Exception:  # broad except: fallback reload best-effort
-                            pass
+                    # Periodic fallback snapshot reload — видалено.
+                    # Snapshot використовуємо лише при холодному старті або при gap у seq.
                     message = await pubsub.get_message(
                         ignore_subscribe_messages=True, timeout=1.0
                     )
@@ -272,8 +221,126 @@ class UIConsumer:
                             )
                             data = None
 
-                        # ✅ Новий коректний парсинг продюсера: очікуємо dict з 'assets'
+                        # ✅ Очікуємо dict з 'assets' та коректною meta.seq
                         if isinstance(data, dict) and "assets" in data:
+                            # Строгий контроль послідовності: приймаємо лише якщо seq монотонно зростає.
+                            try:
+                                meta_ts_raw = data.get("meta", {}).get("ts")
+                                meta_seq = data.get("meta", {}).get("seq")
+                                incoming_ts = None
+                                if meta_ts_raw:
+                                    incoming_ts = datetime.fromisoformat(
+                                        str(meta_ts_raw).replace("Z", "+00:00")
+                                    ).timestamp()
+                                incoming_seq = None
+                                try:
+                                    if meta_seq is not None:
+                                        incoming_seq = int(meta_seq)
+                                except Exception:
+                                    incoming_seq = None
+                                if incoming_seq is not None and isinstance(
+                                    self._last_seq, (int, float)
+                                ):
+                                    if incoming_seq == int(self._last_seq):
+                                        ui_logger.debug(
+                                            "Duplicate seq=%s — skip", incoming_seq
+                                        )
+                                        continue
+                                    if incoming_seq < int(self._last_seq):
+                                        ui_logger.debug(
+                                            "Stale seq=%s < last_seq=%s — skip",
+                                            incoming_seq,
+                                            self._last_seq,
+                                        )
+                                        continue
+                                    if incoming_seq > int(self._last_seq) + 1:
+                                        # gap detected → reload snapshot (воно має відповідати останньому publish)
+                                        ui_logger.warning(
+                                            "Gap detected: incoming_seq=%s last_seq=%s — reload snapshot",
+                                            incoming_seq,
+                                            self._last_seq,
+                                        )
+                                        try:
+                                            # При gap також використовуємо той самий підхід primary→fallback
+                                            primary_snapshot = (
+                                                REDIS_SNAPSHOT_UI_KEY
+                                                if UI_USE_V2_NAMESPACE
+                                                else REDIS_SNAPSHOT_KEY
+                                            )
+                                            fallback_snapshot = (
+                                                REDIS_SNAPSHOT_KEY
+                                                if UI_USE_V2_NAMESPACE
+                                                else REDIS_SNAPSHOT_UI_KEY
+                                            )
+                                            snapshot_raw = await redis_client.get(
+                                                primary_snapshot
+                                            )
+                                            if not snapshot_raw:
+                                                snapshot_raw = await redis_client.get(
+                                                    fallback_snapshot
+                                                )
+                                            if snapshot_raw:
+                                                snap = json.loads(snapshot_raw)
+                                                if isinstance(snap, dict):
+                                                    self._last_results = (
+                                                        snap.get("assets") or []
+                                                    )
+                                                    if self._last_results:
+                                                        self._display_results = (
+                                                            self._last_results
+                                                        )
+                                                    self._last_counters = (
+                                                        snap.get("counters", {}) or {}
+                                                    )
+                                                    seq_val = snap.get("meta", {}).get(
+                                                        "seq"
+                                                    )
+                                                    try:
+                                                        if seq_val is not None:
+                                                            self._last_seq = int(
+                                                                seq_val
+                                                            )
+                                                    except Exception:
+                                                        pass
+                                                    ts_val = snap.get("meta", {}).get(
+                                                        "ts"
+                                                    )
+                                                    if ts_val:
+                                                        try:
+                                                            self.last_update_time = (
+                                                                datetime.fromisoformat(
+                                                                    str(ts_val).replace(
+                                                                        "Z", "+00:00"
+                                                                    )
+                                                                ).timestamp()
+                                                            )
+                                                        except Exception:
+                                                            pass
+                                                    ui_logger.info(
+                                                        "Snapshot reloaded after gap: assets=%d seq=%s",
+                                                        len(self._last_results),
+                                                        self._last_seq,
+                                                    )
+                                        except Exception:
+                                            ui_logger.debug(
+                                                "Snapshot reload failed after gap",
+                                                exc_info=True,
+                                            )
+                                        # після reload snapshot пропускаємо поточне повідомлення
+                                        continue
+                                elif (
+                                    incoming_ts is not None
+                                    and incoming_ts < self.last_update_time
+                                ):
+                                    # Якщо seq відсутній — зберігаємо захист за часом, щоб не відображати застаріле
+                                    ui_logger.debug(
+                                        "Stale by time skipped: ts_in=%s < last_ts=%.3f",
+                                        meta_ts_raw,
+                                        self.last_update_time,
+                                    )
+                                    continue
+                            except Exception:
+                                pass
                             try:
                                 assets_field = data.get("assets")
                                 assets_len = (
@@ -313,13 +380,15 @@ class UIConsumer:
                                 if parsed_assets:
                                     self._display_results = parsed_assets
                             # meta.ts → час оновлення
-                            meta_ts = data.get("meta", {}).get("ts")
+                            meta_obj = data.get("meta", {}) or {}
+                            meta_ts = meta_obj.get("ts")
+                            meta_seq = meta_obj.get("seq")
                             if meta_ts:
                                 try:
                                     incoming_ts = datetime.fromisoformat(
-                                        meta_ts.replace("Z", "")
+                                        str(meta_ts).replace("Z", "+00:00")
                                     ).timestamp()
-                                    # Оновлюємо лише якщо новіше значення
+                                    # Оновлюємо лише якщо новіше значення (seq контроль вище)
                                     if incoming_ts >= self.last_update_time:
                                         self.last_update_time = incoming_ts
                                 except Exception:
@@ -329,8 +398,16 @@ class UIConsumer:
                                 # давно не оновлювалось (>5s)
                                 if time.time() - self.last_update_time > 5:
                                     self.last_update_time = time.time()
-                            # counters → для заголовку
-                            self._last_counters = data.get("counters", {}) or {}
+                            # Завершально оновлюємо last_seq, якщо присутній
+                            try:
+                                if meta_seq is not None:
+                                    self._last_seq = int(meta_seq)
+                            except Exception:
+                                pass
+                            # counters → для заголовку (мерджимо, щоб не губити core‑метрики)
+                            incoming_counters = data.get("counters", {}) or {}
+                            if isinstance(incoming_counters, dict):
+                                self._last_counters.update(incoming_counters)
                             # Додатковий лог узгодженості
                             ui_logger.debug(
                                 "Post-assign last_results_len=%d counters_assets=%s display_len=%d",
@@ -395,7 +472,8 @@ class UIConsumer:
                     await asyncio.sleep(3)
                     try:
                         await pubsub.reset()
-                        await pubsub.subscribe(channel)
+                        # Повторно підписуємося на вже обраний канал (не None)
+                        await pubsub.subscribe(selected_channel)
                         ui_logger.info("✅ Перепідключено до Redis")
                     except Exception as reconnect_err:
                         ui_logger.error(f"Помилка перепідключення: {reconnect_err}")
@@ -407,6 +485,20 @@ class UIConsumer:
         self, results: list[dict[str, Any]], loading: bool = False
     ) -> Table:
         """Побудова таблиці з сигналами та метриками системи."""
+        # Діагностичне логування для перевірки «застигання» значень
+        try:
+            if results:
+                sample = results[0]
+                ui_logger.debug(
+                    "Render sample symbol=%s price_str=%s rsi=%s ts=%s seq=%s",
+                    sample.get("symbol"),
+                    sample.get("price_str"),
+                    sample.get("rsi"),
+                    (sample.get("stats") or {}).get("timestamp"),
+                    (sample.get("meta") or {}).get("seq"),
+                )
+        except Exception:
+            pass
         # counters з payloadу, якщо є
         # Спершу беремо фактичну кількість рядків (що реально відображаються)
         total_assets = len(results)
@@ -464,6 +556,9 @@ class UIConsumer:
                 drift_fragment = ""
         else:
             drift_fragment = ""
+            # Плейсхолдер, якщо ключ існує, але значення наразі відсутнє
+            if "drift_ratio" in self._last_counters:
+                drift_fragment = " | Drift: -"
 
         trades_fragment = ""
         if active_trades is not None or closed_trades is not None:
@@ -486,6 +581,8 @@ class UIConsumer:
                     pass
         else:
             skipped_fragment = ""
+            if "skipped" in self._last_counters:
+                skipped_fragment = " | Skipped: -"
 
         if dynamic_interval is not None:
             try:
@@ -506,6 +603,8 @@ class UIConsumer:
                 dynamic_fragment = f" | ΔInterval: {dynamic_interval}"
         else:
             dynamic_fragment = ""
+            if "dynamic_interval" in self._last_counters:
+                dynamic_fragment = " | ΔInterval: -"
 
         blink_fragment = ""
         if pressure is not None:
@@ -543,6 +642,8 @@ class UIConsumer:
                 pressure_fragment = f" | Pressure: {pressure}"
         else:
             pressure_fragment = ""
+            if "pressure" in self._last_counters:
+                pressure_fragment = " | Pressure: -"
 
         consec_fragment = ""
         if (consec_drift or consec_pressure) and (consec_drift or 0) + (
@@ -554,6 +655,8 @@ class UIConsumer:
         alpha_fragment = (
             f" | α={alpha_val:.2f}" if isinstance(alpha_val, (int, float)) else ""
         )
+        if not alpha_fragment and "alpha" in self._last_counters:
+            alpha_fragment = " | α=-"
         skip_reasons_fragment = ""
         if isinstance(skip_reasons, dict) and skip_reasons:
             # take first 3 reasons for compact display
@@ -561,12 +664,39 @@ class UIConsumer:
             compact = ",".join(f"{k}:{v}" for k, v in top_pairs)
             skip_reasons_fragment = f" | SkipReasons[{compact}]"
 
+        # Видалено: Stage2 (QDE) counters з Redis (scenario/recommendation)
+        # UI більше не відображає ці фрагменти; логіку зібрано у Publisher
+
+        # Stage3 блокування з counters снапшоту (якщо доступні)
+        blocks_fragment = ""
+        try:
+            # Нові накопичувальні лічильники
+            b_lv = self._last_counters.get("blocked_alerts_lowvol") or 0
+            b_htf = self._last_counters.get("blocked_alerts_htf") or 0
+            b_lc = self._last_counters.get("blocked_alerts_lowconf") or 0
+            passed = self._last_counters.get("passed_alerts") or 0
+            downgraded = self._last_counters.get("downgraded_alerts") or 0
+            gen = self._last_counters.get("generated_signals")
+            skip = self._last_counters.get("skipped_signals")
+            # Blocks: lowvol|htf|lowconf|OK (OK = passed)
+            blocks_fragment = f" | Blocks: {b_lv}|{b_htf}|{b_lc}|{passed}"
+            # Додаємо Gen/Skip якщо доступні
+            if isinstance(gen, int) or isinstance(skip, int):
+                blocks_fragment += f" | Gen: {int(gen or 0)} | Skip: {int(skip or 0)}"
+            # Показати скидкові даунгрейди (сума) якщо є
+            if downgraded:
+                blocks_fragment += f" | Downgraded: {downgraded}"
+        except Exception:
+            pass
+
+        # Індикатори Core/Health повністю прибрані з заголовка
+
         title = (
             f"[bold]Система моніторингу AiOne_t[/bold] | "
             f"Активи: [green]{total_assets}[/green] | "
             f"ALERT: [red]{alert_count}[/red] | "
             f"Оновлено: [cyan]{last_update}[/cyan]"
-            f"{trades_fragment}{skipped_fragment}{drift_fragment}{dynamic_fragment}{pressure_fragment}{consec_fragment}{alpha_fragment}{skip_reasons_fragment}{blink_fragment}"
+            f"{trades_fragment}{skipped_fragment}{drift_fragment}{dynamic_fragment}{pressure_fragment}{consec_fragment}{alpha_fragment}{blocks_fragment}{skip_reasons_fragment}{blink_fragment}"
         )
 
         table = Table(
@@ -639,74 +769,49 @@ class UIConsumer:
             sorted_results = results
 
         for asset in sorted_results:
+            # Фільтрація невидимих рядків
+            try:
+                if asset.get("visible") is False:
+                    continue
+            except Exception:
+                pass
             symbol = str(asset.get(K_SYMBOL, "")).upper()
             stats = asset.get(K_STATS, {}) or {}
 
-            # Перевага плоских ключів якщо вони вже розраховані продюсером
-            if "price_str" in asset and isinstance(asset.get("price_str"), str):
-                price_str = asset["price_str"]
-                try:
-                    cp_raw = asset.get("price", stats.get("current_price"))
-                    current_price = float(cp_raw) if cp_raw is not None else None
-                except Exception:
-                    current_price = None
-            else:
-                try:
-                    if "price" in asset and isinstance(
-                        asset.get("price"), (int, float)
-                    ):
-                        price_val = asset.get("price")
-                        current_price = (
-                            float(price_val) if price_val is not None else None
-                        )
-                    else:
-                        cp_raw = stats.get("current_price")
-                        current_price = float(cp_raw) if cp_raw is not None else None
-                except Exception:
-                    current_price = None
-                price_str = self._format_price(current_price, symbol)
+            # Render-only: беремо лише готовий price_str (без локальних розрахунків)
+            price_str = (
+                asset.get("price_str")
+                if isinstance(asset.get("price_str"), str)
+                else "-"
+            )
 
-            volume = asset.get("volume")
-            if not isinstance(volume, (int, float)):
-                volume = stats.get("volume_mean", 0.0) or 0.0
+            # Render-only: беремо лише готовий volume_str
+            volume_str = (
+                asset.get("volume_str")
+                if isinstance(asset.get("volume_str"), str)
+                else "-"
+            )
             volume_z = stats.get("volume_z", 0.0) or 0.0
-            if "volume_str" in asset and isinstance(asset.get("volume_str"), str):
-                volume_str = asset["volume_str"]
-            else:
-                volume_str = f"{volume:,.0f}"
-            if volume_z > self.vol_z_threshold:
+            if volume_str != "-" and volume_z > self.vol_z_threshold:
                 volume_str = f"[bold magenta]{volume_str}[/]"
 
-            if "atr_pct" in asset and isinstance(asset.get("atr_pct"), (int, float)):
-                atr_pct = float(asset.get("atr_pct") or 0.0)
+            # Render-only: використовуємо лише готовий atr_pct
+            atr_pct_val = asset.get("atr_pct")
+            atr_pct = (
+                float(atr_pct_val) if isinstance(atr_pct_val, (int, float)) else None
+            )
+            if atr_pct is None:
+                atr_str = "-"
             else:
-                atr_raw = stats.get("atr")
-                try:
-                    atr = float(atr_raw) if atr_raw is not None else None
-                except Exception:
-                    atr = None
-                atr_pct = (
-                    (float(atr) / float(current_price) * 100.0)
-                    if (
-                        atr is not None
-                        and current_price is not None
-                        and current_price > 0
-                    )
-                    else 0.0
+                atr_color = self._get_atr_color(float(atr_pct))
+                atr_str = (
+                    f"[{atr_color}]{float(atr_pct):.2f}%[/]"
+                    if atr_color
+                    else f"{float(atr_pct):.2f}%"
                 )
-            atr_color = self._get_atr_color(atr_pct)
-            if atr_color:
-                atr_str = f"[{atr_color}]{atr_pct:.2f}%[/]"
-            else:
-                atr_str = f"{atr_pct:.2f}%"
 
             rsi_val = asset.get("rsi")
-            if not isinstance(rsi_val, (int, float)):
-                rsi_val = stats.get("rsi")
-            try:
-                rsi_f = float(rsi_val) if rsi_val is not None else None
-            except Exception:
-                rsi_f = None
+            rsi_f = float(rsi_val) if isinstance(rsi_val, (int, float)) else None
             if rsi_f is None:
                 rsi_str = "-"
             else:
@@ -716,7 +821,8 @@ class UIConsumer:
                 else:
                     rsi_str = f"{float(rsi_f):.1f}"
 
-            status = asset.get("status") or asset.get("state", "normal")
+            # Render-only: статус лише з готового поля
+            status = asset.get("status") or "-"
             if status == "normal":
                 status_icon = "🟢"
             elif status == "init":
@@ -752,16 +858,8 @@ class UIConsumer:
             else:
                 rec_str = f"{rec_icon} {recommendation}"
 
-            if "tp_sl" in asset:
-                tp_sl_str = asset.get("tp_sl") or "-"
-            else:
-                tp = asset.get("tp")
-                sl = asset.get("sl")
-                tp_sl_str = (
-                    f"TP: {self._format_price(tp, symbol)}\nSL: {self._format_price(sl, symbol)}"
-                    if tp and sl
-                    else "-"
-                )
+            # Render-only: TP/SL лише з готового поля tp_sl
+            tp_sl_str = asset.get("tp_sl") or "-"
 
             # Підсвітка для ALERT*
             row_style = (

@@ -478,7 +478,8 @@ async def run_pipeline() -> None:
                     trade_manager=trade_manager,
                     timeframe="1m",
                     lookback=SCREENING_LOOKBACK,
-                    interval_sec=30,
+                    # Зменшено інтервал оновлення для уникнення «застигання» UI-метрик
+                    interval_sec=12,
                     state_manager=state_manager,
                     level_manager=level_manager,
                     user_lang=user_settings["lang"],

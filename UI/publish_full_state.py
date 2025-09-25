@@ -28,9 +28,20 @@ from typing import Any, Protocol
 from rich.console import Console
 from rich.logging import RichHandler
 
-from config.config import REDIS_CHANNEL_ASSET_STATE, REDIS_SNAPSHOT_KEY
+from config.config import (
+    REDIS_CHANNEL_ASSET_STATE,
+    REDIS_CHANNEL_UI_ASSET_STATE,
+    REDIS_SNAPSHOT_KEY,
+    REDIS_SNAPSHOT_UI_KEY,
+    UI_DUAL_PUBLISH,
+    UI_PAYLOAD_SCHEMA_VERSION,
+    UI_SNAPSHOT_TTL_SEC,
+    UI_TP_SL_FROM_STAGE3_ENABLED,
+    UI_USE_V2_NAMESPACE,
+)
 from utils.utils import format_price as fmt_price_stage1
 from utils.utils import format_volume_usd
+from utils.utils import map_reco_to_signal as _map_reco_to_signal
 
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("ui.publish_full_state")
@@ -38,6 +49,9 @@ if not logger.handlers:  # guard від повторної ініціаліза�
     logger.setLevel(logging.INFO)
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
     logger.propagate = False
+
+# Монотонний sequence для meta (у межах процесу)
+_SEQ: int = 0
 
 
 class RedisLike(Protocol):
@@ -86,6 +100,38 @@ async def publish_full_state(
         all_assets = state_manager.get_all_assets()  # список dict
         serialized_assets: list[dict[str, Any]] = []
 
+        # Попередньо завантажимо core:trades для TP/SL таргетів (best-effort)
+        core_trades: dict[str, Any] | None = None
+        try:
+            # cache_handler може бути UnifiedStore із redis.jget; якщо ні — пропускаємо
+            redis_attr = getattr(cache_handler, "redis", None)
+            jget = getattr(redis_attr, "jget", None) if redis_attr is not None else None
+            if callable(jget):
+                core_doc = await jget("core", default=None)
+                if isinstance(core_doc, dict):
+                    core_trades = core_doc.get("trades")
+        except Exception:
+            core_trades = None
+
+        # Витягнемо мапу targets із core_trades (символ → {tp,sl})
+        targets_map: dict[str, dict[str, float]] = {}
+        try:
+            if isinstance(core_trades, dict) and isinstance(
+                core_trades.get("targets"), dict
+            ):
+                # Нормалізуємо ключі символів до upper
+                for k, v in core_trades["targets"].items():
+                    if isinstance(k, str) and isinstance(v, dict):
+                        sym = k.upper()
+                        tpv = v.get("tp")
+                        slv = v.get("sl")
+                        if isinstance(tpv, (int, float)) and isinstance(
+                            slv, (int, float)
+                        ):
+                            targets_map[sym] = {"tp": float(tpv), "sl": float(slv)}
+        except Exception:
+            targets_map = {}
+
         for asset in all_assets:
             # Захист: stats має бути dict
             if not isinstance(asset.get("stats"), dict):
@@ -127,77 +173,78 @@ async def publish_full_state(
             # ── UI flattening layer ────────────────────────────────────────
             stats = asset.get("stats") or {}
             # Уніфіковані кореневі ключі, щоб UI не мав додаткових мапперів
-            # Ціну виставляємо ТІЛЬКИ якщо вона валідна (>0); інакше не створюємо поля
-            if "price" not in asset:
-                cp = stats.get("current_price")
-                try:
-                    cp_f = float(cp) if cp is not None else None
-                except Exception:
-                    cp_f = None
-                if cp_f is not None and cp_f > 0:
-                    asset["price"] = cp_f
-            # Форматовані рядкові версії (для UI без повторного форматування)
-            if (
-                "price_str" not in asset
-                and isinstance(asset.get("price"), (int, float))
-                and asset.get("price", 0) > 0
-            ):
+            # Ціну ВСІГДА беремо зі stats.current_price (джерело правди).
+            cp = stats.get("current_price")
+            try:
+                cp_f = float(cp) if cp is not None else None
+            except Exception:
+                cp_f = None
+            if cp_f is not None and cp_f > 0:
+                asset["price"] = cp_f
                 try:
                     asset["price_str"] = fmt_price_stage1(
                         float(asset["price"]), str(asset.get("symbol", "")).lower()
                     )
-                except Exception:  # broad except: форматування ціни не критичне
-                    pass
-            # Raw volume_mean (кількість контрактів/штук) → зберігаємо як raw_volume
-            if "raw_volume" not in asset:
-                vm = stats.get("volume_mean")
+                except Exception:
+                    asset.pop("price_str", None)
+            else:
+                # Поточна ціна невалідна → прибираємо застаріле форматування
+                asset.pop("price", None)
+                asset.pop("price_str", None)
+            # Raw volume_mean (кількість контрактів/штук) — оновлюємо КОЖЕН цикл
+            vm = stats.get("volume_mean")
+            try:
                 if isinstance(vm, (int, float)):
                     asset["raw_volume"] = float(vm)
-            # Обчислюємо оборот у USD (notional) = raw_volume * current_price
-            if "volume" not in asset:
-                cp_val = stats.get("current_price")
-                try:
-                    cp_f = float(cp_val) if cp_val is not None else None
-                except Exception:
-                    cp_f = None
-                if (
-                    isinstance(asset.get("raw_volume"), (int, float))
-                    and cp_f is not None
-                    and cp_f > 0
-                ):
-                    asset["volume"] = float(asset["raw_volume"]) * float(cp_f)
+                else:
+                    asset.pop("raw_volume", None)
+            except Exception:
+                asset.pop("raw_volume", None)
+            # Обчислюємо оборот у USD (notional) = raw_volume * current_price (переобчислюємо кожен раз)
+            cp_val = stats.get("current_price")
+            try:
+                cp_f2 = float(cp_val) if cp_val is not None else None
+            except Exception:
+                cp_f2 = None
             if (
-                "volume_str" not in asset
-                and isinstance(asset.get("volume"), (int, float))
-                and float(asset.get("volume") or 0) > 0
+                isinstance(asset.get("raw_volume"), (int, float))
+                and cp_f2 is not None
+                and cp_f2 > 0
             ):
+                asset["volume"] = float(asset["raw_volume"]) * float(cp_f2)
                 try:
                     asset["volume_str"] = format_volume_usd(float(asset["volume"]))
-                except Exception:  # broad except: форматування volume_str не критичне
-                    pass
-            # ATR% (для швидкого відтворення у UI без ділення щоразу)
-            if "atr_pct" not in asset:
-                atr_v = stats.get("atr")
-                cp = stats.get("current_price")
-                try:
-                    atr_f = float(atr_v) if atr_v is not None else None
                 except Exception:
-                    atr_f = None
-                try:
-                    cp_f = float(cp) if cp is not None else None
-                except Exception:
-                    cp_f = None
-                if atr_f is not None and cp_f is not None and cp_f > 0:
-                    asset["atr_pct"] = float(atr_f) / float(cp_f) * 100.0
-            # rsi додаємо лише якщо воно дійсно присутнє у stats і це число
-            if "rsi" not in asset:
-                rsi_v = stats.get("rsi")
-                try:
-                    rsi_f = float(rsi_v) if rsi_v is not None else None
-                except Exception:
-                    rsi_f = None
-                if rsi_f is not None:
-                    asset["rsi"] = rsi_f
+                    asset.pop("volume_str", None)
+            else:
+                asset.pop("volume", None)
+                asset.pop("volume_str", None)
+            # ATR% (для UI) — перераховуємо завжди (може змінюватися ATR або ціна)
+            atr_v = stats.get("atr")
+            cp_for_atr = stats.get("current_price")
+            try:
+                atr_f = float(atr_v) if atr_v is not None else None
+            except Exception:
+                atr_f = None
+            try:
+                cp_f_atr = float(cp_for_atr) if cp_for_atr is not None else None
+            except Exception:
+                cp_f_atr = None
+            if atr_f is not None and cp_f_atr is not None and cp_f_atr > 0:
+                asset["atr_pct"] = float(atr_f) / float(cp_f_atr) * 100.0
+            else:
+                # Якщо більше невалідно — прибираємо, щоб не залишався застарілий відсоток
+                asset.pop("atr_pct", None)
+            # RSI — перезаписуємо якщо присутній у stats; не тримаємо старе значення
+            rsi_v = stats.get("rsi")
+            try:
+                rsi_f = float(rsi_v) if rsi_v is not None else None
+            except Exception:
+                rsi_f = None
+            if rsi_f is not None:
+                asset["rsi"] = rsi_f
+            else:
+                asset.pop("rsi", None)
             # status: перераховуємо щоразу, щоб не застрягав у 'init'
             status_val = asset.get("state")
             if isinstance(status_val, dict):  # захист
@@ -209,26 +256,57 @@ async def publish_full_state(
             # Більше НЕ замінюємо 'init' на 'initializing' – коротка форма
             asset["status"] = status_val
 
-            # tp_sl: формуємо завжди з поточних tp/sl (форматуючи ціну)
-            tp = asset.get("tp")
-            sl = asset.get("sl")
-            tp_ok = isinstance(tp, (int, float)) and tp not in [None, 0]
-            sl_ok = isinstance(sl, (int, float)) and sl not in [None, 0]
+            # Узгодження сигналу зі Stage2 recommendation: якщо rec → ALERT*,
+            # форсуємо signal і статус 'alert', аби уникнути розсинхрону зі стейтом
             try:
-                sym = str(asset.get("symbol", "")).lower()
-                fmt_tp = fmt_price_stage1(float(tp or 0.0), sym) if tp_ok else None
-                fmt_sl = fmt_price_stage1(float(sl or 0.0), sym) if sl_ok else None
+                rec_val = asset.get("recommendation")
+                sig_from_rec = _map_reco_to_signal(rec_val)
+                # Сигнал у колонці "Сигнал" = Stage2 мапований;
+                # Статус (state) не форсуємо — якщо Stage1 виставив ALERT і Stage2 понизив, залишаємо ALERT.
+                if sig_from_rec in ("ALERT_BUY", "ALERT_SELL"):
+                    asset["signal"] = sig_from_rec
+                # Якщо сигнали нейтральні, не чіпаємо asset['state'] / status
             except Exception:
-                fmt_tp = str(tp) if tp_ok else None
-                fmt_sl = str(sl) if sl_ok else None
-            if tp_ok and sl_ok:
-                asset["tp_sl"] = f"TP: {fmt_tp} | SL: {fmt_sl}"
-            elif tp_ok:
-                asset["tp_sl"] = f"TP: {fmt_tp}"
-            elif sl_ok:
-                asset["tp_sl"] = f"SL: {fmt_sl}"
-            else:
+                pass
+            # Якщо була даунгрейд рекомендації — додаємо службові позначки в hints
+            try:
+                reco_original = asset.get("reco_original")
+                gate_reason = asset.get("reco_gate_reason")
+                final_reco = asset.get("recommendation")
+                if reco_original and final_reco and reco_original != final_reco:
+                    tag = f"downgraded:{reco_original}->{final_reco}"
+                    if gate_reason:
+                        tag = f"{tag}[{gate_reason}]"
+                    # hints існують як список — зберігаємо унікальність
+                    hints_list = asset.get("hints")
+                    if not isinstance(hints_list, list):
+                        hints_list = []
+                    if tag not in hints_list:
+                        hints_list.insert(0, tag)
+                    asset["hints"] = hints_list
+            except Exception:
+                pass
+
+            # tp_sl: береться виключно зі Stage3 (core:trades.targets), без локальних розрахунків
+            # Можна вимкнути повністю через feature‑flag UI_TP_SL_FROM_STAGE3_ENABLED
+            if not UI_TP_SL_FROM_STAGE3_ENABLED:
                 asset["tp_sl"] = "-"
+            else:
+                try:
+                    sym_up = str(asset.get("symbol", "")).upper()
+                    tgt = targets_map.get(sym_up)
+                    if (
+                        tgt
+                        and isinstance(tgt.get("tp"), (int, float))
+                        and isinstance(tgt.get("sl"), (int, float))
+                    ):
+                        fmt_tp = fmt_price_stage1(float(tgt["tp"]), sym_up.lower())
+                        fmt_sl = fmt_price_stage1(float(tgt["sl"]), sym_up.lower())
+                        asset["tp_sl"] = f"TP: {fmt_tp} | SL: {fmt_sl}"
+                    else:
+                        asset["tp_sl"] = "-"
+                except Exception:
+                    asset["tp_sl"] = "-"
             # гарантуємо signal (для UI фільтра)
             if not asset.get("signal"):
                 asset["signal"] = "NONE"
@@ -288,6 +366,16 @@ async def publish_full_state(
                         lowatr_blocks += 1
             except Exception:
                 pass
+        # Додаткові лічильники (best-effort): скільки згенеровано/пропущено за цикл
+        # Якщо state_manager надає ці значення, використаємо їх; інакше не включаємо
+        generated_signals = None
+        skipped_signals = None
+        try:
+            generated_signals = getattr(state_manager, "generated_signals", None)
+            skipped_signals = getattr(state_manager, "skipped_signals", None)
+        except Exception:
+            pass
+
         counters = {
             "assets": len(serialized_assets),
             "alerts": len(alerts_list),
@@ -296,6 +384,29 @@ async def publish_full_state(
             "htf_blocked": htf_blocks,
             "lowatr_blocked": lowatr_blocks,
         }
+        if isinstance(generated_signals, int):
+            counters["generated_signals"] = generated_signals
+        if isinstance(skipped_signals, int):
+            counters["skipped_signals"] = skipped_signals
+        # Додаємо накопичувальні лічильники блокувань / проходжень ALERT (якщо є у state_manager)
+        try:
+            blocked_lv = getattr(state_manager, "blocked_alerts_lowvol", None)
+            blocked_htf = getattr(state_manager, "blocked_alerts_htf", None)
+            blocked_lc = getattr(state_manager, "blocked_alerts_lowconf", None)
+            passed_total = getattr(state_manager, "passed_alerts", None)
+            downgraded_total = getattr(state_manager, "downgraded_alerts", None)
+            if isinstance(blocked_lv, int):
+                counters["blocked_alerts_lowvol"] = blocked_lv
+            if isinstance(blocked_htf, int):
+                counters["blocked_alerts_htf"] = blocked_htf
+            if isinstance(blocked_lc, int):
+                counters["blocked_alerts_lowconf"] = blocked_lc
+            if isinstance(passed_total, int):
+                counters["passed_alerts"] = passed_total
+            if isinstance(downgraded_total, int):
+                counters["downgraded_alerts"] = downgraded_total
+        except Exception:
+            pass
 
         # Нормалізуємо символи для UI (єдиний формат UPPER)
         for a in serialized_assets:
@@ -305,9 +416,17 @@ async def publish_full_state(
                 except Exception:  # broad except: upper-case sanitation
                     pass
 
+        # Оновлюємо sequence (проста монотонність у межах процесу)
+        global _SEQ
+        _SEQ = (_SEQ + 1) if _SEQ < 2**31 - 1 else 1
+
         payload = {
             "type": REDIS_CHANNEL_ASSET_STATE,
-            "meta": {"ts": datetime.utcnow().isoformat() + "Z"},
+            "meta": {
+                "ts": datetime.utcnow().isoformat() + "Z",
+                "seq": _SEQ,
+                "schema_version": UI_PAYLOAD_SCHEMA_VERSION,
+            },
             "counters": counters,
             "assets": serialized_assets,
         }
@@ -327,14 +446,45 @@ async def publish_full_state(
             pass
 
         payload_json = json.dumps(payload, default=str)
-        await redis_conn.publish(REDIS_CHANNEL_ASSET_STATE, payload_json)
-        # Зберігаємо снапшот останнього повного стану (для швидкого старту UI)
-        try:
-            await redis_conn.set(REDIS_SNAPSHOT_KEY, payload_json)
-        except Exception:  # broad except: snapshot optional
-            logger.debug(
-                "Не вдалося записати snapshot key=%s", REDIS_SNAPSHOT_KEY, exc_info=True
-            )
+        # Вибір namespace для публікації (PR6): v1 або v2, та опційний dual‑publish
+        # Зчитуємо фіче-флаги один раз (можливий override через ENV поза тестами)
+        use_v2 = bool(UI_USE_V2_NAMESPACE)
+        dual_publish = bool(UI_DUAL_PUBLISH)
+
+        primary_snapshot = REDIS_SNAPSHOT_UI_KEY if use_v2 else REDIS_SNAPSHOT_KEY
+        primary_channel = (
+            REDIS_CHANNEL_UI_ASSET_STATE if use_v2 else REDIS_CHANNEL_ASSET_STATE
+        )
+        secondary_snapshot = REDIS_SNAPSHOT_KEY if use_v2 else REDIS_SNAPSHOT_UI_KEY
+        secondary_channel = (
+            REDIS_CHANNEL_ASSET_STATE if use_v2 else REDIS_CHANNEL_UI_ASSET_STATE
+        )
+
+        # Спочатку snapshot → потім publish (щоб listener мав консистентний снапшот)
+        async def _set_with_ttl(key: str) -> None:
+            try:
+                await redis_conn.set(key, payload_json)
+                try:
+                    await redis_conn.expire(key, UI_SNAPSHOT_TTL_SEC)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            except Exception:
+                logger.debug("Не вдалося записати snapshot key=%s", key, exc_info=True)
+
+        await _set_with_ttl(primary_snapshot)
+        if dual_publish:
+            await _set_with_ttl(secondary_snapshot)
+
+        # Публікуємо у основний канал та, за потреби, в обидва
+        await redis_conn.publish(primary_channel, payload_json)
+        if dual_publish:
+            try:
+                await redis_conn.publish(secondary_channel, payload_json)
+            except Exception:
+                logger.debug(
+                    "Dual publish у %s не вдався", secondary_channel, exc_info=True
+                )
+
         logger.info(f"✅ Опубліковано стан {len(serialized_assets)} активів")
 
     except Exception as e:  # broad except: публікація best-effort

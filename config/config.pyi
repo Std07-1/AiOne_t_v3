@@ -14,9 +14,27 @@ SELL_SET: set[str]
 
 REDIS_CHANNEL_ASSET_STATE: str
 REDIS_SNAPSHOT_KEY: str
+REDIS_CHANNEL_UI_ASSET_STATE: str
+REDIS_SNAPSHOT_UI_KEY: str
 ADMIN_COMMANDS_CHANNEL: str
 STATS_CORE_KEY: str
 STATS_HEALTH_KEY: str
+
+# Core document (Stage3 metrics) and JSON paths
+REDIS_DOC_CORE: str
+REDIS_CORE_PATH_TRADES: str
+REDIS_CORE_PATH_STATS: str
+REDIS_CORE_PATH_HEALTH: str
+
+# TTLs and feature toggles for migration
+UI_SNAPSHOT_TTL_SEC: int
+CORE_TTL_SEC: int
+CORE_DUAL_WRITE_OLD_STATS: bool
+UI_PAYLOAD_SCHEMA_VERSION: str
+UI_TP_SL_FROM_STAGE3_ENABLED: bool
+UI_USE_V2_NAMESPACE: bool
+UI_DUAL_PUBLISH: bool
+SIMPLE_UI_MODE: bool
 
 UI_LOCALE: str
 UI_COLUMN_VOLUME: str
@@ -122,6 +140,8 @@ STAGE2_CONFIG: dict[str, Any]
 OPTUNA_PARAM_RANGES: dict[str, tuple]
 STAGE2_RANGE_PARAMS: dict[str, float]
 STAGE3_TRADE_PARAMS: dict[str, float]
+STAGE2_AUDIT: dict[str, float | int | str | bool]
+WS_GAP_BACKFILL: dict[str, int | bool]
 
 INTERVAL_TTL_MAP: dict[str, int]
 

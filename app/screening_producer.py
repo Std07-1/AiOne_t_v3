@@ -38,6 +38,7 @@ from config.config import (
 from stage1.asset_monitoring import AssetMonitorStage1
 from stage2.level_manager import LevelManager
 from stage2.processor import Stage2Processor
+from stage3.open_trades import open_trades
 from stage3.trade_manager import TradeLifecycleManager
 from UI.publish_full_state import RedisLike, publish_full_state
 from utils.utils import (
@@ -47,7 +48,6 @@ from utils.utils import (
     get_tick_size,
     map_reco_to_signal,
     normalize_result_types,
-    normalize_tp_sl,
 )
 
 from .asset_state_manager import AssetStateManager
@@ -86,8 +86,57 @@ async def process_asset_batch(
                 continue
             if "open_time" in df.columns and "timestamp" not in df.columns:
                 df = df.rename(columns={"open_time": "timestamp"})
+            # ── Базові метрики оновлюємо КОЖЕН цикл (щоб UI не «застирав») ──
+            try:
+                current_price = (
+                    float(df["close"].iloc[-1]) if "close" in df.columns else None
+                )
+            except Exception:
+                current_price = None
+            try:
+                volume_last = (
+                    float(df["volume"].iloc[-1]) if "volume" in df.columns else None
+                )
+            except Exception:
+                volume_last = None
+            last_ts_val = None
+            if "timestamp" in df.columns:
+                try:
+                    last_ts_val = df["timestamp"].iloc[-1]
+                except Exception:
+                    last_ts_val = None
+
             signal = await monitor.check_anomalies(symbol, df)
+            if not isinstance(signal, dict):  # захист від невалідного повернення
+                signal = {"symbol": symbol.lower(), "signal": "NONE", "stats": {}}
+
+            # Гарантуємо наявність контейнера stats
+            stats_container = signal.get("stats")
+            if not isinstance(stats_container, dict):
+                stats_container = {}
+                signal["stats"] = stats_container
+
+            # Доповнюємо відсутні поля базових метрик тільки якщо їх немає
+            if current_price is not None and "current_price" not in stats_container:
+                stats_container["current_price"] = current_price
+            if volume_last is not None and "volume" not in stats_container:
+                stats_container["volume"] = volume_last
+            if last_ts_val is not None and "timestamp" not in stats_container:
+                stats_container["timestamp"] = last_ts_val
+
+            # Нормалізуємо типи (існуючі метрики збережуться)
             normalized = normalize_result_types(signal)
+            # Переконуємось, що нормалізація не втратила базові stats
+            try:
+                norm_stats = normalized.get("stats")
+                if not isinstance(norm_stats, dict):
+                    normalized["stats"] = stats_container
+                else:
+                    for k, v in stats_container.items():
+                        norm_stats.setdefault(k, v)
+            except Exception:
+                normalized["stats"] = stats_container
+
             state_manager.update_asset(symbol, normalized)
         except Exception as e:
             logger.error(f"Помилка AssetMonitor для {symbol}: {str(e)}")
@@ -96,7 +145,7 @@ async def process_asset_batch(
 
 _map_reco_to_signal = map_reco_to_signal
 _first_not_none = first_not_none
-_normalize_tp_sl = normalize_tp_sl
+# PR4: Міграція TP/SL на Stage3 — не нормалізуємо TP/SL у продюсері
 
 
 async def process_single_stage2(
@@ -136,14 +185,7 @@ async def process_single_stage2(
         signal_type = _map_reco_to_signal(recommendation or "")
 
         risk_params = result.get("risk_parameters", {}) or {}
-        tp0 = _first_not_none(risk_params.get("tp_targets"))
-        sl = risk_params.get("sl_level")
-        # Поточна ціна (для логіки перевірки – необов'язкова)
-        current_price = None
-        try:
-            current_price = signal.get("stats", {}).get("current_price")
-        except Exception:
-            current_price = None
+        # PR4: TP/SL не використовуються у продюсері для формування UI
 
         conf = result.get("confidence_metrics", {}) or {}
         composite_conf = conf.get("composite_confidence", 0.0)
@@ -174,23 +216,18 @@ async def process_single_stage2(
         if hints:
             update["hints"] = list(dict.fromkeys(hints))
         # Нормалізація TP/SL щоб уникнути кейсів типу TP нижче SL для BUY
-        norm_tp, norm_sl, swapped, note = _normalize_tp_sl(
-            tp0, sl, recommendation, current_price
-        )
-        if norm_tp is not None:
-            update["tp"] = norm_tp
-        if norm_sl is not None:
-            update["sl"] = norm_sl
-        if swapped:
-            # додаємо службову причину, щоб було видно у UI (якщо користувач захоче)
-            trigger_add = note or "tp_sl_swapped"
-        else:
-            trigger_add = None
+        # PR4: TP/SL формуються і коригуються Stage3; продюсер їх не нормалізує
+        trigger_add = None
 
         update["market_context"] = market_ctx or None
         update["risk_parameters"] = risk_params or None
         update["confidence_metrics"] = conf or None
         update["anomaly_detection"] = anomaly_det or None
+        # Проксі службових полів від Stage2 (якщо були змінені гейтом)
+        if "reco_original" in result and result.get("reco_original") != recommendation:
+            update["reco_original"] = result.get("reco_original")
+        if "reco_gate_reason" in result:
+            update["reco_gate_reason"] = result.get("reco_gate_reason")
         existing = state_manager.state.get(symbol, {}).get("trigger_reasons") or []
         extra_triggers: list[str] = []
         if trigger_add:
@@ -204,14 +241,48 @@ async def process_single_stage2(
         if signal_type.startswith("ALERT") and not merged_triggers:
             merged_triggers = ["signal_generated"]
         update["trigger_reasons"] = merged_triggers
+        # Зберігаємо Stage1 alert у статусі (state) навіть якщо Stage2 понизив сигнал до NORMAL
+        prev_state = (
+            state_manager.state.get(symbol, {}).get("state")
+            if symbol in state_manager.state
+            else None
+        )
         if signal_type.startswith("ALERT"):
             update["state"] = ASSET_STATE["ALERT"]
         elif signal_type == "NORMAL":
-            update["state"] = ASSET_STATE["NORMAL"]
+            if prev_state == ASSET_STATE["ALERT"]:
+                # Stage1 ставив ALERT, Stage2 понизив — відображаємо ALERT у колонці "Статус"
+                update["state"] = ASSET_STATE["ALERT"]
+                update["stage1_alert_preserved"] = True
+            else:
+                update["state"] = ASSET_STATE["NORMAL"]
         else:
             update["state"] = update.get("state") or ASSET_STATE["NO_TRADE"]
         update["narrative"] = raw_narr or None
         state_manager.update_asset(symbol, update)
+
+        # ── Накопичувальні метрики проходження/блокування ALERT ──
+        try:
+            if signal_type.startswith("ALERT_BUY") or signal_type.startswith(
+                "ALERT_SELL"
+            ):
+                state_manager.passed_alerts += 1
+            elif signal_type == "NORMAL" and result.get("reco_original"):
+                # був даунгрейд → класифікуємо причини
+                state_manager.downgraded_alerts += 1
+                gr = (
+                    (result.get("reco_gate_reason") or "").split("+")
+                    if result.get("reco_gate_reason")
+                    else []
+                )
+                if any(r == "low_volatility" for r in gr):
+                    state_manager.blocked_alerts_lowvol += 1
+                if any(r == "htf_block" for r in gr):
+                    state_manager.blocked_alerts_htf += 1
+                if any(r == "low_confidence" for r in gr):
+                    state_manager.blocked_alerts_lowconf += 1
+        except Exception:
+            pass
 
         # JSONL аудит Stage2 рішень (best‑effort, без винятків)
         try:
@@ -306,6 +377,12 @@ async def screening_producer(
         user_lang=user_lang,
         user_style=user_style,
     )
+    # Забезпечуємо доступ Stage2 до UnifiedDataStore через state_manager.cache (для публікацій у Redis)
+    try:
+        if getattr(state_manager, "cache", None) is None:
+            state_manager.set_cache_handler(store)
+    except Exception:
+        pass
     stage2_semaphore = asyncio.Semaphore(MAX_PARALLEL_STAGE2)
     await publish_full_state(state_manager, store, redis_conn)
     while True:
@@ -421,6 +498,13 @@ async def screening_producer(
         alert_signals = state_manager.get_alert_signals()
         if alert_signals:
             logger.info(f"[Stage2] Обробка {len(alert_signals)} сигналів...")
+            # Оновлюємо лічильник згенерованих сигналів для UI counters
+            try:
+                state_manager.generated_signals = int(
+                    getattr(state_manager, "generated_signals", 0)
+                ) + len(alert_signals)
+            except Exception:
+                pass
             tasks = [
                 asyncio.create_task(
                     process_single_stage2_with_semaphore(
@@ -433,8 +517,29 @@ async def screening_producer(
             logger.info(f"[Stage2] Завершено обробку {len(alert_signals)} сигналів")
         else:
             logger.info("[Stage2] Немає сигналів ALERT для обробки")
+            # Якщо нічого не оброблялось — вважаємо це пропущеними для метрики 'skipped'
+            try:
+                state_manager.skipped_signals = (
+                    int(getattr(state_manager, "skipped_signals", 0)) + 1
+                )
+            except Exception:
+                pass
         logger.info("📢 Публікація стану активів...")
         await publish_full_state(state_manager, store, redis_conn)
+
+        # Відкриття угод
+        if trade_manager and alert_signals:
+            logger.info("💼 Відкриття угод для Stage2 сигналів...")
+            max_trades = getattr(trade_manager, "max_parallel_trades", 3)
+            if max_trades is None or max_trades <= 0:
+                max_trades = 3
+            logger.info(f"Максимальна кількість угод: {max_trades}")
+            await open_trades(alert_signals, trade_manager, max_trades)
+        else:
+            logger.info(
+                "💼 Торгівля Stage2 вимкнена або немає сигналів для відкриття угод"
+            )
+
         processing_time = time.time() - start_time
         logger.info(f"⏳ Час обробки циклу: {processing_time:.2f} сек")
         if processing_time < 1:

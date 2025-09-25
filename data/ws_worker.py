@@ -29,6 +29,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 # unified store (single source of truth)
+from config.config import WS_GAP_BACKFILL
 from data.unified_store import UnifiedDataStore
 
 # Аудит: жодної нормалізації часу — працюємо із сирими значеннями як приходять
@@ -345,14 +346,23 @@ class WSWorker:
                         )
                         # Мінімальний auto-heal: backfill пропущених хвилин через REST
                         missing = (ot_cur - ot_prev) // 60_000 - 1
-                        if missing > 0:
+                        try:
+                            enabled = bool(WS_GAP_BACKFILL.get("enabled", False))
+                            max_minutes = int(WS_GAP_BACKFILL.get("max_minutes", 10))
+                        except Exception:
+                            enabled = False
+                            max_minutes = 10
+                        if enabled and missing > 0:
+                            # Обмежуємо бекфіл до max_minutes, щоб не блокувати та не DDOS-ити REST
+                            max_bars = min(missing, max_minutes)
+                            start_ot = ot_cur - 60_000 * max_bars
                             # Запускаємо у фоні, щоб не блокувати WS-цикл
                             asyncio.create_task(
                                 self._safe_backfill(
                                     sym=sym,
-                                    start_open_time=ot_prev + 60_000,
+                                    start_open_time=start_ot,
                                     end_open_time=ot_cur - 60_000,
-                                    max_bars=missing,
+                                    max_bars=max_bars,
                                 )
                             )
             except Exception:

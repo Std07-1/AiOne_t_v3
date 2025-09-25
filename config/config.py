@@ -86,6 +86,50 @@ ADMIN_COMMANDS_CHANNEL: str = f"{NAMESPACE}:admin:commands"
 STATS_CORE_KEY: str = f"{NAMESPACE}:stats:core"
 STATS_HEALTH_KEY: str = f"{NAMESPACE}:stats:health"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# UI/CORE НОВІ КЛЮЧІ ТА TTL (INFRA v2)
+# ──────────────────────────────────────────────────────────────────────────────
+# Нові імена для UI-каналу/снапшоту (поки лише константи; міграція окремо)
+REDIS_CHANNEL_UI_ASSET_STATE: str = f"{NAMESPACE}:ui:asset_state"
+REDIS_SNAPSHOT_UI_KEY: str = f"{NAMESPACE}:ui:snapshot"
+
+# Core-метрики Stage3 у єдиному документі (JSON) з окремими шляхами
+REDIS_DOC_CORE: str = f"{NAMESPACE}:core"
+REDIS_CORE_PATH_TRADES: str = "trades"
+REDIS_CORE_PATH_STATS: str = "stats"
+REDIS_CORE_PATH_HEALTH: str = "health"
+
+# TTL для ключів (секунди)
+UI_SNAPSHOT_TTL_SEC: int = 180
+CORE_TTL_SEC: int = 60
+
+# Тогл на період міграції: дублювати записи в старий "stats" (видалити після стабілізації)
+CORE_DUAL_WRITE_OLD_STATS: bool = True
+
+# Версія схеми UI payload (для консюмерів/міграцій)
+UI_PAYLOAD_SCHEMA_VERSION: str = "1.0"
+
+# Feature-flag: керує формуванням tp_sl у UI‑паблішері.
+# Якщо False — UI завжди віддає tp_sl='-' (A/B або повне вимкнення форматування).
+UI_TP_SL_FROM_STAGE3_ENABLED: bool = True
+
+# PR6: Міграція namespace для UI каналів/снапшоту
+# Якщо True — основні операції йдуть через нові ключі/канали `ai_one:ui:*`.
+# Якщо False — основні через старі, але може бути dual‑publish (див. нижче).
+UI_USE_V2_NAMESPACE: bool = False
+
+# Dual‑publish під час міграції: публікувати одночасно в старі та нові ключі/канали.
+# Рекомендація: тримати True поки всі консюмери не оновляться на v2.
+UI_DUAL_PUBLISH: bool = False
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SIMPLE UI MODE (експериментальна опція для діагностики «застигання»)
+# Якщо True — замість повноцінного UIConsumer використовується SimpleUIConsumer,
+# який читає лише snapshot ключ (без pub/sub, без seq-гейтингу). Використовуємо
+# тільки для ізоляції проблем паблішеру від логіки live-консюмеру. Відкат миттєвий
+# (просто повертаємо False). За замовчуванням вимкнено, щоб не ламати тести.
+SIMPLE_UI_MODE: bool = False
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # UI / ЛОКАЛІЗАЦІЯ
@@ -160,6 +204,12 @@ K_RISK_PARAMETERS: str = "risk_parameters"
 # ──────────────────────────────────────────────────────────────────────────────
 # TypedDict контракти (для підказок mypy та документації)
 # ──────────────────────────────────────────────────────────────────────────────
+# Експортовані імена (спрощено: додаємо лише новий фіче-флаг без повного переліку)
+__all__ = [
+    "SIMPLE_UI_MODE",
+]
+
+
 class Stage1Signal(TypedDict):
     """Сигнал Stage1, що передається у Stage2.
 
@@ -538,11 +588,11 @@ STAGE2_RANGE_PARAMS: dict[str, float] = {
     # мінімальна ширина діапазону (у відсотках), нижче якої торгівлю в діапазоні не дозволяємо
     "band_min_pct": 1.5,
     # мінімальна композитна впевненість (0..1) для дозволу RANGE_TRADE у ядрі
-    "comp_min": 0.55,
+    "comp_min": 0.50,
     # спец‑випадок у Stage2Processor: дуже низька волатильність (частка від ціни, а не %)
     "upgrade_low_vol_ratio": 0.005,  # 0.5%
     # композит для апґрейду WAIT_FOR_CONFIRMATION → RANGE_TRADE у дуже низькій волатильності
-    "upgrade_comp_min": 0.65,
+    "upgrade_comp_min": 0.60,
 }
 
 # Параметри Stage3 відкриття угод
@@ -565,6 +615,24 @@ OPTUNA_PARAM_RANGES: dict[str, tuple] = {
     "atr_target": (0.3, 1.5),
     "low_gate": (0.002, 0.015),
     "high_gate": (0.005, 0.03),
+}
+
+# ── Аудит Stage2/QDE (JSONL) ──
+# Мінімальний аудит рішень для прозорості: файл JSONL із ротацією за розміром.
+# Вимкнений лише явно через enabled=False.
+STAGE2_AUDIT: dict[str, float | int | str | bool] = {
+    "enabled": True,
+    # Шлях до файлу аудиту (релятивно до робочої директорії процесу)
+    "path": f"{DATASTORE_BASE_DIR}/stage2_audit.jsonl",
+    # Максимальний розмір файлу перед ротацією (байти)
+    "max_bytes": 50 * 1024 * 1024,  # 50 МБ
+}
+
+# ── Підготовчі прапорці для WS gap‑бекфілу (за замовчуванням вимкнено) ──
+WS_GAP_BACKFILL: dict[str, int | bool] = {
+    "enabled": False,
+    # максимум хвилин до бекфілу REST при виявленні пропусків у live‑стрімі
+    "max_minutes": 10,
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -736,6 +804,8 @@ __all__ = [
     "STAGE2_CONFIG",
     "STAGE2_RANGE_PARAMS",
     "STAGE3_TRADE_PARAMS",
+    "STAGE2_AUDIT",
+    "WS_GAP_BACKFILL",
     "OPTUNA_PARAM_RANGES",
     # App defaults / seeds
     "STAGE1_PREFILTER_THRESHOLDS",

@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from collections.abc import Callable
 from datetime import datetime
@@ -33,6 +35,7 @@ from config.config import (
     K_STATS,
     K_SYMBOL,
     K_TRIGGER_REASONS,
+    STAGE2_AUDIT,
     STAGE2_RANGE_PARAMS,
 )
 from utils.utils import safe_number
@@ -111,6 +114,22 @@ class Stage2Processor:
 
         # Підрахунок часу між викликами (без метрик Prometheus)
         self._last_process_wall: float | None = None
+        # Налаштування аудиту (JSONL). Без зовнішніх залежностей.
+        try:
+            self._audit_enabled: bool = bool(STAGE2_AUDIT.get("enabled", False))
+            self._audit_path: str = str(
+                STAGE2_AUDIT.get("path", "./stage2_audit.jsonl")
+            )
+            self._audit_max_bytes: int = int(
+                STAGE2_AUDIT.get("max_bytes", 50 * 1024 * 1024)
+            )
+        except Exception:
+            self._audit_enabled = False
+            self._audit_path = "./stage2_audit.jsonl"
+            self._audit_max_bytes = 50 * 1024 * 1024
+        # Легка in-memory агрегація для UI/Redis (без залежності від Prometheus)
+        self._agg_last_push: float = 0.0
+        self._agg_counts: dict[str, int] = {}
 
     # Внутрішні допоміжні
     def _maybe_fetch_bars(self, symbol: str) -> tuple[Any, Any, Any]:
@@ -383,6 +402,90 @@ class Stage2Processor:
                 rr_str,
             )
 
+            # 4.0.a) JSONL-аудит рішення (з ротацією за розміром)
+            if self._audit_enabled:
+                try:
+                    record = {
+                        "ts": datetime.utcnow().isoformat() + "Z",
+                        "symbol": symbol,
+                        "scenario": ctx.get("scenario"),
+                        "composite": float(conf.get("composite_confidence", 0.0)),
+                        "htf_ok": (
+                            bool(ctx.get("meta", {}).get("htf_ok"))
+                            if isinstance(ctx.get("meta"), dict)
+                            else None
+                        ),
+                        "band_pct": (ctx.get("key_levels_meta") or {}).get("band_pct"),
+                        "reco": result.get(K_RECOMMENDATION),  # фінальна
+                        "reco_original": result.get("reco_original"),
+                        "reco_gate_reason": result.get("reco_gate_reason"),
+                    }
+                    # Ротація: якщо файл більший за ліміт → перейменувати з суфіксом .1 (простий one-shot)
+                    try:
+                        if (
+                            os.path.exists(self._audit_path)
+                            and os.path.getsize(self._audit_path)
+                            > self._audit_max_bytes
+                        ):
+                            backup = self._audit_path + ".1"
+                            try:
+                                if os.path.exists(backup):
+                                    os.remove(backup)
+                            except Exception:
+                                pass
+                            os.replace(self._audit_path, backup)
+                    except Exception:
+                        pass
+                    # Запис рядка JSONL (із ensure_dir та явним flush)
+                    dir_name = os.path.dirname(self._audit_path) or "."
+                    if dir_name and not os.path.exists(dir_name):
+                        try:
+                            os.makedirs(dir_name, exist_ok=True)
+                        except Exception:
+                            pass
+                    with open(self._audit_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        try:
+                            f.flush()
+                        except Exception:
+                            pass
+                except Exception as _e:  # не ламаємо пайплайн через аудит
+                    logger.debug("Stage2 audit write failed: %s", _e)
+
+            # 4.0.b) Легка агрегація: лічильники scenario/reco → періодичний push у Redis
+            try:
+                scen = str(ctx.get("scenario") or "").upper() or "UNKNOWN"
+                reco = str(result.get(K_RECOMMENDATION) or "").upper() or "UNKNOWN"
+                self._agg_counts[f"scenario:{scen}"] = (
+                    self._agg_counts.get(f"scenario:{scen}", 0) + 1
+                )
+                self._agg_counts[f"reco:{reco}"] = (
+                    self._agg_counts.get(f"reco:{reco}", 0) + 1
+                )
+                now = time.time()
+                if now - self._agg_last_push >= 5.0:
+                    payload = {
+                        "ts": datetime.utcnow().isoformat() + "Z",
+                        "counters": self._agg_counts.copy(),
+                    }
+                    # Доступ до Redis через state_manager.cache (очікуємо UnifiedDataStore)
+                    redis_pub = None
+                    try:
+                        store = getattr(self._state_manager, "cache", None)
+                        if store is not None and hasattr(store, "redis"):
+                            redis_pub = getattr(store.redis, "jset", None)
+                    except Exception:
+                        redis_pub = None
+                    if callable(redis_pub):
+                        try:
+                            await redis_pub("stats", "core", value=payload, ttl=15)
+                        except Exception:
+                            pass
+                    self._agg_counts.clear()
+                    self._agg_last_push = now
+            except Exception:
+                pass
+
             # 4.1) Action-gate (обережний): застосовуємо тільки якщо low_gate відомий
             try:
                 conf = float(
@@ -392,14 +495,27 @@ class Stage2Processor:
                 )
             except Exception:
                 conf = 0.0
+            # Зберігаємо оригінальну рекомендацію перед застосуванням action‑gate
+            original_reco = result.get(K_RECOMMENDATION)
+            gate_reasons: list[str] = []
             if isinstance(low_gate, float):
-                if (
-                    (atr_pct < low_gate)
-                    or (isinstance(htf_ok, bool) and not htf_ok)
-                    or (conf < 0.75)
-                ):
-                    # помʼякшуємо до WAIT_FOR_CONFIRMATION, не ламаючи структуру результату
+                low_vol = isinstance(atr_pct, float) and atr_pct < low_gate
+                htf_block = isinstance(htf_ok, bool) and htf_ok is False
+                low_conf = conf < 0.75
+                if low_vol:
+                    gate_reasons.append("low_volatility")
+                if htf_block:
+                    gate_reasons.append("htf_block")
+                if low_conf:
+                    gate_reasons.append("low_confidence")
+                if gate_reasons:
+                    # помʼякшуємо до WAIT_FOR_CONFIRMATION (коли жодна з умов не дає зелене світло)
                     result[K_RECOMMENDATION] = "WAIT_FOR_CONFIRMATION"
+            # Якщо рекомендація змінена — фіксуємо службові поля для подальшої аналітики / UI
+            if original_reco and result.get(K_RECOMMENDATION) != original_reco:
+                result["reco_original"] = original_reco
+                if gate_reasons:
+                    result["reco_gate_reason"] = "+".join(gate_reasons)
 
             # 5) Додаткові технічні поля як і раніше
             result.update(

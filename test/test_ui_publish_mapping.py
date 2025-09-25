@@ -74,5 +74,56 @@ async def test_publish_sets_tp_sl_string():
     await publish_full_state(mgr, object(), r)
     payload = json.loads(r.published[-1])
     first = payload["assets"][0]
+    # У PR4 tp_sl формується лише з Stage3 targets; якщо їх немає — очікуємо "-"
     assert isinstance(first.get("tp_sl"), str)
-    assert "TP:" in first["tp_sl"] or "SL:" in first["tp_sl"]
+    assert ("TP:" in first["tp_sl"] or "SL:" in first["tp_sl"]) or first["tp_sl"] == "-"
+
+
+class _DummyCacheWithCore:
+    class _Redis:
+        async def jget(self, key: str, default: object | None = None) -> object | None:
+            # Повертаємо core документ з таргетами для BTCUSDT
+            if key == "core":
+                return {"trades": {"targets": {"BTCUSDT": {"tp": 120.0, "sl": 80.0}}}}
+            return default
+
+    def __init__(self) -> None:
+        self.redis = self._Redis()
+
+
+@pytest.mark.asyncio
+async def test_tp_sl_is_dash_when_no_targets():
+    assets = [
+        {
+            "symbol": "btcusdt",
+            "stats": {"current_price": 100.0},
+        },
+    ]
+    mgr = DummyStateMgr(assets)
+    r = DummyRedis()
+
+    # Без core.targets tp_sl має бути '-'
+    await publish_full_state(mgr, object(), r)
+    payload = json.loads(r.published[-1])
+    first = payload["assets"][0]
+    assert first.get("tp_sl") == "-"
+
+
+@pytest.mark.asyncio
+async def test_tp_sl_feature_flag_off_forces_dash(monkeypatch: pytest.MonkeyPatch):
+    # Підміняємо флаг у модулі публішера на False
+    import UI.publish_full_state as pub
+
+    monkeypatch.setattr(pub, "UI_TP_SL_FROM_STAGE3_ENABLED", False, raising=True)
+
+    assets = [
+        {"symbol": "btcusdt", "stats": {"current_price": 100.0}},
+    ]
+    mgr = DummyStateMgr(assets)
+    r = DummyRedis()
+
+    # Навіть при наявності core.targets форматування вимкнено → '-'
+    await publish_full_state(mgr, _DummyCacheWithCore(), r)
+    payload = json.loads(r.published[-1])
+    first = payload["assets"][0]
+    assert first.get("tp_sl") == "-"

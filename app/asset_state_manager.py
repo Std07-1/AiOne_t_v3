@@ -44,6 +44,16 @@ class AssetStateManager:
         self.state: dict[str, dict[str, Any]] = {}
         self.cache: Any | None = cache_handler
         self._symbol_cfg: dict[str, Any] = symbol_cfg or {}
+        # Лічильники для UI (оновлюються продюсером кожен цикл)
+        self.generated_signals: int = 0
+        self.skipped_signals: int = 0
+        # Накопичувальні лічильники блокувань / проходження ALERT після Stage2 гейтів
+        self.blocked_alerts_lowvol: int = 0
+        self.blocked_alerts_htf: int = 0
+        self.blocked_alerts_lowconf: int = 0
+        self.passed_alerts: int = 0  # фінально пройшли як ALERT_BUY/ALERT_SELL
+        self.downgraded_alerts: int = 0  # були даунгрейджені до WAIT_FOR_CONFIRMATION
+
         for asset in initial_assets:
             self.init_asset(asset)
 

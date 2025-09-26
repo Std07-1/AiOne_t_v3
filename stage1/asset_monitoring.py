@@ -52,7 +52,7 @@ from utils.utils import (
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.stage1.asset_monitoring")
 if not logger.handlers:  # guard від подвійного підключення
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
     logger.propagate = False
 

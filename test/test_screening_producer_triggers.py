@@ -1,7 +1,7 @@
 import asyncio
 
 from app.asset_state_manager import AssetStateManager
-from app.screening_producer import process_single_stage2
+from stage2.process_single_stage2 import process_single_stage2
 
 
 class _FakeProcessor:

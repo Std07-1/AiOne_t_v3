@@ -9,34 +9,27 @@
     • оновлення життєвого циклу трейдів через Stage3 `TradeLifecycleManager`.
 """
 
-# ───────────── Стандартна бібліотека ─────────────
+from __future__ import annotations
+
 import asyncio
-import json
 import logging
 import time
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
-# ───────────── Third-party ─────────────
 from rich.console import Console
 from rich.logging import RichHandler
 
-from app.utils.helper import (
-    estimate_atr_pct,
-    resample_5m,
-    store_to_dataframe,
-)
+from app.utils.helper import estimate_atr_pct, resample_5m, store_to_dataframe
 from config.config import (
-    ASSET_STATE,
     DEFAULT_LOOKBACK,
     DEFAULT_TIMEFRAME,
     MAX_PARALLEL_STAGE2,
     MIN_READY_PCT,
-    STAGE2_STATUS,
     TRADE_REFRESH_INTERVAL,
 )
 from stage1.asset_monitoring import AssetMonitorStage1
 from stage2.level_manager import LevelManager
+from stage2.process_single_stage2 import process_single_stage2
 from stage2.processor import Stage2Processor
 from stage3.open_trades import open_trades
 from stage3.trade_manager import TradeLifecycleManager
@@ -44,16 +37,11 @@ from UI.publish_full_state import RedisLike, publish_full_state
 from utils.utils import (
     create_error_signal,
     create_no_data_signal,
-    first_not_none,
     get_tick_size,
-    map_reco_to_signal,
     normalize_result_types,
 )
 
 from .asset_state_manager import AssetStateManager
-
-# ───────────── Внутрішні модулі ─────────────
-
 
 if TYPE_CHECKING:  # pragma: no cover - only for type hints
     from data.unified_store import UnifiedDataStore
@@ -69,7 +57,7 @@ if not logger.handlers:
 async def process_asset_batch(
     symbols: list[str],
     monitor: AssetMonitorStage1,
-    store: "UnifiedDataStore",
+    store: UnifiedDataStore,
     timeframe: str,
     lookback: int,
     state_manager: AssetStateManager,
@@ -144,200 +132,11 @@ async def process_asset_batch(
             state_manager.update_asset(symbol, create_error_signal(symbol, str(e)))
 
 
-_map_reco_to_signal = map_reco_to_signal
-_first_not_none = first_not_none
-# PR4: Міграція TP/SL на Stage3 — не нормалізуємо TP/SL у продюсері
-
-
-async def process_single_stage2(
-    signal: dict[str, Any],
-    processor: "Stage2Processor",
-    state_manager: "AssetStateManager",
-) -> None:
-    """Обробляє один Stage2-сигнал і оновлює стан активу."""
-    symbol = signal["symbol"]
-    try:
-        state_manager.update_asset(
-            symbol, {"stage2_status": STAGE2_STATUS["PROCESSING"]}
-        )
-
-        # Stage2 (QDE_core під капотом)
-        result: dict[str, Any] = await processor.process(signal)
-
-        update: dict[str, Any] = {
-            "stage2": True,
-            "stage2_status": STAGE2_STATUS["COMPLETED"],
-            "last_updated": datetime.utcnow().isoformat(),
-        }
-
-        if "error" in result:
-            err_text = str(result.get("error", "unknown"))
-            update.update({"signal": "NONE", "hints": [f"Stage2 error: {err_text}"]})
-            state_manager.update_asset(symbol, update)
-            return
-
-        market_ctx = result.get("market_context", {}) or {}
-        scenario = market_ctx.get("scenario") or "UNCERTAIN"
-
-        recommendation = result.get("recommendation")
-        if not recommendation and scenario == "UNCERTAIN":
-            recommendation = "WAIT"
-
-        signal_type = _map_reco_to_signal(recommendation or "")
-
-        risk_params = result.get("risk_parameters", {}) or {}
-        # PR4: TP/SL не використовуються у продюсері для формування UI
-
-        conf = result.get("confidence_metrics", {}) or {}
-        composite_conf = conf.get("composite_confidence", 0.0)
-
-        raw_narr = (result.get("narrative") or "").strip()
-        hints: list[str] = []
-        if raw_narr:
-            hints.append(raw_narr)
-            try:
-                logger.info("[NARR] %s %s", symbol, raw_narr.replace("\n", " "))
-            except Exception:
-                logger.debug("[NARR] %s (logging failed)", symbol)
-        # Якщо рекомендація була даунгрейднута Stage2 гейтом — формуємо службовий тег
-        try:
-            original_reco = result.get("reco_original")
-            if original_reco and recommendation and original_reco != recommendation:
-                tag = f"downgraded:{original_reco}->{recommendation}"
-                gate_reason = result.get("reco_gate_reason")
-                if gate_reason:
-                    tag = f"{tag}[{gate_reason}]"
-                if tag not in hints:
-                    hints.insert(0, tag)
-        except Exception:
-            pass
-
-        anomaly_det = result.get("anomaly_detection")
-        # Об'єднуємо джерела причин: основний результат + market_context
-        tr_from_result = result.get("trigger_reasons") or []
-        tr_from_ctx = (
-            market_ctx.get("trigger_reasons") if isinstance(market_ctx, dict) else []
-        )
-        if not isinstance(tr_from_ctx, list):
-            tr_from_ctx = []
-        trigger_reasons_raw = list(tr_from_result) + list(tr_from_ctx)
-
-        update["signal"] = signal_type
-        update["recommendation"] = recommendation or None
-        update["scenario"] = scenario
-        update["confidence"] = composite_conf
-        if hints:
-            update["hints"] = list(dict.fromkeys(hints))
-        # Нормалізація TP/SL щоб уникнути кейсів типу TP нижче SL для BUY
-        # PR4: TP/SL формуються і коригуються Stage3; продюсер їх не нормалізує
-        trigger_add = None
-
-        update["market_context"] = market_ctx or None
-        update["risk_parameters"] = risk_params or None
-        update["confidence_metrics"] = conf or None
-        update["anomaly_detection"] = anomaly_det or None
-        # Проксі службових полів від Stage2 (якщо були змінені гейтом)
-        if "reco_original" in result and result.get("reco_original") != recommendation:
-            update["reco_original"] = result.get("reco_original")
-        if "reco_gate_reason" in result:
-            update["reco_gate_reason"] = result.get("reco_gate_reason")
-        existing = state_manager.state.get(symbol, {}).get("trigger_reasons") or []
-        extra_triggers: list[str] = []
-        if trigger_add:
-            extra_triggers.append(trigger_add)
-        # Обережно приводимо типи до list[str]
-        existing_list: list[str] = list(cast(list[str], existing))
-        tr_list: list[str] = (
-            list(cast(list[str], trigger_reasons_raw)) if trigger_reasons_raw else []
-        )
-        merged_triggers = list(dict.fromkeys(existing_list + tr_list + extra_triggers))
-        if signal_type.startswith("ALERT") and not merged_triggers:
-            merged_triggers = ["signal_generated"]
-        update["trigger_reasons"] = merged_triggers
-        # Зберігаємо Stage1 alert у статусі (state) навіть якщо Stage2 понизив сигнал до NORMAL
-        prev_state = (
-            state_manager.state.get(symbol, {}).get("state")
-            if symbol in state_manager.state
-            else None
-        )
-        if signal_type.startswith("ALERT"):
-            update["state"] = ASSET_STATE["ALERT"]
-        elif signal_type == "NORMAL":
-            if prev_state == ASSET_STATE["ALERT"]:
-                # Stage1 ставив ALERT, Stage2 понизив — відображаємо ALERT у колонці "Статус"
-                update["state"] = ASSET_STATE["ALERT"]
-                update["stage1_alert_preserved"] = True
-            else:
-                update["state"] = ASSET_STATE["NORMAL"]
-        else:
-            update["state"] = update.get("state") or ASSET_STATE["NO_TRADE"]
-        update["narrative"] = raw_narr or None
-        state_manager.update_asset(symbol, update)
-
-        # ── Накопичувальні метрики проходження/блокування ALERT ──
-        try:
-            if signal_type.startswith("ALERT_BUY") or signal_type.startswith(
-                "ALERT_SELL"
-            ):
-                state_manager.passed_alerts += 1
-            elif signal_type == "NORMAL" and result.get("reco_original"):
-                # був даунгрейд → класифікуємо причини
-                state_manager.downgraded_alerts += 1
-                gr = (
-                    (result.get("reco_gate_reason") or "").split("+")
-                    if result.get("reco_gate_reason")
-                    else []
-                )
-                if any(r == "low_volatility" for r in gr):
-                    state_manager.blocked_alerts_lowvol += 1
-                if any(r == "htf_block" for r in gr):
-                    state_manager.blocked_alerts_htf += 1
-                if any(r == "low_confidence" for r in gr):
-                    state_manager.blocked_alerts_lowconf += 1
-        except Exception:
-            pass
-
-        # JSONL аудит Stage2 рішень (best‑effort, без винятків)
-        try:
-            audit = {
-                "ts": datetime.utcnow().isoformat() + "Z",
-                "symbol": symbol,
-                "scenario": scenario,
-                "recommendation": recommendation,
-                "signal": signal_type,
-                "confidence": composite_conf,
-                "htf_ok": (market_ctx.get("meta", {}) or {}).get("htf_ok"),
-                "atr_pct": (market_ctx.get("meta", {}) or {}).get("atr_pct"),
-                "low_gate": (market_ctx.get("meta", {}) or {}).get("low_gate"),
-                "near_edge": (
-                    (market_ctx.get("key_levels_meta", {}) or {}).get("band_pct")
-                    if isinstance(market_ctx, dict)
-                    else None
-                ),
-                "triggers": merged_triggers,
-            }
-            line = json.dumps(audit, ensure_ascii=False)
-            with open("stage2_decisions.jsonl", "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
-
-    except Exception:
-        logger.exception("Stage2 помилка для %s", symbol)
-        state_manager.update_asset(
-            symbol,
-            {
-                "stage2_status": STAGE2_STATUS["ERROR"],
-                "error": "Stage2 exception (див. логи)",
-            },
-        )
-
-
 async def process_single_stage2_with_semaphore(
     signal: dict[str, Any],
-    processor: "Stage2Processor",
+    processor: Stage2Processor,
     semaphore: asyncio.Semaphore,
-    state_manager: "AssetStateManager",
+    state_manager: AssetStateManager,
 ) -> None:
     async with semaphore:
         await process_single_stage2(signal, processor, state_manager)
@@ -345,8 +144,8 @@ async def process_single_stage2_with_semaphore(
 
 async def screening_producer(
     monitor: AssetMonitorStage1,
-    store: "UnifiedDataStore",
-    store_fast_symbols: "UnifiedDataStore",
+    store: UnifiedDataStore,
+    store_fast_symbols: UnifiedDataStore,
     assets: list[str],
     redis_conn: RedisLike,
     trade_manager: TradeLifecycleManager | None = None,
@@ -547,7 +346,12 @@ async def screening_producer(
             if max_trades is None or max_trades <= 0:
                 max_trades = 3
             logger.info(f"Максимальна кількість угод: {max_trades}")
-            await open_trades(alert_signals, trade_manager, max_trades)
+            await open_trades(
+                alert_signals,
+                trade_manager,
+                max_trades,
+                state_manager=state_manager,
+            )
         else:
             logger.info(
                 "💼 Торгівля Stage2 вимкнена або немає сигналів для відкриття угод"

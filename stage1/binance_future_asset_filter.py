@@ -52,7 +52,7 @@ from utils.utils import format_open_interest, format_volume_usd
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.stage1.binance_future_asset_filter")
 if not logger.handlers:
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
     logger.propagate = False
 

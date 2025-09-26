@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.logging import RichHandler
@@ -16,6 +17,105 @@ from rich.logging import RichHandler
 from config.config import STAGE3_TRADE_PARAMS
 from stage3.trade_manager import TradeLifecycleManager
 from utils.utils import safe_float
+
+if TYPE_CHECKING:  # pragma: no cover
+    from app.asset_state_manager import AssetStateManager
+
+
+def _log_stage3_skip(signal: dict[str, Any], reason: str) -> None:
+    """Записати причину пропуску відкриття угоди у JSONL (best-effort).
+
+    Формат рядка: {
+        ts, symbol, reason, confidence, signal_type,
+        htf_ok, atr_pct, low_gate
+    }
+    """
+    try:
+        symbol = signal.get("symbol")
+        ctx_meta = signal.get("context_metadata") or {}
+        if not ctx_meta and isinstance(signal.get("market_context"), dict):
+            ctx_meta = (signal.get("market_context", {}) or {}).get("meta", {})
+        rec = {
+            "ts": datetime.utcnow().isoformat() + "Z",
+            "symbol": symbol,
+            "reason": reason,
+            "confidence": safe_float(signal.get("confidence")),
+            "signal_type": signal.get("signal"),
+            "htf_ok": ctx_meta.get("htf_ok"),
+            "atr_pct": ctx_meta.get("atr_pct"),
+            "low_gate": ctx_meta.get("low_gate"),
+        }
+        with open("stage3_skips.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        # ігноруємо будь-які помилки (не критично для пайплайну)
+        pass
+
+
+def _optional_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _ensure_alert_session(
+    state_manager: AssetStateManager,
+    symbol: str,
+    signal: dict[str, Any],
+) -> None:
+    if symbol in state_manager.alert_sessions:
+        return
+    stats = signal.get("stats") or {}
+    price_val = _optional_float(stats.get("current_price"))
+    rsi_val = _optional_float(stats.get("rsi"))
+    meta = signal.get("context_metadata") or {}
+    if not meta and isinstance(signal.get("market_context"), dict):
+        meta = (signal.get("market_context", {}) or {}).get("meta", {})
+    atr_pct_val = _optional_float(meta.get("atr_pct"))
+    sig_type = str(signal.get("signal", "")).upper()
+    side_val: str | None = None
+    if sig_type.startswith("ALERT_BUY"):
+        side_val = "BUY"
+    elif sig_type.startswith("ALERT_SELL"):
+        side_val = "SELL"
+    try:
+        state_manager.start_alert_session(
+            symbol,
+            price_val,
+            atr_pct_val,
+            rsi_val,
+            side_val,
+        )
+    except Exception:
+        pass
+
+
+def _finalize_alert_session(
+    state_manager: AssetStateManager | None,
+    signal: dict[str, Any],
+    reason: str,
+) -> None:
+    if state_manager is None:
+        return
+    symbol = signal.get("symbol")
+    if not isinstance(symbol, str):
+        return
+    sig_type = str(signal.get("signal", "")).upper()
+    if symbol not in state_manager.alert_sessions and sig_type.startswith("ALERT"):
+        _ensure_alert_session(state_manager, symbol, signal)
+    if symbol in state_manager.alert_sessions:
+        try:
+            state_manager.finalize_alert_session(symbol, reason)
+        except Exception:
+            return
+        try:
+            state_manager.update_asset(symbol, {"signal": "NORMAL"})
+        except Exception:
+            pass
+
 
 # ── Logger ───────────────────────────────────────────────────────────────────
 logger = logging.getLogger("stage3.open_trades")
@@ -38,6 +138,7 @@ async def open_trades(
     signals: list[dict[str, Any]],
     trade_manager: TradeLifecycleManager,
     max_parallel: int,
+    state_manager: AssetStateManager | None = None,
 ) -> None:
     """
     Відкриває угоди для найперспективніших сигналів:
@@ -79,7 +180,7 @@ async def open_trades(
         if confidence is None:
             confidence = 0.0
 
-        # Детальне логування причин, чому угода не відкривається
+        # Лише INFO/DEBUG, відкриття не очікується для інших рекомендацій
         if confidence < MIN_CONFIDENCE_TRADE:
             logger.info(
                 f"⛔️ Не відкриваємо угоду для {symbol}: впевненість {confidence:.3f} "
@@ -91,6 +192,8 @@ async def open_trades(
             skipped_by_reason["low_confidence"] = (
                 skipped_by_reason.get("low_confidence", 0) + 1
             )
+            _log_stage3_skip(signal, "low_confidence")
+            _finalize_alert_session(state_manager, signal, "stage3_low_confidence")
             continue
 
         # Додаткові перевірки (можна розширити)
@@ -104,6 +207,8 @@ async def open_trades(
                 f"Деталі сигналу: {json.dumps(signal, ensure_ascii=False, default=str)}"
             )
             skipped_by_reason["not_alert"] = skipped_by_reason.get("not_alert", 0) + 1
+            _log_stage3_skip(signal, "not_alert")
+            _finalize_alert_session(state_manager, signal, "stage3_not_alert")
             continue
 
         # Вимагаємо явний стан 'alert' якщо передається
@@ -115,6 +220,8 @@ async def open_trades(
             skipped_by_reason["not_state_alert"] = (
                 skipped_by_reason.get("not_state_alert", 0) + 1
             )
+            _log_stage3_skip(signal, "not_state_alert")
+            _finalize_alert_session(state_manager, signal, "stage3_not_state_alert")
             continue
 
         try:
@@ -134,6 +241,8 @@ async def open_trades(
                     skipped_by_reason["htf_block"] = (
                         skipped_by_reason.get("htf_block", 0) + 1
                     )
+                    _log_stage3_skip(signal, "htf_block")
+                    _finalize_alert_session(state_manager, signal, "stage3_htf_block")
                     continue
                 if isinstance(atr_pct, (int, float)) and isinstance(
                     low_gate, (int, float)
@@ -145,6 +254,8 @@ async def open_trades(
                         skipped_by_reason["low_atr"] = (
                             skipped_by_reason.get("low_atr", 0) + 1
                         )
+                        _log_stage3_skip(signal, "low_atr")
+                        _finalize_alert_session(state_manager, signal, "stage3_low_atr")
                         continue
             except Exception:
                 pass

@@ -358,14 +358,14 @@ async def publish_full_state(
         except Exception:
             pass
 
-        counters = {
-            "assets": len(serialized_assets),
-            "alerts": len(alerts_list),
-            "alerts_buy": alerts_buy,
-            "alerts_sell": alerts_sell,
-            "htf_blocked": htf_blocks,
-            "lowatr_blocked": lowatr_blocks,
-        }
+        # counters (int-only): агрегати для хедера UI; метрики з плаваючою точкою (percentiles) виносимо в confidence_stats
+        counters: dict[str, int] = {}
+        counters["assets"] = int(len(serialized_assets))
+        counters["alerts"] = int(len(alerts_list))
+        counters["alerts_buy"] = int(alerts_buy)
+        counters["alerts_sell"] = int(alerts_sell)
+        counters["htf_blocked"] = int(htf_blocks)
+        counters["lowatr_blocked"] = int(lowatr_blocks)
         if isinstance(generated_signals, int):
             counters["generated_signals"] = generated_signals
         if isinstance(skipped_signals, int):
@@ -375,6 +375,9 @@ async def publish_full_state(
             blocked_lv = getattr(state_manager, "blocked_alerts_lowvol", None)
             blocked_htf = getattr(state_manager, "blocked_alerts_htf", None)
             blocked_lc = getattr(state_manager, "blocked_alerts_lowconf", None)
+            blocked_lv_lc = getattr(
+                state_manager, "blocked_alerts_lowvol_lowconf", None
+            )
             passed_total = getattr(state_manager, "passed_alerts", None)
             downgraded_total = getattr(state_manager, "downgraded_alerts", None)
             if isinstance(blocked_lv, int):
@@ -383,12 +386,44 @@ async def publish_full_state(
                 counters["blocked_alerts_htf"] = blocked_htf
             if isinstance(blocked_lc, int):
                 counters["blocked_alerts_lowconf"] = blocked_lc
+            if isinstance(blocked_lv_lc, int):
+                counters["blocked_alerts_lowvol_lowconf"] = blocked_lv_lc
             if isinstance(passed_total, int):
                 counters["passed_alerts"] = passed_total
             if isinstance(downgraded_total, int):
                 counters["downgraded_alerts"] = downgraded_total
         except Exception:
             pass
+
+        # Confidence перцентилі (best-effort) — окремо від counters (щоб counters залишались int-only для сумісності)
+        confidence_stats: dict[str, float] | None = None
+        try:
+            samples = getattr(state_manager, "conf_samples", [])
+            if isinstance(samples, list) and len(samples) >= 5:
+                import math
+
+                sorted_vals = [v for v in samples if isinstance(v, (int, float))]
+                sorted_vals.sort()
+                if sorted_vals:
+
+                    def _pct(p: float) -> float:
+                        k = (len(sorted_vals) - 1) * p
+                        f = math.floor(k)
+                        c = math.ceil(k)
+                        if f == c:
+                            return float(sorted_vals[int(k)])
+                        d0 = sorted_vals[f] * (c - k)
+                        d1 = sorted_vals[c] * (k - f)
+                        return float(d0 + d1)
+
+                    confidence_stats = {
+                        "p50": round(_pct(0.50), 3),
+                        "p75": round(_pct(0.75), 3),
+                        "p90": round(_pct(0.90), 3),
+                        "count": float(len(sorted_vals)),  # для дебагу/контексту
+                    }
+        except Exception:
+            confidence_stats = None
 
         # Нормалізуємо символи для UI (єдиний формат UPPER)
         for a in serialized_assets:
@@ -412,6 +447,8 @@ async def publish_full_state(
             "counters": counters,
             "assets": serialized_assets,
         }
+        if confidence_stats:
+            payload["confidence_stats"] = confidence_stats
 
         try:
             if serialized_assets:

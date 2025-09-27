@@ -111,12 +111,9 @@ class AssetMonitorStage1:
         self.use_vol_atr: bool = USE_VOL_ATR
 
         # Можливий оверрайд через feature_switches
-        try:
-            sw = (feature_switches or {}).get("volume_spike", {})
-            if isinstance(sw, dict) and "use_vol_atr" in sw:
-                self.use_vol_atr = bool(sw["use_vol_atr"])
-        except Exception:
-            pass
+        sw = (feature_switches or {}).get("volume_spike", {})
+        if isinstance(sw, dict) and "use_vol_atr" in sw:
+            self.use_vol_atr = bool(sw["use_vol_atr"])
 
         logger.debug("[Stage1] use_vol_atr=%s", self.use_vol_atr)
 
@@ -145,7 +142,14 @@ class AssetMonitorStage1:
                 return "range_bound"
             if abs(price_change) >= 0.02 or rsi >= 60 or rsi <= 40:
                 return "trend_strong"
-        except Exception:
+        except (
+            TypeError,
+            ValueError,
+            ZeroDivisionError,
+        ) as exc:  # broad except: stats можуть бути неповними
+            logger.debug(
+                f"[{symbol}] Не вдалося визначити ринковий стан: {exc}", exc_info=True
+            )
             return None
         return None
 
@@ -354,8 +358,12 @@ class AssetMonitorStage1:
                     t_head,
                     t_tail,
                 )
-        except Exception:
-            pass
+        except (
+            Exception
+        ) as exc:  # broad except: діагностичний лог не має зривати аналіз
+            logger.debug(
+                f"[{symbol}] Не вдалося зібрати timestamp-лог: {exc}", exc_info=True
+            )
 
         # Додатково: лог сирих open_time/close_time як приходять (інт/рядки)
         try:
@@ -375,8 +383,13 @@ class AssetMonitorStage1:
                     ct.head(3).dropna().astype("int64").tolist(),
                     ct.tail(3).dropna().astype("int64").tolist(),
                 )
-        except Exception:
-            pass
+        except (
+            Exception
+        ) as exc:  # broad except: конверсія timestamp може впасти на зіпсованих даних
+            logger.debug(
+                f"[{symbol}] Неможливо зібрати open/close-time лог: {exc}",
+                exc_info=True,
+            )
 
         # Не конвертуємо час — лишаємо raw numeric логіку вище
 
@@ -407,7 +420,12 @@ class AssetMonitorStage1:
         market_state = self._detect_market_state(symbol, stats)
         try:
             effective = thr.effective_thresholds(market_state=market_state)
-        except Exception:
+        except (
+            Exception
+        ) as exc:  # broad except: fallback на сирі пороги, щоб не втратити сигнал
+            logger.debug(
+                f"[{symbol}] effective_thresholds fallback: {exc}", exc_info=True
+            )
             effective = thr.to_dict()
         logger.debug(
             f"[check_anomalies] {symbol} | Застосовано пороги: "
@@ -435,8 +453,13 @@ class AssetMonitorStage1:
                 )
             # збережемо стан для наступного порівняння
             self.asset_stats.setdefault(symbol, {})["_market_state"] = market_state
-        except Exception:
-            pass
+        except (
+            Exception
+        ) as exc:  # broad except: діагностичний лог не повинен ламати пайплайн
+            logger.debug(
+                f"[{symbol}] Неможливо оновити кеш ринкового стану: {exc}",
+                exc_info=True,
+            )
 
         def _add(reason: str, text: str) -> None:
             anomalies.append(text)
@@ -510,16 +533,13 @@ class AssetMonitorStage1:
         if self._sw_triggers.get("breakout", True):
             # Налаштування breakout із конфігурації (state-aware)
             br_cfg: dict[str, Any] = {}
-            try:
-                st = (
-                    effective.get("signal_thresholds", {})
-                    if isinstance(effective, dict)
-                    else {}
-                )
-                if isinstance(st, dict):
-                    br_cfg = st.get("breakout", {}) or {}
-            except Exception:
-                br_cfg = {}
+            st = (
+                effective.get("signal_thresholds", {})
+                if isinstance(effective, dict)
+                else {}
+            )
+            if isinstance(st, dict):
+                br_cfg = st.get("breakout", {}) or {}
 
             band_pct_atr = br_cfg.get("band_pct_atr", br_cfg.get("band_pct"))
             confirm_bars = int(br_cfg.get("confirm_bars", 1) or 1)
@@ -528,7 +548,7 @@ class AssetMonitorStage1:
             # Обчислимо поріг близькості як частку від ціни: band_pct_atr * (ATR/price)
             try:
                 atr_pct_local = float(stats.get("atr", 0.0)) / float(price)
-            except Exception:
+            except (TypeError, ValueError, ZeroDivisionError):
                 atr_pct_local = 0.0
             if isinstance(band_pct_atr, (int, float)) and atr_pct_local > 0:
                 near_thr = float(band_pct_atr) * atr_pct_local
@@ -584,39 +604,36 @@ class AssetMonitorStage1:
                 over = stats["dynamic_overbought"]
                 under = stats["dynamic_oversold"]
                 # Застосуємо обмеження (стеля/підлога) з signal_thresholds.rsi_trigger
-                try:
-                    st = (
-                        effective.get("signal_thresholds", {})
-                        if isinstance(effective, dict)
-                        else {}
+                st = (
+                    effective.get("signal_thresholds", {})
+                    if isinstance(effective, dict)
+                    else {}
+                )
+                rsi_cfg = st.get("rsi_trigger", {}) if isinstance(st, dict) else {}
+                clamp_over = rsi_cfg.get("overbought")
+                clamp_under = rsi_cfg.get("oversold")
+                over_eff = (
+                    float(min(float(over), float(clamp_over)))
+                    if isinstance(clamp_over, (int, float))
+                    else float(over)
+                )
+                under_eff = (
+                    float(max(float(under), float(clamp_under)))
+                    if isinstance(clamp_under, (int, float))
+                    else float(under)
+                )
+                if over_eff != over or under_eff != under:
+                    logger.debug(
+                        "[%s] RSI clamp застосовано",
+                        symbol,
+                        extra={
+                            "base": {"over": float(over), "under": float(under)},
+                            "clamp": {"over": clamp_over, "under": clamp_under},
+                            "effective": {"over": over_eff, "under": under_eff},
+                        },
                     )
-                    rsi_cfg = st.get("rsi_trigger", {}) if isinstance(st, dict) else {}
-                    clamp_over = rsi_cfg.get("overbought")
-                    clamp_under = rsi_cfg.get("oversold")
-                    over_eff = (
-                        float(min(float(over), float(clamp_over)))
-                        if isinstance(clamp_over, (int, float))
-                        else float(over)
-                    )
-                    under_eff = (
-                        float(max(float(under), float(clamp_under)))
-                        if isinstance(clamp_under, (int, float))
-                        else float(under)
-                    )
-                    if over_eff != over or under_eff != under:
-                        logger.debug(
-                            "[%s] RSI clamp застосовано",
-                            symbol,
-                            extra={
-                                "base": {"over": float(over), "under": float(under)},
-                                "clamp": {"over": clamp_over, "under": clamp_under},
-                                "effective": {"over": over_eff, "under": under_eff},
-                            },
-                        )
-                    over = over_eff
-                    under = under_eff
-                except Exception:
-                    pass
+                over = over_eff
+                under = under_eff
                 if rsi_res["rsi"] > over:
                     _add(
                         "rsi_overbought",

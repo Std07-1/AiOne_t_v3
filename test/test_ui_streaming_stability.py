@@ -152,6 +152,7 @@ def test_signal_table_includes_band_column_with_color() -> None:
     table = consumer._build_signal_table([asset])
     headers = [column.header for column in table.columns]
     assert "Band%" in headers
+    assert headers.index("Band%") == headers.index("RSI") + 1
 
 
 @pytest.mark.asyncio

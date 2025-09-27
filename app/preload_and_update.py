@@ -33,7 +33,7 @@ from stage1.optimized_asset_filter import get_filtered_assets
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.preload")
 if not logger.handlers:
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     # show_path=True для чіткої вказівки файлу/рядка у WARNING/ERROR
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=True))
     logger.propagate = False
@@ -55,6 +55,20 @@ async def periodic_prefilter_and_update(
     # Початковий набір символів
     initial_symbols = set(await cache.get_fast_symbols())
     prev_symbols = initial_symbols.copy()
+    if initial_symbols:
+        try:
+            await cache.set_fast_symbols(
+                sorted(initial_symbols), ttl=max(interval * 2, interval + 60)
+            )
+            logger.debug(
+                "Prefilter bootstrap: продовжено TTL існуючого whitelist",
+                extra={
+                    "count": len(initial_symbols),
+                    "head": sorted(list(initial_symbols))[:3],
+                },
+            )
+        except Exception as exc:
+            logger.warning("Не вдалося оновити TTL початкового whitelist: %s", exc)
 
     # Затримка перед першим оновленням (щоб уникнути конфлікту з первинним префільтром)
     await asyncio.sleep(interval)  # Чекаємо звичайний інтервал (600 сек)
@@ -144,15 +158,37 @@ async def periodic_prefilter_and_update(
                 # Оновлюємо попередні символи
                 prev_symbols = current_symbols
             else:
-                logger.warning(
-                    "Prefilter повернув порожній список, fast_symbols не оновлено.",
-                    extra={"batch_id": batch_id},
-                )
+                if prev_symbols:
+                    logger.warning(
+                        "Prefilter повернув порожній список, використовуємо попередній whitelist",
+                        extra={
+                            "batch_id": batch_id,
+                            "count": len(prev_symbols),
+                        },
+                    )
+                    await cache.set_fast_symbols(
+                        sorted(prev_symbols), ttl=max(interval, interval // 2)
+                    )
+                else:
+                    logger.debug(
+                        "Prefilter повернув порожній список, а історії whitelist немає.",
+                        extra={"batch_id": batch_id},
+                    )
         except Exception as e:
             logger.warning(
                 "Помилка оновлення prefilter",
                 extra={"batch_id": batch_id, "error": str(e)},
             )
+            if prev_symbols:
+                try:
+                    await cache.set_fast_symbols(
+                        sorted(prev_symbols), ttl=max(interval, interval // 2)
+                    )
+                except Exception as ttl_exc:
+                    logger.warning(
+                        "Не вдалося продовжити TTL whitelist після помилки prefilter: %s",
+                        ttl_exc,
+                    )
         finally:
             t1 = time.perf_counter()
             logger.info(
@@ -350,7 +386,7 @@ async def _fetch_klines(
                 return df
             else:
                 txt = await response.text()
-                logger.error(
+                logger.debug(
                     "HTTP помилка від Binance",
                     extra={
                         "symbol": symbol,
@@ -437,7 +473,7 @@ async def preload_1m_history(
                     stats["success"] = cast(int, stats.get("success", 0)) + 1
                     stats["symbols_loaded"].append(symbol)
 
-                    logger.info(
+                    logger.debug(
                         f"✅ {symbol}: {len(df)} барів | "
                         f"Останній: {pd.to_datetime(df['open_time'].iloc[-1], unit='ms').strftime('%H:%M:%S')}"
                     )
@@ -528,7 +564,7 @@ async def preload_daily_levels(
                     stats["success"] = cast(int, stats.get("success", 0)) + 1
                     stats["symbols_loaded"].append(symbol)
 
-                    logger.info(f"✅ Daily {symbol}: {len(df)} денних барів")
+                    logger.debug(f"✅ Daily {symbol}: {len(df)} денних барів")
                     return True
                 else:
                     stats["failed"] = cast(int, stats.get("failed", 0)) + 1

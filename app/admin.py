@@ -70,7 +70,7 @@ async def admin_command_loop(admin: DataStoreAdmin):
     pubsub = admin.redis.r.pubsub()
     try:
         await pubsub.subscribe(ch)
-        logger.info(f"🛠  Admin commands listening on {ch}")
+        logger.debug(f"🛠  Admin commands listening on {ch}")
         async for msg in pubsub.listen():
             if msg.get("type") != "message":
                 continue
@@ -83,7 +83,7 @@ async def admin_command_loop(admin: DataStoreAdmin):
             op = (cmd.get("op") or "").lower()
             if op == "dump_status":
                 status = await admin.dump_status()
-                logger.info(
+                logger.debug(
                     "[ADMIN] dump_status → %s", json.dumps(status, ensure_ascii=False)
                 )
             elif op == "set_profile":
@@ -99,10 +99,10 @@ async def admin_command_loop(admin: DataStoreAdmin):
                 except Exception:
                     lvl = 1
                 admin.store.set_priority(sym, lvl)
-                logger.info("[ADMIN] set_priority %s → %s", sym, lvl)
+                logger.debug("[ADMIN] set_priority %s → %s", sym, lvl)
             elif op == "flush_now":
                 await admin.store._drain_flush_queue(force=True)
-                logger.info("[ADMIN] flush_now executed")
+                logger.debug("[ADMIN] flush_now executed")
             else:
                 logger.warning("Unknown admin op: %s", op)
     except asyncio.CancelledError:  # graceful cancellation

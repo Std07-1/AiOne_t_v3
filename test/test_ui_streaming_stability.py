@@ -1,8 +1,11 @@
 import asyncio
+import json
+from datetime import datetime
 from typing import Any
 
 import pytest
 
+from config.config import K_STATS, K_TRIGGER_REASONS
 from UI.publish_full_state import publish_full_state
 from UI.ui_consumer import UIConsumer
 
@@ -123,3 +126,87 @@ async def test_ui_streaming_multi_iteration_shows_latest_and_skips_stale():
     assert float(
         latest.get("price", latest.get("stats", {}).get("current_price", 0))
     ) in (3.0,)
+
+
+def test_signal_table_includes_band_column_with_color() -> None:
+    consumer = UIConsumer()
+    asset = {
+        "symbol": "AAAUSDT",
+        "price_str": "1.00",
+        "volume_str": "-",
+        "atr_pct": 0.01,
+        "rsi": 55.0,
+        "status": "normal",
+        "signal": "ALERT_BUY",
+        "confidence": 0.42,
+        "recommendation": "BUY_IN_DIPS",
+        "tp_sl": "-",
+        "analytics": {"corridor_band_pct": 0.012},
+        K_STATS: {},
+        K_TRIGGER_REASONS: [],
+    }
+
+    band_repr = consumer._format_band_pct(asset)
+    assert band_repr == "[yellow]1.20%[/]"
+
+    table = consumer._build_signal_table([asset])
+    headers = [column.header for column in table.columns]
+    assert "Band%" in headers
+
+
+@pytest.mark.asyncio
+async def test_ui_accepts_sequence_reset_after_publisher_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import UI.publish_full_state as publisher_mod
+    import UI.ui_consumer as ui_mod
+
+    old_assets = [
+        {"symbol": "oldusdt", "signal": "NORMAL", "stats": {"current_price": 1.0}}
+    ]
+    redis_backend = DummyRedis()
+    manager = DummyStateMgr(old_assets)
+
+    publisher_mod._SEQ = 540
+    await publish_full_state(manager, object(), redis_backend)
+
+    assert redis_backend._snapshot is not None
+    old_payload = json.loads(redis_backend._snapshot)
+    old_payload.setdefault("meta", {})["ts"] = "2000-01-01T00:00:00Z"
+    redis_backend._snapshot = json.dumps(old_payload)
+
+    publisher_mod._SEQ = 0
+    manager.set_assets(
+        [{"symbol": "newusdt", "signal": "ALERT_BUY", "stats": {"current_price": 2.0}}]
+    )
+    await publish_full_state(manager, object(), redis_backend)
+    new_message = redis_backend._msgs[-1]
+
+    redis_backend._queue = asyncio.Queue()
+    await redis_backend._queue.put(new_message)
+    redis_backend._msgs = [new_message]
+    redis_backend._snapshot = json.dumps(old_payload)
+
+    monkeypatch.setattr(ui_mod.redis, "from_url", lambda *args, **kwargs: redis_backend)
+
+    consumer = UIConsumer()
+    run_task = asyncio.create_task(
+        consumer.redis_consumer(
+            redis_url="redis://dummy",
+            loading_delay=0.0,
+            smooth_delay=0.0,
+        )
+    )
+    await asyncio.sleep(0.15)
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert consumer._display_results, "Очікуємо принаймні один актив після reset"
+    latest = consumer._display_results[0]
+    assert latest.get("symbol") == "NEWUSDT"
+    assert consumer._last_seq == 1
+    old_ts = datetime.fromisoformat("2000-01-01T00:00:00+00:00").timestamp()
+    assert consumer.last_update_time >= old_ts
+
+    publisher_mod._SEQ = 0

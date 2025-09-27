@@ -30,7 +30,7 @@ from utils.utils import safe_float
 
 logger = logging.getLogger("stage2.process_single_stage2")
 if not logger.handlers:  # guard
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
     logger.propagate = False
 
@@ -393,12 +393,41 @@ async def process_single_stage2(
             rsi_val = signal.get("stats", {}).get("rsi")
             atr_pct_val = None
             htf_ok_val = None
+            band_pct_val: float | None = None
+            near_edge_val: str | None = None
+            low_gate_val: float | None = None
+            meta_ctx: dict[str, Any] = {}
+            corridor_meta_ctx: dict[str, Any] = {}
             try:
-                meta_ctx = (
+                raw_meta_ctx = (
                     market_ctx.get("meta", {}) if isinstance(market_ctx, dict) else {}
                 ) or {}
+                if isinstance(raw_meta_ctx, dict):
+                    meta_ctx = raw_meta_ctx
                 atr_pct_val = meta_ctx.get("atr_pct")
                 htf_ok_val = meta_ctx.get("htf_ok")
+                low_gate_val = safe_float(meta_ctx.get("low_gate"))
+
+                corridor_candidate = meta_ctx.get("corridor")
+                if isinstance(corridor_candidate, dict):
+                    corridor_meta_ctx = corridor_candidate
+                elif isinstance(market_ctx, dict):
+                    key_levels_meta = market_ctx.get("key_levels_meta")
+                    if isinstance(key_levels_meta, dict):
+                        corridor_meta_ctx = key_levels_meta
+
+                if corridor_meta_ctx:
+                    band_pct_val = safe_float(corridor_meta_ctx.get("band_pct"))
+                    near_edge_raw = corridor_meta_ctx.get("near_edge")
+                    if isinstance(near_edge_raw, str):
+                        near_edge_val = near_edge_raw
+                    else:
+                        nearest_edge_candidate = corridor_meta_ctx.get("nearest_edge")
+                        is_near_edge_val = corridor_meta_ctx.get("is_near_edge")
+                        if isinstance(nearest_edge_candidate, str) and bool(
+                            is_near_edge_val
+                        ):
+                            near_edge_val = nearest_edge_candidate
             except Exception:
                 pass
             side_val: str | None = None
@@ -419,7 +448,14 @@ async def process_single_stage2(
                         side_val,
                     )
                 state_manager.start_alert_session(
-                    symbol, price_val, atr_pct_val, rsi_val, side_val
+                    symbol,
+                    price_val,
+                    atr_pct_val,
+                    rsi_val,
+                    side_val,
+                    band_pct_val,
+                    low_gate_val,
+                    near_edge_val,
                 )
             # Продовження ALERT
             elif prev_signal.startswith("ALERT") and sig_u.startswith("ALERT"):
@@ -433,17 +469,19 @@ async def process_single_stage2(
                         htf_ok_val,
                     )
                 state_manager.update_alert_session(
-                    symbol, price_val, atr_pct_val, rsi_val, htf_ok_val
+                    symbol,
+                    price_val,
+                    atr_pct_val,
+                    rsi_val,
+                    htf_ok_val,
+                    band_pct_val,
+                    low_gate_val,
+                    near_edge_val,
                 )
             # Вихід із ALERT
             elif prev_signal.startswith("ALERT") and (not sig_u.startswith("ALERT")):
                 downgrade_list: list[str] = []
                 try:
-                    low_gate_val = None
-                    if isinstance(market_ctx, dict):
-                        low_gate_val = (market_ctx.get("meta", {}) or {}).get(
-                            "low_gate"
-                        )
                     if (
                         isinstance(atr_pct_val, (int, float))
                         and isinstance(low_gate_val, (int, float))

@@ -36,6 +36,7 @@ from config.config import (
     K_SYMBOL,
     K_TRIGGER_REASONS,
     STAGE2_AUDIT,
+    STAGE2_GATE_PARAMS,
     STAGE2_RANGE_PARAMS,
 )
 from utils.utils import safe_number
@@ -495,22 +496,39 @@ class Stage2Processor:
                 )
             except Exception:
                 conf = 0.0
+            low_conf_threshold = float(
+                STAGE2_GATE_PARAMS.get("low_conf_threshold", 0.75)
+            )
+            low_vol_conf_override = float(
+                STAGE2_GATE_PARAMS.get("low_vol_conf_override", 1.0)
+            )
             # Зберігаємо оригінальну рекомендацію перед застосуванням action‑gate
             original_reco = result.get(K_RECOMMENDATION)
             gate_reasons: list[str] = []
-            if isinstance(low_gate, float):
-                low_vol = isinstance(atr_pct, float) and atr_pct < low_gate
-                htf_block = isinstance(htf_ok, bool) and htf_ok is False
-                low_conf = conf < 0.75
-                if low_vol:
-                    gate_reasons.append("low_volatility")
-                if htf_block:
-                    gate_reasons.append("htf_block")
-                if low_conf:
-                    gate_reasons.append("low_confidence")
-                if gate_reasons:
-                    # помʼякшуємо до WAIT_FOR_CONFIRMATION (коли жодна з умов не дає зелене світло)
-                    result[K_RECOMMENDATION] = "WAIT_FOR_CONFIRMATION"
+            low_vol = False
+            if isinstance(low_gate, float) and isinstance(atr_pct, float):
+                low_vol = atr_pct < low_gate
+                if low_vol and conf >= low_vol_conf_override:
+                    low_vol = False
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "[Stage2] %s low_vol_override: atr_pct=%.5f low_gate=%.5f conf=%.3f",
+                            symbol,
+                            atr_pct,
+                            low_gate,
+                            conf,
+                        )
+            htf_block = isinstance(htf_ok, bool) and htf_ok is False
+            low_conf = conf < low_conf_threshold
+            if low_vol:
+                gate_reasons.append("low_volatility")
+            if htf_block:
+                gate_reasons.append("htf_block")
+            if low_conf:
+                gate_reasons.append("low_confidence")
+            if gate_reasons:
+                # помʼякшуємо до WAIT_FOR_CONFIRMATION (коли жодна з умов не дає зелене світло)
+                result[K_RECOMMENDATION] = "WAIT_FOR_CONFIRMATION"
             # Якщо рекомендація змінена — фіксуємо службові поля для подальшої аналітики / UI
             if original_reco and result.get(K_RECOMMENDATION) != original_reco:
                 result["reco_original"] = original_reco

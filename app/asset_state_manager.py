@@ -155,6 +155,9 @@ class AssetStateManager:
         atr_pct: float | None,
         rsi: float | None = None,
         side: str | None = None,
+        band_pct: float | None = None,
+        low_gate: float | None = None,
+        near_edge: str | None = None,
     ) -> None:
         """Почати нову ALERT-сесію (фіксуємо стартові метрики)."""
         try:
@@ -174,6 +177,14 @@ class AssetStateManager:
             "atr_path": [] if atr_pct is None else [atr_pct],
             "rsi_path": [] if rsi is None else [rsi],
             "htf_ok_path": [],
+            "band_pct_initial": band_pct,
+            "band_pct_last": band_pct,
+            "band_pct_path": [] if band_pct is None else [band_pct],
+            "low_gate_initial": low_gate,
+            "low_gate_last": low_gate,
+            "low_gate_path": [] if low_gate is None else [low_gate],
+            "near_edge_initial": near_edge,
+            "near_edge_last": near_edge,
         }
 
     def update_alert_session(
@@ -183,6 +194,9 @@ class AssetStateManager:
         atr_pct: float | None = None,
         rsi: float | None = None,
         htf_ok: bool | None = None,
+        band_pct: float | None = None,
+        low_gate: float | None = None,
+        near_edge: str | None = None,
     ) -> None:
         """Оновити активну ALERT-сесію (max_high/min_low, ATR/RSI траєкторії)."""
         sess = self.alert_sessions.get(symbol)
@@ -203,6 +217,24 @@ class AssetStateManager:
             sess.setdefault("rsi_path", []).append(rsi)
         if htf_ok is not None:
             sess.setdefault("htf_ok_path", []).append(htf_ok)
+        if band_pct is not None:
+            try:
+                band_val = float(band_pct)
+            except Exception:
+                band_val = None
+            if band_val is not None:
+                sess["band_pct_last"] = band_val
+                sess.setdefault("band_pct_path", []).append(band_val)
+        if low_gate is not None:
+            try:
+                low_gate_val = float(low_gate)
+            except Exception:
+                low_gate_val = None
+            if low_gate_val is not None:
+                sess["low_gate_last"] = low_gate_val
+                sess.setdefault("low_gate_path", []).append(low_gate_val)
+        if near_edge is not None:
+            sess["near_edge_last"] = near_edge
 
     def finalize_alert_session(
         self, symbol: str, downgrade_reason: str | None = None
@@ -255,12 +287,16 @@ class AssetStateManager:
                 "side": side,
                 "price_alert": price_alert,
                 "atr_alert": atr_alert,
+                "atr_pct": atr_alert,
                 "survival_s": survival_s,
                 "mfe": mfe,
                 "mae": mae,
                 "aof": aof,
                 "htf_ok_path": sess.get("htf_ok_path"),
                 "downgrade_reason": downgrade_reason,
+                "band_pct": sess.get("band_pct_last", sess.get("band_pct_initial")),
+                "low_gate": sess.get("low_gate_last", sess.get("low_gate_initial")),
+                "near_edge": sess.get("near_edge_last", sess.get("near_edge_initial")),
             }
             with open("alerts_quality.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")

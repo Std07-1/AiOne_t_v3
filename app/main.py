@@ -155,7 +155,6 @@ async def bootstrap() -> UnifiedDataStore:
         )
     else:
         logger.info("[Launch] Admin command loop disabled via settings")
-    logger.info("[Launch] Admin command loop started")
     return store
 
 
@@ -238,7 +237,7 @@ async def run_pipeline() -> None:
 
         # ===== НОВА ЛОГІКА ВИБОРУ РЕЖИМУ =====
         use_manual_list = (
-            True  # Змінити на False для автоматичного режиму, True - для ручного
+            False  # Змінити на False для автоматичного режиму, True - для ручного
         )
 
         if use_manual_list:

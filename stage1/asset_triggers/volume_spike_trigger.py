@@ -35,6 +35,7 @@ def volume_spike_trigger(
     atr_window: int = 14,
     use_vol_atr: bool = False,
     require_upbar: bool = True,
+    upbar_tolerance: float = 5e-4,
     min_effect_ratio: float = 1.15,  # latest_vol / mean_vol ≥ цей коеф. як дод. умова
     symbol: str = "",
 ) -> tuple[bool, dict[str, float]]:
@@ -47,6 +48,8 @@ def volume_spike_trigger(
         atr_window: Вікно ATR.
         use_vol_atr: Додатковий критерій Volume/ATR > 2.0.
         require_upbar: Вимога, щоб close > open.
+        upbar_tolerance: Допустиме відхилення (у частках, наприклад 5e-4 = 0.05%),
+            в межах якого бар вважається нейтральним/flat і не фільтрується.
         min_effect_ratio: Мінімальне відхилення latest_vol від середнього.
         symbol: Для логування.
 
@@ -54,12 +57,13 @@ def volume_spike_trigger(
         (flag, meta): Прапор сплеску та метадані для UI/Stage2.
     """
     n = len(df)
-    if n < max(window + 1, atr_window + 1):
+    min_required = max(atr_window + 1, 3)
+    if n < min_required:
         logger.debug(
             "[%s] [VolSpike] Недостатньо даних (n=%d, need≥%d)",
             symbol,
             n,
-            max(window + 1, atr_window + 1),
+            min_required,
         )
         return False, {
             "z": 0.0,
@@ -70,13 +74,24 @@ def volume_spike_trigger(
         }
 
     # --- Останній бар ---
-    latest_vol = float(df["volume"].iloc[-1])
+    latest_series = pd.to_numeric(df["volume"].iloc[[-1]], errors="coerce")
+    latest_vol = float(latest_series.iloc[0]) if not latest_series.isna().all() else 0.0
     open_ = float(df["open"].iloc[-1])
     close_ = float(df["close"].iloc[-1])
-    upbar = close_ > open_
+    tol = max(0.0, float(upbar_tolerance))
+    if open_ != 0:
+        rel_delta = (close_ - open_) / open_
+    else:
+        rel_delta = close_ - open_
+    upbar = rel_delta >= -tol
 
     if require_upbar and not upbar:
-        logger.debug("[%s] [VolSpike] Відсічено: не upbar (close<=open)", symbol)
+        logger.debug(
+            "[%s] [VolSpike] Відсічено: не upbar (Δ=%.5f, tol=%.5f)",
+            symbol,
+            rel_delta,
+            tol,
+        )
         return False, {
             "z": 0.0,
             "mean": 0.0,
@@ -86,26 +101,44 @@ def volume_spike_trigger(
         }
 
     # --- Rolling статистики без останнього бара (анти-лукап) ---
-    vol_win = df["volume"].iloc[-(window + 1) : -1].astype(float)
+    effective_window = min(window, max(1, n - 1))
+    vol_history = pd.to_numeric(df["volume"].iloc[:-1], errors="coerce").dropna()
+    vol_win = vol_history.tail(effective_window)
+    if len(vol_win) < max(2, min(10, effective_window)):
+        logger.debug(
+            "[%s] [VolSpike] Недостатньо валідних volume значень для статистики (len=%d, eff_win=%d)",
+            symbol,
+            len(vol_win),
+            effective_window,
+        )
+        return False, {
+            "z": 0.0,
+            "mean": 0.0,
+            "std": 0.0,
+            "vol_atr": 0.0,
+            "upbar": bool(upbar),
+            "latest_vol": float(latest_vol),
+        }
     mean_vol = float(vol_win.mean())
     std_vol = float(vol_win.std(ddof=0))
+    if std_vol == 0:
+        std_vol = 1e-9
 
-    # Захист від нульової дисперсії
-    eps = 1e-9
-    std_vol = max(std_vol, eps)
+    # Захист від нульової дисперсії забезпечено вище
 
     z = (latest_vol - mean_vol) / std_vol
     effect_ok = (mean_vol > 0) and (latest_vol / mean_vol >= min_effect_ratio)
 
     # --- ATR шлях (опційно) ---
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    close = pd.to_numeric(df["close"], errors="coerce")
     prev_close = close.shift(1)
     tr = pd.concat(
         [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
     ).max(axis=1)
-    atr = float(tr.tail(atr_window).mean())
+    tr_tail = tr.dropna().tail(atr_window)
+    atr = float(tr_tail.mean()) if len(tr_tail) else 0.0
     vol_atr = (latest_vol / atr) if (atr > 0) else 0.0
 
     z_pass = (z >= z_thresh) and (z > 0.0) and effect_ok

@@ -35,6 +35,18 @@ def _log_stage3_skip(signal: dict[str, Any], reason: str) -> None:
         ctx_meta = signal.get("context_metadata") or {}
         if not ctx_meta and isinstance(signal.get("market_context"), dict):
             ctx_meta = (signal.get("market_context", {}) or {}).get("meta", {})
+        corridor_meta: dict[str, Any] = {}
+        corridor_candidate = (
+            ctx_meta.get("corridor") if isinstance(ctx_meta, dict) else None
+        )
+        if isinstance(corridor_candidate, dict):
+            corridor_meta = corridor_candidate
+        else:
+            market_ctx = signal.get("market_context")
+            if isinstance(market_ctx, dict):
+                km = market_ctx.get("key_levels_meta") or {}
+                if isinstance(km, dict):
+                    corridor_meta = km
         rec = {
             "ts": datetime.utcnow().isoformat() + "Z",
             "symbol": symbol,
@@ -44,6 +56,16 @@ def _log_stage3_skip(signal: dict[str, Any], reason: str) -> None:
             "htf_ok": ctx_meta.get("htf_ok"),
             "atr_pct": ctx_meta.get("atr_pct"),
             "low_gate": ctx_meta.get("low_gate"),
+            "corridor_band_pct": safe_float(corridor_meta.get("band_pct")),
+            "corridor_dist_to_edge_pct": safe_float(
+                corridor_meta.get("dist_to_edge_pct")
+            ),
+            "corridor_dist_to_edge_ratio": safe_float(
+                corridor_meta.get("dist_to_edge_ratio")
+            ),
+            "corridor_near_edge": corridor_meta.get("near_edge"),
+            "corridor_is_near_edge": corridor_meta.get("is_near_edge"),
+            "corridor_within": corridor_meta.get("within_corridor"),
         }
         with open("stage3_skips.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -61,6 +83,14 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
+def _pick_float(*values: Any) -> float | None:
+    for candidate in values:
+        val = safe_float(candidate)
+        if val is not None:
+            return val
+    return None
+
+
 def _ensure_alert_session(
     state_manager: AssetStateManager,
     symbol: str,
@@ -71,10 +101,30 @@ def _ensure_alert_session(
     stats = signal.get("stats") or {}
     price_val = _optional_float(stats.get("current_price"))
     rsi_val = _optional_float(stats.get("rsi"))
+    market_ctx_raw = signal.get("market_context")
+    market_ctx = market_ctx_raw if isinstance(market_ctx_raw, dict) else {}
     meta = signal.get("context_metadata") or {}
-    if not meta and isinstance(signal.get("market_context"), dict):
-        meta = (signal.get("market_context", {}) or {}).get("meta", {})
+    if not meta:
+        meta = market_ctx.get("meta", {}) or {}
+    if not isinstance(meta, dict):
+        meta = {}
     atr_pct_val = _optional_float(meta.get("atr_pct"))
+    low_gate_val = _optional_float(meta.get("low_gate"))
+    corridor_meta: dict[str, Any] = {}
+    corridor_candidate = meta.get("corridor")
+    if isinstance(corridor_candidate, dict):
+        corridor_meta = corridor_candidate
+    else:
+        key_levels_candidate = market_ctx.get("key_levels_meta")
+        if isinstance(key_levels_candidate, dict):
+            corridor_meta = key_levels_candidate
+    band_pct_val = _optional_float(corridor_meta.get("band_pct"))
+    near_edge_val = corridor_meta.get("near_edge")
+    if not isinstance(near_edge_val, str):
+        nearest_edge_candidate = corridor_meta.get("nearest_edge")
+        is_near_edge_val = corridor_meta.get("is_near_edge")
+        if isinstance(nearest_edge_candidate, str) and bool(is_near_edge_val):
+            near_edge_val = nearest_edge_candidate
     sig_type = str(signal.get("signal", "")).upper()
     side_val: str | None = None
     if sig_type.startswith("ALERT_BUY"):
@@ -88,6 +138,9 @@ def _ensure_alert_session(
             atr_pct_val,
             rsi_val,
             side_val,
+            band_pct_val,
+            low_gate_val,
+            near_edge_val,
         )
     except Exception:
         pass
@@ -132,6 +185,13 @@ try:
     MIN_CONFIDENCE_TRADE = float(STAGE3_TRADE_PARAMS.get("min_confidence_trade", 0.75))
 except Exception:
     MIN_CONFIDENCE_TRADE = 0.75
+
+try:
+    LOW_VOL_CONF_OVERRIDE = float(
+        STAGE3_TRADE_PARAMS.get("low_vol_conf_override", 0.82)
+    )
+except Exception:
+    LOW_VOL_CONF_OVERRIDE = 0.82
 
 
 async def open_trades(
@@ -224,13 +284,13 @@ async def open_trades(
             _finalize_alert_session(state_manager, signal, "stage3_not_state_alert")
             continue
 
+        ctx_meta = signal.get("context_metadata") or {}
+        if not ctx_meta and isinstance(signal.get("market_context"), dict):
+            ctx_meta = (signal.get("market_context", {}) or {}).get("meta", {})
+
         try:
             # Фінальний guard: перевірка HTF та ATR проти low_gate (якщо доступні метадані)
             try:
-                ctx_meta = signal.get("context_metadata") or {}
-                # допускаємо джерела: context_metadata або market_context.meta
-                if not ctx_meta and isinstance(signal.get("market_context"), dict):
-                    ctx_meta = (signal.get("market_context", {}) or {}).get("meta", {})
                 htf_ok = ctx_meta.get("htf_ok")
                 atr_pct = ctx_meta.get("atr_pct")
                 low_gate = ctx_meta.get("low_gate")
@@ -248,20 +308,32 @@ async def open_trades(
                     low_gate, (int, float)
                 ):
                     if float(atr_pct) < float(low_gate):
-                        logger.info(
-                            f"⛔️ Пропуск відкриття {symbol}: ATR%% {float(atr_pct)*100:.2f}% нижче порогу {float(low_gate)*100:.2f}%"
-                        )
-                        skipped_by_reason["low_atr"] = (
-                            skipped_by_reason.get("low_atr", 0) + 1
-                        )
-                        _log_stage3_skip(signal, "low_atr")
-                        _finalize_alert_session(state_manager, signal, "stage3_low_atr")
-                        continue
+                        if confidence >= LOW_VOL_CONF_OVERRIDE:
+                            if logger.isEnabledFor(logging.INFO):
+                                logger.info(
+                                    f"⚠️ Low ATR {float(atr_pct)*100:.2f}% < {float(low_gate)*100:.2f}% для {symbol}, але застосовано override (conf={confidence:.3f})"
+                                )
+                        else:
+                            logger.info(
+                                f"⛔️ Пропуск відкриття {symbol}: ATR%% {float(atr_pct)*100:.2f}% нижче порогу {float(low_gate)*100:.2f}%"
+                            )
+                            skipped_by_reason["low_atr"] = (
+                                skipped_by_reason.get("low_atr", 0) + 1
+                            )
+                            _log_stage3_skip(signal, "low_atr")
+                            _finalize_alert_session(
+                                state_manager, signal, "stage3_low_atr"
+                            )
+                            continue
             except Exception:
                 pass
 
+            stats = signal.get("stats") if isinstance(signal, dict) else {}
+            if not isinstance(stats, dict):
+                stats = {}
+
             # Захист від нульових значень ATR
-            atr = safe_float(signal.get("atr"))
+            atr = _pick_float(signal.get("atr"), stats.get("atr"))
             if atr is None or atr < 0.0001:
                 atr = 0.01
                 logger.warning(
@@ -269,32 +341,52 @@ async def open_trades(
                 )
 
             # Підготовка TP/SL: якщо відсутні топ-рівня, беремо з risk_parameters
-            tp_val = safe_float(signal.get("tp"))
-            sl_val = safe_float(signal.get("sl"))
-            if tp_val is None or sl_val is None:
-                rp = signal.get("risk_parameters") or {}
-                if tp_val is None:
-                    tp_fallback = safe_float(rp.get("take_profit"))
-                    if tp_fallback is not None:
-                        tp_val = tp_fallback
-                        logger.debug(
-                            "Fallback TP з risk_parameters для %s -> %s", symbol, tp_val
-                        )
-                if sl_val is None:
-                    sl_fallback = safe_float(rp.get("stop_loss"))
-                    if sl_fallback is not None:
-                        sl_val = sl_fallback
-                        logger.debug(
-                            "Fallback SL з risk_parameters для %s -> %s", symbol, sl_val
-                        )
+            rp = signal.get("risk_parameters") or {}
+            if not isinstance(rp, dict):
+                rp = {}
+
+            tp_candidates: list[Any] = [
+                signal.get("tp"),
+                rp.get("take_profit"),
+                rp.get("tp"),
+            ]
+            targets = rp.get("tp_targets")
+            if isinstance(targets, (list, tuple)):
+                tp_candidates.extend(targets)
+            tp_val = _pick_float(*tp_candidates)
+
+            sl_candidates: list[Any] = [
+                signal.get("sl"),
+                rp.get("stop_loss"),
+                rp.get("sl"),
+                rp.get("sl_level"),
+            ]
+            sl_val = _pick_float(*sl_candidates)
+            if tp_val is None and logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Stage3 TP не визначено для %s (ризик=%s)", symbol, rp)
+            if sl_val is None and logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Stage3 SL не визначено для %s (ризик=%s)", symbol, rp)
+
+            current_price = _pick_float(
+                signal.get("current_price"),
+                stats.get("current_price"),
+                ctx_meta.get("current_price"),
+            )
+            rsi_val = _pick_float(signal.get("rsi"), stats.get("rsi"))
+            volume_val = _pick_float(
+                signal.get("volume"),
+                signal.get("volume_mean"),
+                stats.get("volume_mean"),
+                stats.get("volume"),
+            )
 
             # Підготовка даних для відкриття угоди
             trade_data = {
                 "symbol": symbol,
-                "current_price": safe_float(signal.get("current_price")),
-                "atr": safe_float(signal.get("atr")),
-                "rsi": safe_float(signal.get("rsi")),
-                "volume": safe_float(signal.get("volume_mean")),
+                "current_price": current_price,
+                "atr": atr,
+                "rsi": rsi_val,
+                "volume": volume_val,
                 "tp": tp_val,
                 "sl": sl_val,
                 "confidence": confidence,

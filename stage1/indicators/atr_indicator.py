@@ -107,7 +107,10 @@ def compute_atr(df: pd.DataFrame, window: int = 14, symbol: str = "") -> float:
     hc = (df["high"] - df["close"].shift()).abs()
     lc = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    atr = tr.rolling(window=window).mean().iloc[-1]
+    if len(tr) < window:
+        return float("nan")
+    atr_series = tr.rolling(window=window, min_periods=window).mean()
+    atr = atr_series.iloc[-1]
     logger.debug(f"[{symbol}] [ATR] {atr:.6f}")
     return float(atr)
 

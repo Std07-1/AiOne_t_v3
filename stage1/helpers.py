@@ -37,7 +37,7 @@ from config.config import (
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.stage1.helpers")
 if not logger.handlers:
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
     logger.propagate = False
 

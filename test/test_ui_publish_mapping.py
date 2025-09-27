@@ -127,3 +127,48 @@ async def test_tp_sl_feature_flag_off_forces_dash(monkeypatch: pytest.MonkeyPatc
     payload = json.loads(r.published[-1])
     first = payload["assets"][0]
     assert first.get("tp_sl") == "-"
+
+
+@pytest.mark.asyncio
+async def test_publish_exposes_corridor_analytics_block():
+    corridor_meta = {
+        "band_pct": 0.02,
+        "dist_to_edge_pct": 0.008,
+        "dist_to_edge_ratio": 0.4,
+        "near_edge": "support",
+        "is_near_edge": True,
+        "within_corridor": True,
+    }
+    assets = [
+        {
+            "symbol": "btcusdt",
+            "signal": "ALERT_BUY",
+            "stats": {"current_price": 100.0},
+            "market_context": {
+                "meta": {
+                    "low_gate": 0.006,
+                    "atr_pct": 0.004,
+                    "htf_ok": True,
+                    "corridor": corridor_meta,
+                }
+            },
+        },
+    ]
+    mgr = DummyStateMgr(assets)
+    r = DummyRedis()
+
+    await publish_full_state(mgr, object(), r)
+
+    payload = json.loads(r.published[-1])
+    asset = payload["assets"][0]
+    analytics = asset.get("analytics")
+    assert isinstance(analytics, dict)
+    assert analytics.get("corridor_band_pct") == pytest.approx(0.02)
+    assert analytics.get("corridor_near_edge") == "support"
+    assert analytics.get("low_volatility_flag") is True
+    summary = payload.get("analytics")
+    assert isinstance(summary, dict)
+    assert summary.get("near_edge_assets") == 1
+    low_vol_summary = summary.get("low_volatility")
+    assert isinstance(low_vol_summary, dict)
+    assert low_vol_summary.get("alerts") == 1

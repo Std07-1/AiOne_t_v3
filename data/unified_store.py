@@ -39,7 +39,7 @@ from config.config import DATASTORE_BASE_DIR, NAMESPACE
 # ── Логування ──
 logger = logging.getLogger("app.data.unified_store")
 if not logger.handlers:  # guard проти повторної ініціалізації
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     # show_path=True щоб у WARNING/ERROR було видно точний файл і рядок
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=True))
     logger.propagate = False
@@ -602,7 +602,8 @@ class UnifiedDataStore:
     """
 
     # Публічні поля-атрибути з анотаціями типів
-    _flush_q: deque[tuple[str, str, pd.DataFrame]]
+    _flush_q: deque[tuple[str, str]]
+    _flush_pending: dict[tuple[str, str], pd.DataFrame]
     _maint_task: asyncio.Task[Any] | None
 
     def __init__(self, *, redis: Redis[Any], cfg: StoreConfig | None = None) -> None:
@@ -614,6 +615,8 @@ class UnifiedDataStore:
 
         # write-behind черга для диска
         self._flush_q = deque()
+        self._flush_pending = {}
+        self._flush_batch_limit = self.cfg.profile.flush_batch_max
         self._ram_hits = 0
         self._ram_miss = 0
         self._redis_hits = 0
@@ -872,7 +875,16 @@ class UnifiedDataStore:
 
             # 3) write-behind на диск
             if self.cfg.write_behind:
-                self._flush_q.append((symbol, interval, merged))
+                key = (symbol, interval)
+                if key in self._flush_pending:
+                    logger.debug(
+                        "[put_bars] Коалесовано snapshot у черзі: %s %s",
+                        symbol,
+                        interval,
+                    )
+                else:
+                    self._flush_q.append(key)
+                self._flush_pending[key] = merged
                 self.metrics.flush_backlog.set(len(self._flush_q))
             else:
                 await self.disk.save_bars(symbol, interval, merged)
@@ -910,7 +922,9 @@ class UnifiedDataStore:
         """
         try:
             while True:
-                await asyncio.sleep(1.0)
+                backlog = len(self._flush_q)
+                sleep_interval = 0.05 if backlog else 1.0
+                await asyncio.sleep(sleep_interval)
                 # RAM sweep
                 self.ram.sweep(self.metrics)
 
@@ -926,38 +940,67 @@ class UnifiedDataStore:
 
     async def _drain_flush_queue(self, *, force: bool = False) -> None:
         """Скидання write-behind черги з backpressure."""
-        limit = self.cfg.profile.flush_batch_max
         size = len(self._flush_q)
+        if size == 0:
+            return
 
-        # м'який/жорсткий тиск
-        if size > self.cfg.profile.flush_queue_soft and not force:
-            limit = max(1, limit // 2)
-            logger.warning(
-                f"[DataStore] Backpressure: backlog={size}, batch_limit={limit}"
+        previous_limit = self._flush_batch_limit
+        if size >= 800:
+            target_limit = 64
+        elif size >= 400:
+            target_limit = 32
+        elif size >= 200:
+            target_limit = 16
+        else:
+            target_limit = self.cfg.profile.flush_batch_max
+
+        if target_limit != previous_limit:
+            level = logging.WARNING if target_limit > previous_limit else logging.DEBUG
+            logger.log(
+                level,
+                "[DataStore] Адаптуємо batch_limit: backlog=%s, %s→%s",
+                size,
+                previous_limit,
+                target_limit,
             )
+            self._flush_batch_limit = target_limit
+
+        limit = self._flush_batch_limit
+
         if size > self.cfg.profile.flush_queue_hard and not force:
-            # аварійний режим — агресивно ріжемо batch
-            limit = 1
             logger.error(
-                (
-                    "[DataStore] Severe backpressure: backlog=%s, forcing "
-                    "batch_limit=%s"
-                ),
+                "[DataStore] Severe backpressure: backlog=%s, batch_limit=%s",
                 size,
                 limit,
             )
 
-        for _ in range(min(limit, size) if not force else size):
-            symbol, interval, df = self._flush_q.popleft()
+        iterations = size if force else min(limit, size)
+
+        for _ in range(iterations):
+            key = self._flush_q.popleft()
+            df = self._flush_pending.pop(key, None)
+            if df is None:
+                logger.debug(
+                    "[DataStore] Пропускаємо порожній snapshot у черзі: %s %s",
+                    key[0],
+                    key[1],
+                )
+                continue
+            symbol, interval = key
             try:
                 await self.disk.save_bars(symbol, interval, df)
             except Exception as e:
-                # якщо не вдалось — повертаємо в хвіст і почекаємо
                 logger.error(
-                    f"Disk flush failed for {symbol} {interval}: {e}", exc_info=True
+                    "Disk flush failed for %s %s: %s",
+                    symbol,
+                    interval,
+                    e,
+                    exc_info=True,
                 )
-                self._flush_q.append((symbol, interval, df))
+                self._flush_pending[key] = df
+                self._flush_q.appendleft(key)
                 await asyncio.sleep(self.cfg.io_retry_backoff)
+                break
 
         self.metrics.flush_backlog.set(len(self._flush_q))
 

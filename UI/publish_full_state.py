@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from datetime import datetime
 from typing import Any, Protocol
 
@@ -52,6 +53,19 @@ if not logger.handlers:  # guard від повторної ініціаліза�
 
 # Монотонний sequence для meta (у межах процесу)
 _SEQ: int = 0
+
+
+def _safe_float(value: Any) -> float | None:
+    """Конвертує значення у float або повертає None."""
+
+    try:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str) and value.strip():
+            return float(value)
+    except Exception:
+        return None
+    return None
 
 
 class RedisLike(Protocol):
@@ -99,6 +113,19 @@ async def publish_full_state(
     try:
         all_assets = state_manager.get_all_assets()  # список dict
         serialized_assets: list[dict[str, Any]] = []
+        band_samples: list[float] = []
+        dist_edge_samples: list[float] = []
+        edge_ratio_samples: list[float] = []
+        low_gate_samples: list[float] = []
+        atr_meta_samples: list[float] = []
+        atr_vs_low_gate_samples: list[float] = []
+        near_edge_counter: Counter[str] = Counter()
+        near_edge_alerts = 0
+        near_edge_total = 0
+        within_true = 0
+        within_false = 0
+        low_vol_assets = 0
+        low_vol_alerts = 0
 
         # Попередньо завантажимо core:trades для TP/SL таргетів (best-effort)
         core_trades: dict[str, Any] | None = None
@@ -298,23 +325,195 @@ async def publish_full_state(
             else:
                 asset.setdefault("visible", True)
 
-            # Проксі метаданих HTF для UI: витягуємо з market_context.meta
+            # Проксі метаданих HTF та коридорної аналітики для UI
+            mc_raw = asset.get("market_context")
+            mc = mc_raw if isinstance(mc_raw, dict) else {}
+            meta_candidate = mc.get("meta") if isinstance(mc, dict) else {}
+            meta = meta_candidate if isinstance(meta_candidate, dict) else {}
+            analytics_bucket = asset.get("analytics")
+            if not isinstance(analytics_bucket, dict):
+                analytics_bucket = {}
+
             try:
-                mc = asset.get("market_context") or {}
-                meta = mc.get("meta") if isinstance(mc, dict) else {}
-                if isinstance(meta, dict):
-                    if "htf_alignment" in meta and "htf_alignment" not in asset:
-                        val = meta.get("htf_alignment")
-                        if isinstance(val, (int, float)):
-                            asset["htf_alignment"] = float(val)
-                    if "htf_ok" in meta and "htf_ok" not in asset:
-                        hov = meta.get("htf_ok")
-                        if isinstance(hov, bool):
-                            asset["htf_ok"] = hov
+                if "htf_alignment" in meta and "htf_alignment" not in asset:
+                    val = meta.get("htf_alignment")
+                    if isinstance(val, (int, float)):
+                        asset["htf_alignment"] = float(val)
+                if "htf_ok" in meta and "htf_ok" not in asset:
+                    hov = meta.get("htf_ok")
+                    if isinstance(hov, bool):
+                        asset["htf_ok"] = hov
+                if "htf_ok" in meta:
+                    hov = meta.get("htf_ok")
+                    if isinstance(hov, bool):
+                        analytics_bucket.setdefault("htf_ok", hov)
             except Exception:
                 pass
 
+            corridor_meta: dict[str, Any] = {}
+            corridor_candidate = (
+                meta.get("corridor") if isinstance(meta, dict) else None
+            )
+            if isinstance(corridor_candidate, dict):
+                corridor_meta = corridor_candidate
+            else:
+                km = mc.get("key_levels_meta") if isinstance(mc, dict) else {}
+                if isinstance(km, dict):
+                    corridor_meta = km
+
+            signal_upper = str(asset.get("signal", "")).upper()
+            was_near_edge_asset = False
+
+            low_gate_val = _safe_float(meta.get("low_gate"))
+            if low_gate_val is not None:
+                analytics_bucket["low_gate"] = low_gate_val
+                low_gate_samples.append(low_gate_val)
+
+            atr_meta_val = _safe_float(meta.get("atr_pct"))
+            if atr_meta_val is not None:
+                analytics_bucket["atr_pct_stage2"] = atr_meta_val
+                atr_meta_samples.append(atr_meta_val)
+
+            atr_vs_low_gate = None
+            if (
+                atr_meta_val is not None
+                and low_gate_val is not None
+                and low_gate_val > 0
+            ):
+                atr_vs_low_gate = atr_meta_val / low_gate_val
+                analytics_bucket["atr_vs_low_gate_ratio"] = atr_vs_low_gate
+                atr_vs_low_gate_samples.append(atr_vs_low_gate)
+
+            low_vol_flag: bool | None = None
+            if atr_meta_val is not None and low_gate_val is not None:
+                low_vol_flag = atr_meta_val < low_gate_val
+                if low_vol_flag:
+                    low_vol_assets += 1
+                    if signal_upper.startswith("ALERT"):
+                        low_vol_alerts += 1
+                analytics_bucket["low_volatility_flag"] = low_vol_flag
+
+            band_val = _safe_float(corridor_meta.get("band_pct"))
+            if band_val is not None:
+                analytics_bucket["corridor_band_pct"] = band_val
+                band_samples.append(band_val)
+
+            dist_edge_pct = _safe_float(corridor_meta.get("dist_to_edge_pct"))
+            if dist_edge_pct is not None:
+                analytics_bucket["corridor_dist_to_edge_pct"] = dist_edge_pct
+                dist_edge_samples.append(dist_edge_pct)
+
+            dist_edge_ratio = _safe_float(corridor_meta.get("dist_to_edge_ratio"))
+            if dist_edge_ratio is not None:
+                analytics_bucket["corridor_dist_to_edge_ratio"] = dist_edge_ratio
+                edge_ratio_samples.append(dist_edge_ratio)
+
+            nearest_edge = corridor_meta.get("nearest_edge")
+            if isinstance(nearest_edge, str):
+                analytics_bucket["corridor_nearest_edge"] = nearest_edge
+
+            near_edge_val = corridor_meta.get("near_edge")
+            if isinstance(near_edge_val, str):
+                analytics_bucket["corridor_near_edge"] = near_edge_val
+                near_edge_counter[near_edge_val] += 1
+                was_near_edge_asset = True
+
+            is_near_edge = corridor_meta.get("is_near_edge")
+            if isinstance(is_near_edge, bool):
+                analytics_bucket["corridor_is_near_edge"] = is_near_edge
+                if is_near_edge:
+                    was_near_edge_asset = True
+
+            within_corridor = corridor_meta.get("within_corridor")
+            if isinstance(within_corridor, bool):
+                analytics_bucket["corridor_within"] = within_corridor
+                if within_corridor:
+                    within_true += 1
+                else:
+                    within_false += 1
+
+            if was_near_edge_asset:
+                near_edge_total += 1
+                if signal_upper.startswith("ALERT"):
+                    near_edge_alerts += 1
+
+            if analytics_bucket:
+                asset["analytics"] = analytics_bucket
+            else:
+                asset.pop("analytics", None)
+
             serialized_assets.append(asset)
+
+        analytics_summary: dict[str, Any] = {}
+        total_assets = len(serialized_assets)
+        if band_samples:
+            analytics_summary["corridor_band_pct"] = {
+                "avg": round(sum(band_samples) / len(band_samples), 5),
+                "min": round(min(band_samples), 5),
+                "max": round(max(band_samples), 5),
+                "count": len(band_samples),
+            }
+        if dist_edge_samples:
+            analytics_summary["corridor_dist_to_edge_pct"] = {
+                "avg": round(sum(dist_edge_samples) / len(dist_edge_samples), 5),
+                "min": round(min(dist_edge_samples), 5),
+                "max": round(max(dist_edge_samples), 5),
+                "count": len(dist_edge_samples),
+            }
+        if edge_ratio_samples:
+            analytics_summary["corridor_dist_to_edge_ratio"] = {
+                "avg": round(sum(edge_ratio_samples) / len(edge_ratio_samples), 5),
+                "min": round(min(edge_ratio_samples), 5),
+                "max": round(max(edge_ratio_samples), 5),
+                "count": len(edge_ratio_samples),
+            }
+        if low_gate_samples:
+            analytics_summary["low_gate"] = {
+                "avg": round(sum(low_gate_samples) / len(low_gate_samples), 5),
+                "min": round(min(low_gate_samples), 5),
+                "max": round(max(low_gate_samples), 5),
+                "count": len(low_gate_samples),
+            }
+        if atr_meta_samples:
+            analytics_summary["atr_pct_stage2"] = {
+                "avg": round(sum(atr_meta_samples) / len(atr_meta_samples), 5),
+                "min": round(min(atr_meta_samples), 5),
+                "max": round(max(atr_meta_samples), 5),
+                "count": len(atr_meta_samples),
+            }
+        if atr_vs_low_gate_samples:
+            analytics_summary["atr_vs_low_gate_ratio"] = {
+                "avg": round(
+                    sum(atr_vs_low_gate_samples) / len(atr_vs_low_gate_samples), 5
+                ),
+                "min": round(min(atr_vs_low_gate_samples), 5),
+                "max": round(max(atr_vs_low_gate_samples), 5),
+                "count": len(atr_vs_low_gate_samples),
+            }
+        if near_edge_counter:
+            analytics_summary["near_edge_counts"] = dict(near_edge_counter)
+        if near_edge_total:
+            analytics_summary["near_edge_assets"] = int(near_edge_total)
+            if total_assets:
+                analytics_summary["near_edge_assets_share"] = round(
+                    near_edge_total / total_assets, 3
+                )
+        if near_edge_alerts:
+            analytics_summary["near_edge_alerts"] = int(near_edge_alerts)
+        if within_true or within_false:
+            analytics_summary["within_corridor"] = {
+                "true": int(within_true),
+                "false": int(within_false),
+            }
+        if low_vol_assets or low_vol_alerts:
+            summary_block = {
+                "assets": int(low_vol_assets),
+            }
+            if total_assets:
+                summary_block["assets_share"] = round(low_vol_assets / total_assets, 3)
+            if low_vol_alerts:
+                summary_block["alerts"] = int(low_vol_alerts)
+            analytics_summary["low_volatility"] = summary_block
 
         # counters для хедера (+ базові агрегати Stage3‑гейтів)
         alerts_list = [
@@ -447,6 +646,8 @@ async def publish_full_state(
             "counters": counters,
             "assets": serialized_assets,
         }
+        if analytics_summary:
+            payload["analytics"] = analytics_summary
         if confidence_stats:
             payload["confidence_stats"] = confidence_stats
 

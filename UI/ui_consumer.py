@@ -110,6 +110,39 @@ class UIConsumer:
         }
         return icons.get(recommendation, "")
 
+    def _format_band_pct(self, asset: dict[str, Any]) -> str:
+        """Повертає рядок із Band% для відображення у таблиці."""
+
+        band_raw: float | None = None
+        try:
+            root_band = asset.get("band_pct")
+            if isinstance(root_band, (int, float)):
+                band_raw = float(root_band)
+            else:
+                analytics = asset.get("analytics")
+                if isinstance(analytics, dict):
+                    band_candidate = analytics.get("corridor_band_pct")
+                    if isinstance(band_candidate, (int, float)):
+                        band_raw = float(band_candidate)
+        except Exception:
+            band_raw = None
+
+        if band_raw is None or band_raw < 0:
+            return "-"
+
+        band_pct_val = band_raw * 100.0 if band_raw <= 1.0 else band_raw
+
+        try:
+            if band_pct_val < 0.3:
+                band_color = "red"
+            elif band_pct_val <= 1.5:
+                band_color = "yellow"
+            else:
+                band_color = "green"
+            return f"[{band_color}]{band_pct_val:.2f}%[/]"
+        except Exception:
+            return f"{band_pct_val:.2f}%"
+
     async def redis_consumer(
         self,
         redis_url: str | None = None,
@@ -247,12 +280,34 @@ class UIConsumer:
                                         )
                                         continue
                                     if incoming_seq < int(self._last_seq):
-                                        ui_logger.debug(
-                                            "Stale seq=%s < last_seq=%s — skip",
-                                            incoming_seq,
-                                            self._last_seq,
+                                        seq_backward = (
+                                            int(self._last_seq) - incoming_seq
                                         )
-                                        continue
+                                        newer_ts = (
+                                            incoming_ts is not None
+                                            and incoming_ts
+                                            >= self.last_update_time + 0.5
+                                        )
+                                        reset_window = (
+                                            incoming_seq <= 5 and seq_backward > 20
+                                        )
+                                        if newer_ts or reset_window:
+                                            ui_logger.warning(
+                                                "Sequence reset detected: incoming_seq=%s last_seq=%s ts=%s — accepting new epoch",
+                                                incoming_seq,
+                                                self._last_seq,
+                                                meta_ts_raw,
+                                            )
+                                            self._last_seq = max(
+                                                int(incoming_seq) - 1, -1
+                                            )
+                                        else:
+                                            ui_logger.debug(
+                                                "Stale seq=%s < last_seq=%s — skip",
+                                                incoming_seq,
+                                                self._last_seq,
+                                            )
+                                            continue
                                     if incoming_seq > int(self._last_seq) + 1:
                                         # gap detected → reload snapshot (воно має відповідати останньому publish)
                                         ui_logger.warning(
@@ -716,6 +771,7 @@ class UIConsumer:
             ("Статус", "center"),
             ("Причини", "left"),
             ("Сигнал", "center"),
+            ("Band%", "right"),
             ("Conf%", "right"),
             ("Рекомендація", "left"),
             ("TP/SL", "right"),
@@ -840,6 +896,8 @@ class UIConsumer:
             signal = str(asset.get(K_SIGNAL, "NONE")).upper()
             signal_str = f"{self._get_signal_icon(signal)} {signal}"
 
+            band_str = self._format_band_pct(asset)
+
             # Нова колонка впевненості (confidence)
             conf_val = asset.get("confidence")
             if not isinstance(conf_val, (int, float)):
@@ -892,6 +950,7 @@ class UIConsumer:
                 status_str,
                 reasons,
                 signal_str,
+                band_str,
                 conf_str,
                 rec_str,
                 tp_sl_str,

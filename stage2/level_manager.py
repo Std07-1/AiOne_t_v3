@@ -375,12 +375,24 @@ class LevelManager:
     def _anchored_vwap(self, df: pd.DataFrame) -> tuple[float, float]:
         """Обчислює Anchored VWAP і σ навколо нього (простий якор на вікні df)."""
         p = df["close"].to_numpy(dtype=float, copy=False)
-        v = df["volume"].to_numpy(dtype=float, copy=False)
+        v = (
+            df["volume"].to_numpy(dtype=float, copy=False)
+            if "volume" in df.columns
+            else np.ones_like(p)
+        )
+        mask = np.isfinite(p) & np.isfinite(v)
+        if not mask.any():
+            logger.debug("[VWAP] No valid price/volume data. Ставимо 0.0, 0.0")
+            return 0.0, 0.0
+        p = p[mask]
+        v = v[mask]
         v_sum = float(np.sum(v))
         if v_sum <= 0.0:
             v_sum = 1.0
         vwap = float(np.sum(p * v) / v_sum)
-        sigma = float(np.std(p - vwap))
+        diffs = p - vwap
+        diffs = diffs[np.isfinite(diffs)]
+        sigma = float(np.nanstd(diffs)) if diffs.size else 0.0
         return vwap, sigma
 
     def _merge_close(self, symbol: str, eps_rel: float = 0.002) -> None:

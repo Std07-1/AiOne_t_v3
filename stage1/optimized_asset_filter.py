@@ -28,7 +28,7 @@ from stage1.binance_future_asset_filter import BinanceFutureAssetFilter
 
 # ── Налаштування логування ─────────────────────────────────────────────────
 logger = logging.getLogger("optimized_asset_filter")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 logger.handlers.clear()
 logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
 logger.propagate = False

@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from typing import Any, cast
 
 import aiohttp
@@ -29,7 +30,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 
 # unified store (single source of truth)
-from config.config import WS_GAP_BACKFILL
+from config.config import WS_GAP_BACKFILL, WS_GAP_STATUS_PATH
 from data.unified_store import UnifiedDataStore
 
 # Аудит: жодної нормалізації часу — працюємо із сирими значеннями як приходять
@@ -151,6 +152,7 @@ class WSWorker:
         self._refresh_task: asyncio.Task[Any] | None = None
         self._hb_task: asyncio.Task[Any] | None = None
         self._stop_event = asyncio.Event()
+        self._resync_state: dict[str, dict[str, Any]] = {}
 
     async def _get_live_symbols(self) -> list[str]:
         """Fetch whitelist symbols either via custom selectors_key or store helper.
@@ -176,10 +178,16 @@ class WSWorker:
         syms = [s.lower() for s in syms]
         # Fallback якщо порожній
         if not syms:
-            logger.warning(
-                "[WSWorker] selector:active:stream пустий або невалидний, fallback btcusdt"
-            )
-            syms = DEFAULT_SYMBOLS
+            if self._symbols:
+                logger.warning(
+                    "[WSWorker] selector:active:stream порожній, використовуємо попередній whitelist"
+                )
+                syms = sorted(self._symbols)
+            else:
+                logger.warning(
+                    "[WSWorker] selector:active:stream пустий або невалидний, fallback btcusdt"
+                )
+                syms = DEFAULT_SYMBOLS
         if len(syms) < 3:
             logger.warning(
                 "[WSWorker] ВАЖЛИВО: Кількість symbols у стрімі підозріло мала: %d (%s)",
@@ -356,6 +364,13 @@ class WSWorker:
                             # Обмежуємо бекфіл до max_minutes, щоб не блокувати та не DDOS-ити REST
                             max_bars = min(missing, max_minutes)
                             start_ot = ot_cur - 60_000 * max_bars
+                            await self._mark_resync(
+                                sym=sym,
+                                start_open_time=start_ot,
+                                end_open_time=ot_cur - 60_000,
+                                missing=missing,
+                                scheduled=max_bars,
+                            )
                             # Запускаємо у фоні, щоб не блокувати WS-цикл
                             asyncio.create_task(
                                 self._safe_backfill(
@@ -479,6 +494,7 @@ class WSWorker:
                 end_open_time,
                 max_bars,
             )
+            await self._clear_resync(sym)
         except Exception as e:
             logger.warning("[WS GAP] backfill failed %s 1m: %s", sym, e, exc_info=True)
 
@@ -492,6 +508,57 @@ class WSWorker:
                     await self._resubscribe(ws, new_syms)
             except Exception as e:
                 logger.warning("Refresh symbols error: %s", e)
+
+    async def _mark_resync(
+        self,
+        *,
+        sym: str,
+        start_open_time: int,
+        end_open_time: int,
+        missing: int,
+        scheduled: int,
+    ) -> None:
+        meta = {
+            "status": "syncing",
+            "start_open_time": start_open_time,
+            "end_open_time": end_open_time,
+            "missing": missing,
+            "scheduled": scheduled,
+            "ts": int(time.time()),
+        }
+        prev = self._resync_state.get(sym)
+        if prev != meta:
+            logger.warning(
+                "[WS GAP] %s: пауза Stage1, пропущено %d хв (REST %d)",
+                sym,
+                missing,
+                scheduled,
+            )
+        self._resync_state[sym] = meta
+        ttl = int(WS_GAP_BACKFILL.get("status_ttl", 900))
+        try:
+            await self.store.redis.jset(
+                *WS_GAP_STATUS_PATH,
+                value=self._resync_state,
+                ttl=ttl,
+            )
+        except Exception as e:
+            logger.debug("[WS GAP] Не вдалося оновити статус resync: %s", e)
+
+    async def _clear_resync(self, sym: str) -> None:
+        if sym not in self._resync_state:
+            return
+        self._resync_state.pop(sym, None)
+        ttl = int(WS_GAP_BACKFILL.get("status_ttl", 900))
+        try:
+            await self.store.redis.jset(
+                *WS_GAP_STATUS_PATH,
+                value=self._resync_state,
+                ttl=ttl,
+            )
+            logger.info("[WS GAP] %s: ресинхронізація завершена", sym)
+        except Exception as e:
+            logger.debug("[WS GAP] Не вдалося очистити статус resync: %s", e)
 
     async def _resubscribe(self, ws: Any, new_syms: set[str]) -> None:
         """UNSUBSCRIBE/SUBSCRIBE WS-канали без reconnect."""

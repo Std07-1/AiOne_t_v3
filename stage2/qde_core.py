@@ -229,14 +229,17 @@ def analyze_meso(stats: dict[str, Any], cfg: QDEConfig) -> dict[str, float]:
     volume_strength = min(max(_safe(stats.get("volume_z"), 0.0) / 2.5, 0.0), 1.0)
     # простий slope за 5 останніх цін, якщо передали масив
     closes = np.asarray(stats.get("closes", []), dtype=float)
+    closes = closes[np.isfinite(closes)]
     trend_slope = 0.5
     if closes.size >= 6:
-        y = (closes[-60:] if closes.size > 60 else closes).astype(float)
-        x = np.arange(len(y), dtype=float)
-        x = (x - x.mean()) / (x.std() + 1e-9)
-        y = (y - y.mean()) / (y.std() + 1e-9)
-        beta = float(np.dot(x, y) / (np.dot(x, x) + 1e-9))
-        trend_slope = max(0.0, min(1.0, 0.5 + beta / 2.0))
+        y_raw = (closes[-60:] if closes.size > 60 else closes).astype(float)
+        y = y_raw[np.isfinite(y_raw)]
+        if y.size >= 2:
+            x = np.arange(len(y), dtype=float)
+            x = (x - x.mean()) / (x.std() + 1e-9)
+            y = (y - y.mean()) / (y.std() + 1e-9)
+            beta = float(np.dot(x, y) / (np.dot(x, x) + 1e-9))
+            trend_slope = max(0.0, min(1.0, 0.5 + beta / 2.0))
 
     # HTF (1h+) узгодження, якщо передане у stats
     htf_raw = None

@@ -223,10 +223,18 @@ class AssetMonitorStage1:
         daily_low = df["low"].min()
         daily_range = daily_high - daily_low
 
-        # 4. Volume statistics
-        vol_mean = df["volume"].mean()
-        vol_std = df["volume"].std(ddof=0) or 1.0
-        volume_z = (df["volume"].iloc[-1] - vol_mean) / vol_std
+        # 4. Volume statistics (з урахуванням NaN / коротких вікон)
+        vol_series = pd.to_numeric(df["volume"], errors="coerce")
+        latest_vol = vol_series.iloc[-1] if len(vol_series) else 0.0
+        clean_vol = vol_series.dropna()
+        if len(clean_vol) < 2:
+            vol_mean = float(clean_vol.mean()) if len(clean_vol) else 0.0
+            vol_std = 1.0
+            volume_z = 0.0
+        else:
+            vol_mean = float(clean_vol.mean())
+            vol_std = float(clean_vol.std(ddof=0)) or 1.0
+            volume_z = 0.0 if pd.isna(latest_vol) else (latest_vol - vol_mean) / vol_std
 
         # 5. RSI (інкрементально) O(1) (RAM-fast)
         self.rsi_manager.ensure_state(symbol, df["close"])  # на всяк випадок при старті
@@ -413,8 +421,11 @@ class AssetMonitorStage1:
             # Лог лише коли стан змінюється (зберігаємо попередній у self.asset_stats)
             prev_state = self.asset_stats.get(symbol, {}).get("_market_state")
             if prev_state != market_state:
-                logger.info(
-                    "[%s] Ринковий стан: %s → ефективні пороги: volZ=%.2f, vwap=%.3f, gates=[%.3f..%.3f]",
+                logger.debug(
+                    "%s Ринковий стан: %s → ефективні пороги: \n"
+                    " volZ=%.2f \n"
+                    " vwap=%.3f \n"
+                    " gates=[%.3f..%.3f] \n",
                     symbol,
                     market_state,
                     float(effective.get("vol_z_threshold", float("nan"))),

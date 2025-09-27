@@ -41,7 +41,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.asset_state_manager import AssetStateManager
 from stage2.level_manager import LevelManager
+from stage2.process_single_stage2 import process_single_stage2
 from stage2.processor import Stage2Processor
 
 # Налаштування логування для тестів
@@ -159,7 +161,7 @@ TEST_CASES = [
             "anomalies": {},
         },
         "expected_scenario": "RANGE_BOUND",
-        "expected_recommendation": "RANGE_TRADE",
+        "expected_recommendation": "WAIT_FOR_CONFIRMATION",
         "expected_keywords": ["флет", "діапазон", "боковик", "торгівля на межах"],
     },
     {
@@ -181,7 +183,7 @@ TEST_CASES = [
             "anomalies": {"volatility_spike": True},
         },
         "expected_scenario": "HIGH_VOLATILITY",
-        "expected_recommendation": "AVOID_HIGH_RISK",
+        "expected_recommendation": "WAIT_FOR_CONFIRMATION",
         "expected_keywords": ["волатильність", "різк", "обереж"],
     },
     {
@@ -396,6 +398,143 @@ async def test_localization(level_manager):
 
     # Перевіряємо, що рекомендації відповідають
     assert result_ua["recommendation"] == result_en["recommendation"]
+
+
+@pytest.mark.asyncio
+async def test_stage2_low_vol_high_confidence_keeps_alert() -> None:
+    """Перевіряємо, що високий конфіденс обходить low-vol даунгрейд."""
+
+    state_manager = AssetStateManager(["testusdt"])
+    stage1_signal = {
+        "symbol": "testusdt",
+        "signal": "ALERT_BUY",
+        "stats": {"symbol": "testusdt", "current_price": 10.0, "atr": 0.004},
+        "thresholds": {"low_gate": 0.006},
+        "trigger_reasons": ["breakout_up"],
+    }
+    state_manager.update_asset("testusdt", stage1_signal)
+
+    level_manager = MagicMock()
+    level_manager.get_corridor.return_value = {
+        "support": 9.8,
+        "resistance": 10.4,
+        "mid": 10.1,
+        "band_pct": 0.012,
+        "confidence": 0.75,
+        "dist_to_support_pct": 0.002,
+        "dist_to_resistance_pct": 0.006,
+    }
+    level_manager.evidence_around.return_value = {}
+
+    processor = Stage2Processor(
+        calib_queue=DummyCalibration(),
+        timeframe="1m",
+        state_manager=state_manager,
+        level_manager=level_manager,
+        user_lang="UA",
+        user_style="pro",
+    )
+    processor.engine.process = MagicMock(
+        return_value={
+            "recommendation": "BUY_IN_DIPS",
+            "confidence_metrics": {"composite_confidence": 0.88},
+            "market_context": {
+                "scenario": "BULLISH_BREAKOUT",
+                "meta": {"htf_ok": True},
+                "key_levels": {
+                    "immediate_support": 9.8,
+                    "immediate_resistance": 10.4,
+                },
+                "key_levels_meta": {
+                    "band_pct": 0.012,
+                    "dist_to_support_pct": 0.002,
+                    "dist_to_resistance_pct": 0.006,
+                },
+            },
+            "risk_parameters": {"tp_targets": [10.5], "sl_level": 9.7},
+            "narrative": "Сигнал на прорив з високою впевненістю.",
+            "trigger_reasons": ["volume_spike"],
+        }
+    )
+
+    await process_single_stage2(stage1_signal, processor, state_manager)
+
+    asset_state = state_manager.state["testusdt"]
+    assert asset_state["signal"] == "ALERT_BUY"
+    assert asset_state.get("reco_original") is None
+    assert state_manager.passed_alerts == 1
+    assert state_manager.blocked_alerts_lowvol == 0
+    assert state_manager.blocked_alerts_lowconf == 0
+
+
+@pytest.mark.asyncio
+async def test_stage2_low_vol_low_confidence_downgrades_alert() -> None:
+    """Даунгрейд при низькому ATR та недостатньому conf повинен відбутися."""
+
+    state_manager = AssetStateManager(["test2usdt"])
+    stage1_signal = {
+        "symbol": "test2usdt",
+        "signal": "ALERT_BUY",
+        "stats": {"symbol": "test2usdt", "current_price": 5.0, "atr": 0.002},
+        "thresholds": {"low_gate": 0.006},
+        "trigger_reasons": ["breakout_up"],
+    }
+    state_manager.update_asset("test2usdt", stage1_signal)
+
+    level_manager = MagicMock()
+    level_manager.get_corridor.return_value = {
+        "support": 4.9,
+        "resistance": 5.3,
+        "mid": 5.1,
+        "band_pct": 0.015,
+        "confidence": 0.6,
+        "dist_to_support_pct": 0.003,
+        "dist_to_resistance_pct": 0.007,
+    }
+    level_manager.evidence_around.return_value = {}
+
+    processor = Stage2Processor(
+        calib_queue=DummyCalibration(),
+        timeframe="1m",
+        state_manager=state_manager,
+        level_manager=level_manager,
+        user_lang="UA",
+        user_style="pro",
+    )
+    processor.engine.process = MagicMock(
+        return_value={
+            "recommendation": "BUY_IN_DIPS",
+            "confidence_metrics": {"composite_confidence": 0.7},
+            "market_context": {
+                "scenario": "BULLISH_BREAKOUT",
+                "meta": {"htf_ok": True},
+                "key_levels": {
+                    "immediate_support": 4.9,
+                    "immediate_resistance": 5.3,
+                },
+                "key_levels_meta": {
+                    "band_pct": 0.015,
+                    "dist_to_support_pct": 0.003,
+                    "dist_to_resistance_pct": 0.007,
+                },
+            },
+            "risk_parameters": {"tp_targets": [5.4], "sl_level": 4.8},
+            "narrative": "Сигнал недостатньо впевнений у низькій волатильності.",
+            "trigger_reasons": ["volume_spike"],
+        }
+    )
+
+    await process_single_stage2(stage1_signal, processor, state_manager)
+
+    asset_state = state_manager.state["test2usdt"]
+    assert asset_state["signal"] == "NORMAL"
+    assert asset_state.get("recommendation") == "WAIT_FOR_CONFIRMATION"
+    assert asset_state.get("reco_original") == "BUY_IN_DIPS"
+    assert asset_state.get("reco_gate_reason") == "low_volatility+low_confidence"
+    assert state_manager.downgraded_alerts == 1
+    assert state_manager.blocked_alerts_lowvol == 1
+    assert state_manager.blocked_alerts_lowconf == 1
+    assert state_manager.blocked_alerts_lowvol_lowconf == 1
 
 
 if __name__ == "__main__":

@@ -175,6 +175,7 @@ ASSET_STATE = {
     "NORMAL": "normal",
     "NO_TRADE": "no_trade",
     "NO_DATA": "no_data",
+    "SYNCING": "syncing",
     "ERROR": "error",
 }
 
@@ -295,13 +296,19 @@ TRIGGER_NAME_MAP: dict[str, str] = {
 # ПАРАЛЕЛІЗМ/СЕМAФОРИ ДЛЯ ЗОВНІШНІХ ЗАПИТІВ (Stage1 фільтри, Binance тощо)
 # ──────────────────────────────────────────────────────────────────────────────
 #: Максимум паралельних запитів до ендпойнтів відкритого інтересу (OI)
-OI_SEMAPHORE = asyncio.Semaphore(15)
+OI_SEMAPHORE = asyncio.Semaphore(8)
 
 #: Обмеження для запитів свічок (klines)
-KLINES_SEMAPHORE = asyncio.Semaphore(20)
+KLINES_SEMAPHORE = asyncio.Semaphore(8)
 
 #: Обмеження для глибини стакану (order book depth)
-DEPTH_SEMAPHORE = asyncio.Semaphore(20)
+DEPTH_SEMAPHORE = asyncio.Semaphore(8)
+
+#: Рекомендований розмір батчу для важких метрик (OI/Depth/ATR)
+STAGE1_METRICS_BATCH = 32
+
+#: Верхня межа символів після cheap-фільтра перед важкими метриками (safety)
+STAGE1_PREFILTER_HEAVY_LIMIT = 150
 
 #: TTL для кешу у Redis (сек) — актуально для важких довідкових відповідей
 REDIS_CACHE_TTL: int = 3 * 3600  # 3 години
@@ -590,10 +597,20 @@ STAGE2_RANGE_PARAMS: dict[str, float] = {
     "upgrade_comp_min": 0.60,
 }
 
+# Параметри ґейтів Stage2 (action gate + low vol override)
+STAGE2_GATE_PARAMS: dict[str, float] = {
+    # Мінімальна композитна впевненість, нижче якої вважаємо сигнал низьковпевненим
+    "low_conf_threshold": 0.75,
+    # Якщо ATR% нижче low_gate, але впевненість вища за цей поріг — дозволяємо ALERT
+    "low_vol_conf_override": 0.82,
+}
+
 # Параметри Stage3 відкриття угод
 STAGE3_TRADE_PARAMS: dict[str, float] = {
     # Мінімальна впевненість для відкриття угоди (0..1)
     "min_confidence_trade": 0.75,
+    # Поріг впевненості, який дозволяє ігнорувати low_gate для відкриття угоди
+    "low_vol_conf_override": 0.82,
 }
 
 OPTUNA_PARAM_RANGES: dict[str, tuple] = {
@@ -625,10 +642,15 @@ STAGE2_AUDIT: dict[str, float | int | str | bool] = {
 
 # ── Підготовчі прапорці для WS gap‑бекфілу (за замовчуванням вимкнено) ──
 WS_GAP_BACKFILL: dict[str, int | bool] = {
-    "enabled": False,
+    "enabled": True,
     # максимум хвилин до бекфілу REST при виявленні пропусків у live‑стрімі
-    "max_minutes": 10,
+    "max_minutes": 15,
+    # TTL статусу ресинхронізації у Redis/UI (сек)
+    "status_ttl": 15 * 60,
 }
+
+#: Redis-шлях для статусу WS-ресинхронізації (ai_one:stream:resync)
+WS_GAP_STATUS_PATH: tuple[str, ...] = ("stream", "resync")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CACHE / TTL CONFIG (свічки / історія)
@@ -783,6 +805,8 @@ __all__ = [
     "OI_SEMAPHORE",
     "KLINES_SEMAPHORE",
     "DEPTH_SEMAPHORE",
+    "STAGE1_METRICS_BATCH",
+    "STAGE1_PREFILTER_HEAVY_LIMIT",
     "REDIS_CACHE_TTL",
     # Cache maps
     "INTERVAL_TTL_MAP",
@@ -798,9 +822,11 @@ __all__ = [
     "ASSET_CLASS_MAPPING",
     "STAGE2_CONFIG",
     "STAGE2_RANGE_PARAMS",
+    "STAGE2_GATE_PARAMS",
     "STAGE3_TRADE_PARAMS",
     "STAGE2_AUDIT",
     "WS_GAP_BACKFILL",
+    "WS_GAP_STATUS_PATH",
     "OPTUNA_PARAM_RANGES",
     # App defaults / seeds
     "STAGE1_PREFILTER_THRESHOLDS",

@@ -34,6 +34,8 @@ from config.config import (
     DEPTH_SEMAPHORE,
     KLINES_SEMAPHORE,
     OI_SEMAPHORE,
+    STAGE1_METRICS_BATCH,
+    STAGE1_PREFILTER_HEAVY_LIMIT,
     FilterParams,
     MetricResults,
     SymbolInfo,
@@ -52,12 +54,15 @@ from utils.utils import format_open_interest, format_volume_usd
 # ───────────────────────────── Логування ─────────────────────────────
 logger = logging.getLogger("app.stage1.binance_future_asset_filter")
 if not logger.handlers:
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     logger.addHandler(RichHandler(console=Console(stderr=True), show_path=False))
     logger.propagate = False
 
 # Глобальний консоль для зручності
 console = Console()
+
+
+WHITELIST_SYMBOLS: set[str] = {"BTCUSDT"}
 
 
 # CORE LOGIC
@@ -113,7 +118,22 @@ class BinanceFutureAssetFilter:
         logger.debug(f"[STEP] Завантажено exchangeInfo, кількість: {len(data)}")
         # data expected as {"symbols": [...]} ; normalize to list
         items = data.get("symbols", []) if isinstance(data, dict) else data
-        return [SymbolInfo(**s) for s in items if isinstance(s, dict)]
+        symbols = [SymbolInfo(**s) for s in items if isinstance(s, dict)]
+        if len(symbols) <= 1:
+            logger.debug(
+                "[STEP] exchangeInfo cache повернув лише %d символів — форсуємо refresh",
+                len(symbols),
+            )
+            fresh = await _fetch_json(
+                self.session, "https://fapi.binance.com/fapi/v1/exchangeInfo"
+            )
+            refreshed_items = process_data(fresh) if fresh else []
+            symbols = [SymbolInfo(**s) for s in refreshed_items if isinstance(s, dict)]
+            logger.debug(
+                "[STEP] Форсований refresh exchangeInfo: %d символів",
+                len(symbols),
+            )
+        return symbols
 
     async def fetch_ticker_data(self) -> pd.DataFrame:
         """
@@ -256,12 +276,43 @@ class BinanceFutureAssetFilter:
         prefiltered_df = ticker_df[base_mask].copy()
         logger.debug(f"[EVENT] Після базового маску: {prefiltered_df.shape}")
 
+        missing_whitelist = [
+            sym
+            for sym in WHITELIST_SYMBOLS
+            if sym in ticker_df["symbol"].values
+            and sym not in prefiltered_df["symbol"].values
+        ]
+        if missing_whitelist:
+            extra_rows = ticker_df[ticker_df["symbol"].isin(missing_whitelist)].copy()
+            if not extra_rows.empty:
+                prefiltered_df = (
+                    pd.concat([prefiltered_df, extra_rows], ignore_index=True)
+                    .drop_duplicates(subset="symbol")
+                    .reset_index(drop=True)
+                )
+                logger.info("[STEP] Додано whitelist символи: %s", missing_whitelist)
+
         if prefiltered_df.empty:
             logger.warning("Немає активів після базової фільтрації")
             return []
 
         symbols = prefiltered_df["symbol"].tolist()
         logger.debug("Після базової фільтрації: %d активів", len(symbols))
+
+        heavy_limit = min(len(symbols), STAGE1_PREFILTER_HEAVY_LIMIT)
+        if len(symbols) > heavy_limit:
+            logger.debug(
+                "[STEP] Обмежуємо важкі метрики до топ-%d символів (з %d)",
+                heavy_limit,
+                len(symbols),
+            )
+            prefiltered_df = (
+                prefiltered_df.sort_values("quoteVolume", ascending=False)
+                .head(heavy_limit)
+                .copy()
+            )
+            symbols = prefiltered_df["symbol"].tolist()
+            logger.debug("[STEP] Після обрізки важких метрик: %d активів", len(symbols))
         # Логування символів для додаткових метрик
         logger.debug(f"[EVENT] Символи для додаткових метрик: {symbols}")
 
@@ -279,39 +330,63 @@ class BinanceFutureAssetFilter:
             "[bold yellow] OI • Depth • ATR[/bold yellow]", total=total_metrics
         )
 
-        # Паралельний збір openInterest
-        oi_data = await fetch_concurrently(
-            self.session,
-            symbols,
-            fetch_open_interest,
-            OI_SEMAPHORE,
-            progress_callback=lambda: prog.advance(metrics_task),
-        )
-        logger.debug(f"[EVENT] Зібрано openInterest для {len(oi_data)} символів")
+        batch_size = max(1, STAGE1_METRICS_BATCH)
+        total = len(symbols)
+        chunked = [
+            symbols[idx : idx + batch_size] for idx in range(0, total, batch_size)
+        ]
+
+        def _log_batch(metric: str, batch_idx: int, chunk: list[str]) -> None:
+            logger.debug(
+                "[STEP] %s батч %d/%d — символів: %d",  # noqa: E501
+                metric,
+                batch_idx,
+                max(1, len(chunked)),
+                len(chunk),
+            )
+
+        oi_data: dict[str, float] = {}
+        for idx, chunk in enumerate(chunked, start=1):
+            _log_batch("openInterest", idx, chunk)
+            partial = await fetch_concurrently(
+                self.session,
+                chunk,
+                fetch_open_interest,
+                OI_SEMAPHORE,
+                progress_callback=lambda: prog.advance(metrics_task),
+            )
+            oi_data.update(partial)
+        logger.debug("[EVENT] Зібрано openInterest для %d символів", len(oi_data))
 
         logger.debug("[STEP] Крок 4: Паралельний збір orderbookDepth")
 
-        # Паралельний збір orderbookDepth
-        depth_data = await fetch_concurrently(
-            self.session,
-            symbols,
-            fetch_orderbook_depth,
-            DEPTH_SEMAPHORE,
-            progress_callback=lambda: prog.advance(metrics_task),
-        )
-        logger.debug(f"[EVENT] Зібрано orderbookDepth для {len(depth_data)} символів")
+        depth_data: dict[str, float] = {}
+        for idx, chunk in enumerate(chunked, start=1):
+            _log_batch("orderbookDepth", idx, chunk)
+            partial = await fetch_concurrently(
+                self.session,
+                chunk,
+                fetch_orderbook_depth,
+                DEPTH_SEMAPHORE,
+                progress_callback=lambda: prog.advance(metrics_task),
+            )
+            depth_data.update(partial)
+        logger.debug("[EVENT] Зібрано orderbookDepth для %d символів", len(depth_data))
 
         logger.debug("[STEP] Крок 4: Паралельний збір ATR")
 
-        # Паралельний збір ATR
-        atr_data = await fetch_concurrently(
-            self.session,
-            symbols,
-            fetch_atr,
-            KLINES_SEMAPHORE,
-            progress_callback=lambda: prog.advance(metrics_task),
-        )
-        logger.debug(f"[EVENT] Зібрано ATR для {len(atr_data)} символів")
+        atr_data: dict[str, float] = {}
+        for idx, chunk in enumerate(chunked, start=1):
+            _log_batch("ATR", idx, chunk)
+            partial = await fetch_concurrently(
+                self.session,
+                chunk,
+                fetch_atr,
+                KLINES_SEMAPHORE,
+                progress_callback=lambda: prog.advance(metrics_task),
+            )
+            atr_data.update(partial)
+        logger.debug("[EVENT] Зібрано ATR для %d символів", len(atr_data))
 
         self.progress.advance(main_task)
 

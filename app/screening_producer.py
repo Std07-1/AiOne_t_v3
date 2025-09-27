@@ -21,11 +21,16 @@ from rich.logging import RichHandler
 
 from app.utils.helper import estimate_atr_pct, resample_5m, store_to_dataframe
 from config.config import (
+    ASSET_STATE,
     DEFAULT_LOOKBACK,
     DEFAULT_TIMEFRAME,
+    K_SIGNAL,
+    K_STATS,
     MAX_PARALLEL_STAGE2,
     MIN_READY_PCT,
+    STAGE2_STATUS,
     TRADE_REFRESH_INTERVAL,
+    WS_GAP_STATUS_PATH,
 )
 from stage1.asset_monitoring import AssetMonitorStage1
 from stage2.level_manager import LevelManager
@@ -66,8 +71,65 @@ async def process_asset_batch(
 
     Очікується: store.get_df(symbol, interval, limit=lookback) -> DataFrame з open_time.
     """
+    resync_payload = await store.redis.jget(*WS_GAP_STATUS_PATH, default={})
+    resync_meta: dict[str, dict[str, Any]] = {}
+    if isinstance(resync_payload, dict):
+        for sym_key, meta in resync_payload.items():
+            try:
+                if not isinstance(meta, dict):
+                    continue
+                if str(meta.get("status", "")).lower() != "syncing":
+                    continue
+                resync_meta[sym_key.lower()] = meta
+            except Exception:
+                continue
+
     for symbol in symbols:
         try:
+            lower_symbol = symbol.lower()
+            sync_meta = resync_meta.get(lower_symbol)
+            if sync_meta:
+                missing = (
+                    int(sync_meta.get("missing", 0))
+                    if sync_meta.get("missing")
+                    else None
+                )
+                hint = (
+                    f"WS ресинхронізація ({missing} хв)"
+                    if missing
+                    else "WS ресинхронізація триває"
+                )
+                stats_update = {}
+                start_ot = sync_meta.get("start_open_time")
+                end_ot = sync_meta.get("end_open_time")
+                if start_ot is not None:
+                    stats_update["gap_start_open_time"] = start_ot
+                if end_ot is not None:
+                    stats_update["gap_end_open_time"] = end_ot
+                if missing is not None:
+                    stats_update["gap_missing_bars"] = missing
+
+                existing = state_manager.state.get(symbol, {})
+                existing_stats = (
+                    existing.get(K_STATS, {}) if isinstance(existing, dict) else {}
+                )
+                merged_stats = (
+                    {**existing_stats, **stats_update}
+                    if isinstance(existing_stats, dict)
+                    else stats_update
+                )
+
+                state_manager.update_asset(
+                    symbol,
+                    {
+                        K_SIGNAL: "SYNCING",
+                        "state": ASSET_STATE["SYNCING"],
+                        "hints": [hint],
+                        K_STATS: merged_stats,
+                    },
+                )
+                continue
+
             df = await store.get_df(symbol, timeframe, limit=lookback)
             if df is None or df.empty or len(df) < 5:
                 state_manager.update_asset(symbol, create_no_data_signal(symbol))
@@ -125,6 +187,20 @@ async def process_asset_batch(
                         norm_stats.setdefault(k, v)
             except Exception:
                 normalized["stats"] = stats_container
+
+            signal_val = str(normalized.get(K_SIGNAL, "")).upper()
+            if not signal_val.startswith("ALERT"):
+                normalized["recommendation"] = None
+                normalized["narrative"] = None
+                normalized["confidence"] = float(normalized.get("confidence") or 0.0)
+                normalized["stage2_status"] = STAGE2_STATUS["PENDING"]
+                normalized["market_context"] = None
+                normalized["risk_parameters"] = None
+                normalized["confidence_metrics"] = None
+                normalized["anomaly_detection"] = None
+                normalized.pop("reco_original", None)
+                normalized.pop("reco_gate_reason", None)
+                normalized.pop("analytics", None)
 
             state_manager.update_asset(symbol, normalized)
         except Exception as e:
